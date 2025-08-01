@@ -443,7 +443,8 @@ dafoam_function_outputs = dafoam_functions.evaluate(dafoam_solver_states,
 # optimization_case options
 # 1: Maximize CL/CD wrt angle-of-attack
 # 2: Minimize CD wrt angle-of-attack, root/tip twist, constrained by CL=0.5
-optimization_case = 2
+# 3: Minimize CD wrt wing shape (thickness/camber ffd), constrained by CL=0.5
+optimization_case = 3
 
 
 if optimization_case == 1:
@@ -476,6 +477,26 @@ if optimization_case == 2:
 
     # Constraints
     CL.set_as_constraint(lower=0.5, upper=0.5)
+
+    # Objective
+    CD.set_as_objective()
+
+
+if optimization_case == 3:
+    # Declaring and naming some variables
+    dynamic_pressure = 0.5*ambient_conditions_group.rho_kg_m3*flight_conditions_group.airspeed_m_s*flight_conditions_group.airspeed_m_s
+    lift = dafoam_function_outputs.lift
+    drag = dafoam_function_outputs.drag
+    CL   = lift/(dynamic_pressure*A0)
+    CD   = drag/(dynamic_pressure*A0)
+
+    # Design variables
+    flight_conditions_group.angle_of_attack.set_as_design_variable(lower=-2., upper=10., adder=2, scaler=10)
+    percent_change_in_thickness_dof_wing.set_as_design_variable(lower=-10, upper=30., add=10, scaler=40)
+    normalized_percent_camber_change_dof_wing.set_as_design_variable(lower=-20., upper=20., scaler=20)
+
+    # Constraints
+    Cl.set_as_constraint(lower=0.5, upper=0.5)
 
     # Objective
     CD.set_as_objective()
@@ -517,5 +538,4 @@ optimizer   = PySLSQP(prob, solver_options={'maxiter':20, 'iprint':2, 'visualize
 # optimizer.check_first_derivatives(prob.x0)
 
 optimizer.solve()
-
 optimizer.print_results()
