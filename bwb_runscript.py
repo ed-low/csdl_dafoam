@@ -439,7 +439,7 @@ dafoam_function_outputs = dafoam_functions.evaluate(dafoam_solver_states,
                                                     dafoam_input_variables_group)
 
 
-# region Design variable, constraint, and objective setup selection
+# region Optimization problem selection
 # optimization_case options
 # 1: Maximize CL/CD wrt angle-of-attack
 # 2: Minimize CD wrt angle-of-attack, root/tip twist, constrained by CL=0.5
@@ -460,7 +460,7 @@ if optimization_case == 1:
     objective_fun.set_as_objective()
 
 
-if optimization_case == 2:
+elif optimization_case == 2:
     # Declaring and naming some variables
     dynamic_pressure = 0.5*ambient_conditions_group.rho_kg_m3*flight_conditions_group.airspeed_m_s*flight_conditions_group.airspeed_m_s
     lift = dafoam_function_outputs.lift
@@ -482,7 +482,7 @@ if optimization_case == 2:
     CD.set_as_objective()
 
 
-if optimization_case == 3:
+elif optimization_case == 3:
     # Declaring and naming some variables
     dynamic_pressure = 0.5*ambient_conditions_group.rho_kg_m3*flight_conditions_group.airspeed_m_s*flight_conditions_group.airspeed_m_s
     lift = dafoam_function_outputs.lift
@@ -491,12 +491,12 @@ if optimization_case == 3:
     CD   = drag/(dynamic_pressure*A0)
 
     # Design variables
-    flight_conditions_group.angle_of_attack.set_as_design_variable(lower=-2., upper=10., adder=2, scaler=10)
-    percent_change_in_thickness_dof_wing.set_as_design_variable(lower=-10, upper=30., adder=10, scaler=40)
-    normalized_percent_camber_change_dof_wing.set_as_design_variable(lower=-20., upper=20., scaler=20)
+    flight_conditions_group.angle_of_attack.set_as_design_variable(lower=-2., upper=10., adder=2., scaler=1./10.)
+    percent_change_in_thickness_dof_wing.set_as_design_variable(lower=-10, upper=30., adder=10., scaler=1./40.)
+    normalized_percent_camber_change_dof_wing.set_as_design_variable(lower=-20., upper=20., scaler=1./20.)
 
     # Constraints
-    Cl.set_as_constraint(lower=0.5, upper=0.5)
+    CL.set_as_constraint(lower=0.5, upper=0.5)
 
     # Objective
     CD.set_as_objective()
@@ -523,17 +523,22 @@ sim = csdl.experimental.PySimulator(recorder)
 # sim.check_totals()
 # derivs = sim.compute_totals([CD],[root_twist, tip_twist, flight_conditions_group.angle_of_attack])
 
-# Optimization testing here
+# Only allow visualization on the root rank
+if rank == 0:
+    visualize_on_this_rank = True
+else:
+    visualize_on_this_rank = False
+
+# Optimization solver setup and run
 solver_options = {'maxiter': 20,
                   'iprint': 2,
-                  'visualize': True,
+                  'visualize': visualize_on_this_rank,
                   'summary_filename': f'rank{rank}_slsqp_summary.out',
                   'save_figname':     f'rank{rank}_slsqp_plot.pdf',
                   'save_filename':    f'rank{rank}_slsqp_recorder.hdf5'}
 
-
 prob        = CSDLAlphaProblem(problem_name='BWB', simulator=sim)
-optimizer   = PySLSQP(prob, solver_options={'maxiter':20, 'iprint':2, 'visualize':True})
+optimizer   = PySLSQP(prob, solver_options=solver_options)
 
 # optimizer.check_first_derivatives(prob.x0)
 
