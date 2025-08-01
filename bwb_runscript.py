@@ -492,7 +492,7 @@ if optimization_case == 3:
 
     # Design variables
     flight_conditions_group.angle_of_attack.set_as_design_variable(lower=-2., upper=10., adder=2, scaler=10)
-    percent_change_in_thickness_dof_wing.set_as_design_variable(lower=-10, upper=30., add=10, scaler=40)
+    percent_change_in_thickness_dof_wing.set_as_design_variable(lower=-10, upper=30., adder=10, scaler=40)
     normalized_percent_camber_change_dof_wing.set_as_design_variable(lower=-20., upper=20., scaler=20)
 
     # Constraints
