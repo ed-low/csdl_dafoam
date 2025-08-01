@@ -7,6 +7,7 @@ obj_*/
 
 # Misc files
 *.txt
+*.out
 
 
 # Byte-compiled / optimized / DLL files
