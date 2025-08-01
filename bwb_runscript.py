@@ -503,7 +503,7 @@ if optimization_case == 3:
 
 
 else:
-    print('Not a valid case')
+    print('Not a valid case number')
 
 
 recorder.stop()
