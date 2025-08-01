@@ -349,6 +349,18 @@ mid_twist   = csdl.Variable(shape=(2,), value=np.array([0., 0.]))
 wing_twists = csdl.concatenate((root_twist, mid_twist, tip_twist))
 wing_twists.flatten()
 
+percent_change_in_thickness_dof_wing        = csdl.Variable(shape=(8,4), value=0.)
+percent_change_in_thickness_dof_body        = csdl.Variable(shape=(8,4), value=0.)
+percent_change_in_thickness_dof             = csdl.concatenate(
+                                                (percent_change_in_thickness_dof_wing,
+                                                 percent_change_in_thickness_dof_body), axis=1)
+
+normalized_percent_camber_change_dof_wing   = csdl.Variable(shape=(6,4), value=0.)
+normalized_percent_camber_change_dof_body   = csdl.Variable(shape=(6,4), value=0.)
+normalized_percent_camber_change_dof        = csdl.concatenate(
+                                                (normalized_percent_camber_change_dof_wing,
+                                                 normalized_percent_camber_change_dof_body), axis=1)
+
 centerbody_chord_stretches                  = csdl.Variable(shape=(3,), value=0.)
 wing_chord_stretching_b_spline_coefficients = csdl.Variable(shape=(2,), value=np.array([0., 0.]))
 centerbody_span                             = csdl.Variable(value=10.)
@@ -359,8 +371,8 @@ centerbody_dihedral_translations            = csdl.Variable(shape=(3,), value=np
 wing_dihedral_translation_b_spline_coefficients = csdl.Variable(shape=(2,), value=np.array([0., 0.]))
 centerbody_twists                           = csdl.Variable(shape=(3,), value=np.array([0., 0., 0.]))
 # wing_twists                                 = csdl.Variable(shape=(4,), value=np.array([0., 0., 0., 0.]))
-percent_change_in_thickness_dof             = csdl.Variable(shape=(8,8), value=0.)
-normalized_percent_camber_change_dof        = csdl.Variable(shape=(6,8), value=0.)
+# percent_change_in_thickness_dof             = csdl.Variable(shape=(8,8), value=0.)
+# normalized_percent_camber_change_dof        = csdl.Variable(shape=(6,8), value=0.)
 
 
 geometry_values_dict = {
@@ -389,7 +401,7 @@ with Timer(f'setting up geometry'):
         comm.Barrier()
 
 with Timer(f'evaluating geometry component'):
-    x_surf_dafoam_full = geometry.evaluate(projected_surf_mesh_dafoam, plot=True)
+    x_surf_dafoam_full = geometry.evaluate(projected_surf_mesh_dafoam, plot=False)
 
 # region Surface mesh distribution
 i0, i1          = x_surf_dafoam_initial_indices[rank]
