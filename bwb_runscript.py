@@ -47,6 +47,9 @@ os.environ["PETSC_OPTIONS"] = "-malloc_debug"
 # ===============================
 # region USER INPUT
 # ===============================
+# Keyword for optimization name (optimization results folder will be saved with this name)
+problem_name              = 'bwb_test'
+
 # Geometry
 geometry_directory        =  os.path.join(os.getcwd(), 'bwb_geometry/')
 stp_file_name             = 'bwbv2_no_wingtip_coarse_refined_flat.stp'
@@ -57,7 +60,7 @@ comm           = MPI.COMM_WORLD
 TIMING_ENABLED = True  # True if we want timing printed for the CSDL operations
 
 # DAFoam
-dafoam_directory = os.path.join(os.getcwd(), 'openfoam_175k_bwb/')
+dafoam_directory = os.path.join(os.getcwd(), 'openfoam_471k_bwb/')
 
 # Initial/reference values for DAFoam (best to use base conditions)
 U0        = 238.0         # used for normalizing CD and CL
@@ -200,8 +203,9 @@ def hash_array_tol(arr: np.ndarray, tol: float = 1e-8, length: int = 16) -> str:
 # region SETUP
 # ===============================
 # MPI information
-rank                        = comm.Get_rank()
-comm_size                   = comm.Get_size()
+rank      = comm.Get_rank()
+comm_size = comm.Get_size()
+rank_str  = f"{rank:0{len(str(comm_size-1))}d}" # string with zero-padded rank index (for prints)
 
 
 # region DAFoam instance
@@ -338,7 +342,7 @@ else:
     if rank != 0:
         projected_surf_mesh_dafoam = read_simple_pickle(surface_mesh_projection_file_path)
 
-print(f'Rank {rank} done reading projected surface mesh!')
+print(f'Rank {rank_str} done reading projected surface mesh!')
 comm.Barrier()
 
 
@@ -446,8 +450,8 @@ dafoam_function_outputs = dafoam_functions.evaluate(dafoam_solver_states,
 # 2: Minimize CD wrt angle-of-attack, root/tip twist, constrained by CL=0.5
 # 3: Minimize CD wrt angle-of-attack, wing shape (thickness/camber ffd), constrained by CL=0.5
 # 4: Minimize CD wrt angle-of-attack, wing shape (thickness/camber ffd) and wing twists, constrained by CL=0.5
-# 5: Maximize CL/CD wrt angle-of-attack, and wing shape
-optimization_case = 5
+# 5: Maximize CL/CD wrt angle-of-attack and wing shape
+optimization_case = 2
 
 
 if optimization_case == 1:
@@ -571,11 +575,11 @@ else:
 solver_options = {'maxiter': 20,
                   'iprint': 2,
                   'visualize': visualize_on_this_rank,
-                  'summary_filename': f'rank{rank}_slsqp_summary.out',
-                  'save_figname':     f'rank{rank}_slsqp_plot.pdf',
-                  'save_filename':    f'rank{rank}_slsqp_recorder.hdf5'}
+                  'summary_filename': f'rank{rank_str}_slsqp_summary.out',
+                  'save_figname':     f'rank{rank_str}_slsqp_plot.pdf',
+                  'save_filename':    f'rank{rank_str}_slsqp_recorder.hdf5'}
 
-prob        = CSDLAlphaProblem(problem_name='BWB', simulator=sim)
+prob        = CSDLAlphaProblem(problem_name=f'{problem_name}_rank{rank_str}', simulator=sim)
 optimizer   = PySLSQP(prob, solver_options=solver_options)
 
 # optimizer.check_first_derivatives(prob.x0)
