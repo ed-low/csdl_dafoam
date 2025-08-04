@@ -60,7 +60,7 @@ comm           = MPI.COMM_WORLD
 TIMING_ENABLED = True  # True if we want timing printed for the CSDL operations
 
 # DAFoam
-dafoam_directory = os.path.join(os.getcwd(), 'openfoam_471k_bwb/')
+dafoam_directory = os.path.join(os.getcwd(), 'openfoam_175k_bwb/')
 
 # Initial/reference values for DAFoam (best to use base conditions)
 U0        = 238.0         # used for normalizing CD and CL
@@ -451,7 +451,7 @@ dafoam_function_outputs = dafoam_functions.evaluate(dafoam_solver_states,
 # 3: Minimize CD wrt angle-of-attack, wing shape (thickness/camber ffd), constrained by CL=0.5
 # 4: Minimize CD wrt angle-of-attack, wing shape (thickness/camber ffd) and wing twists, constrained by CL=0.5
 # 5: Maximize CL/CD wrt angle-of-attack and wing shape
-optimization_case = 2
+optimization_case = 3
 
 
 if optimization_case == 1:
@@ -475,12 +475,14 @@ elif optimization_case == 2:
     CL   = lift/(dynamic_pressure*A0)
     CD   = drag/(dynamic_pressure*A0)
     root_twist.name = 'root_twist'
-    tip_twist.name = 'tip_twist'
+    tip_twist.name  = 'tip_twist'
+    twist_lim_deg   = 5
+    twist_lim_rad   = twist_lim_deg*np.pi/180
 
     # Design variables
     flight_conditions_group.angle_of_attack.set_as_design_variable(lower=0, upper=10)
-    root_twist.set_as_design_variable(lower=-0.087266, upper=0.087266, scaler=180/np.pi)
-    tip_twist.set_as_design_variable(lower=-0.087266, upper=0.087266, scaler=180/np.pi)
+    root_twist.set_as_design_variable(lower=-twist_lim_rad, upper=twist_lim_rad, scaler=1/twist_lim_rad)
+    tip_twist.set_as_design_variable(lower=-twist_lim_rad, upper=twist_lim_rad, scaler=1/twist_lim_rad)
 
     # Constraints
     CL.set_as_constraint(lower=0.5, upper=0.5)
@@ -516,12 +518,14 @@ elif optimization_case == 4:
     drag = dafoam_function_outputs.drag
     CL   = lift/(dynamic_pressure*A0)
     CD   = drag/(dynamic_pressure*A0)
+    twist_lim_deg   = 5
+    twist_lim_rad   = twist_lim_deg*np.pi/180
 
     # Design variables
     flight_conditions_group.angle_of_attack.set_as_design_variable(lower=-2., upper=10., adder=2., scaler=1./10.)
     percent_change_in_thickness_dof_wing.set_as_design_variable(lower=-10, upper=30., adder=10., scaler=1./40.)
     normalized_percent_camber_change_dof_wing.set_as_design_variable(lower=-20., upper=20., scaler=1./20.)
-    wing_twists.set_as_design_variable(lower=-10*np.pi/180, upper=10*np.pi/180, scaler=18/np.pi)
+    wing_twists.set_as_design_variable(lower=-twist_lim_rad, upper=twist_lim_rad, scaler=1/twist_lim_rad)
 
     # Constraints
     CL.set_as_constraint(lower=0.5, upper=0.5)
