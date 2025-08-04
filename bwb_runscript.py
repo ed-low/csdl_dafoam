@@ -485,7 +485,7 @@ elif optimization_case == 2:
     tip_twist.set_as_design_variable(lower=-twist_lim_rad, upper=twist_lim_rad, scaler=1/twist_lim_rad)
 
     # Constraints
-    CL.set_as_constraint(lower=0.5, upper=0.5)
+    CL.set_as_constraint(equals=0.5)
 
     # Objective
     CD.set_as_objective()
@@ -505,7 +505,7 @@ elif optimization_case == 3:
     normalized_percent_camber_change_dof_wing.set_as_design_variable(lower=-20., upper=20., scaler=1./20.)
 
     # Constraints
-    CL.set_as_constraint(lower=0.5, upper=0.5)
+    CL.set_as_constraint(equals=0.5)
 
     # Objective
     CD.set_as_objective()
@@ -528,7 +528,7 @@ elif optimization_case == 4:
     wing_twists.set_as_design_variable(lower=-twist_lim_rad, upper=twist_lim_rad, scaler=1/twist_lim_rad)
 
     # Constraints
-    CL.set_as_constraint(lower=0.5, upper=0.5)
+    CL.set_as_constraint(equals=0.5)
 
     # Objective
     CD.set_as_objective()
