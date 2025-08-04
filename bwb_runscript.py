@@ -56,7 +56,7 @@ comm           = MPI.COMM_WORLD
 TIMING_ENABLED = True  # True if we want timing printed for the CSDL operations
 
 # DAFoam
-dafoam_directory = os.path.join(os.getcwd(), 'openfoam_175k_bwb/')
+dafoam_directory = os.path.join(os.getcwd(), 'openfoam_471k_bwb/')
 
 # Initial/reference values for DAFoam (best to use base conditions)
 U0        = 238.0         # used for normalizing CD and CL
@@ -445,7 +445,8 @@ dafoam_function_outputs = dafoam_functions.evaluate(dafoam_solver_states,
 # 2: Minimize CD wrt angle-of-attack, root/tip twist, constrained by CL=0.5
 # 3: Minimize CD wrt wing shape (thickness/camber ffd), constrained by CL=0.5
 # 4: Minimize CD wrt wing shape (thickness/camber ffd) and wing twists, constrained by CL=0.5
-optimization_case = 3
+# 5: Maximize CL/CD wrt angle-of-attack, and wing shape
+optimization_case = 5
 
 
 if optimization_case == 1:
@@ -523,6 +524,19 @@ elif optimization_case == 4:
     # Objective
     CD.set_as_objective()
 
+
+elif optimization_case == 5:
+    lift = dafoam_function_outputs.lift
+    drag = dafoam_function_outputs.drag
+
+    # Design variables
+    flight_conditions_group.angle_of_attack.set_as_design_variable(lower=0, upper=10, scaler=1./10.)
+    percent_change_in_thickness_dof_wing.set_as_design_variable(lower=-10, upper=30., adder=10., scaler=1./40.)
+    normalized_percent_camber_change_dof_wing.set_as_design_variable(lower=-20., upper=20., scaler=1./20.)
+
+    # Objectives
+    objective_fun = -lift/drag
+    objective_fun.set_as_objective()
 
 
 else:
