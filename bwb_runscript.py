@@ -31,6 +31,7 @@ from bwb_helper_functions import setup_geometry, read_geometry_pickle, write_geo
 # Plotting
 from vedo import Points, show
 import matplotlib.pyplot as plt
+from check_headless import is_headless
 
 # Hashing (for file name generation)
 import hashlib
@@ -561,7 +562,7 @@ sim = csdl.experimental.PySimulator(recorder)
 # derivs = sim.compute_totals([CD],[root_twist, tip_twist, flight_conditions_group.angle_of_attack])
 
 # Only allow visualization on the root rank
-if rank == 0:
+if rank == 0 and not is_headless():
     visualize_on_this_rank = True
 else:
     visualize_on_this_rank = False
