@@ -57,7 +57,7 @@ comm           = MPI.COMM_WORLD
 TIMING_ENABLED = True  # True if we want timing printed for the CSDL operations
 
 # DAFoam
-dafoam_directory = os.path.join(os.getcwd(), 'openfoam_471k_bwb/')
+dafoam_directory = os.path.join(os.getcwd(), 'openfoam_175k_bwb/')
 
 # Initial/reference values for DAFoam (best to use base conditions)
 U0        = 238.0         # used for normalizing CD and CL
@@ -444,8 +444,8 @@ dafoam_function_outputs = dafoam_functions.evaluate(dafoam_solver_states,
 # optimization_case options
 # 1: Maximize CL/CD wrt angle-of-attack
 # 2: Minimize CD wrt angle-of-attack, root/tip twist, constrained by CL=0.5
-# 3: Minimize CD wrt wing shape (thickness/camber ffd), constrained by CL=0.5
-# 4: Minimize CD wrt wing shape (thickness/camber ffd) and wing twists, constrained by CL=0.5
+# 3: Minimize CD wrt angle-of-attack, wing shape (thickness/camber ffd), constrained by CL=0.5
+# 4: Minimize CD wrt angle-of-attack, wing shape (thickness/camber ffd) and wing twists, constrained by CL=0.5
 # 5: Maximize CL/CD wrt angle-of-attack, and wing shape
 optimization_case = 5
 
