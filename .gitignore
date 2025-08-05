@@ -8,6 +8,7 @@ obj_*/
 # Misc files
 *.txt
 *.out
+test_script.py
 
 
 # Byte-compiled / optimized / DLL files
