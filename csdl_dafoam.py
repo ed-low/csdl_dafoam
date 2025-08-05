@@ -439,9 +439,7 @@ def compute_dafoam_input_variables(dafoam_instance, ambient_conditions_group:csd
 
         # If the type is volCoord, we get the coordinates and assign it to the CSDL variable group
         if input_type == "volCoord":
-            # INSERT LOGIC HERE TO DETERMINE IF IT IS THE RIGHT SHAPE?
-            # >????????
-            #  ^^^^^^^^
+            # TODO: Logic for checking dimensions
             setattr(dafoam_input_variables_group, input_name, aerodynamic_volume_coordinates)
 
         # If the type is patchVelocity, we get the velocity and angle of attack and assign it to a CSDL variable
