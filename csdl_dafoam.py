@@ -104,7 +104,6 @@ class DAFoamSolver(csdl.experimental.CustomImplicitOperation):
         # if the primal fails, do not set states and return
         if dafoam_instance.primalFail != 0:
             print('Primal solution failed!')
-            return
 
         # after solving the primal, we need to print its residual info
         if dafoam_instance.getOption("useAD")["mode"] == "forward":
@@ -114,6 +113,9 @@ class DAFoamSolver(csdl.experimental.CustomImplicitOperation):
 
         # assign the computed flow states to outputs
         states = dafoam_instance.getStates()
+        if dafoam_instance.primalFail != 0:
+            states = np.nan
+
         output_vals['dafoam_solver_states'] = states
 
         # set states
