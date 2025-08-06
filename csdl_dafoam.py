@@ -104,7 +104,6 @@ class DAFoamSolver(csdl.experimental.CustomImplicitOperation):
         # if the primal fails, do not set states and return
         if dafoam_instance.primalFail != 0:
             print('Primal solution failed!')
-            # TODO: Remove return, instead assign nans to state vector and return
 
         # after solving the primal, we need to print its residual info
         if dafoam_instance.getOption("useAD")["mode"] == "forward":
@@ -115,10 +114,10 @@ class DAFoamSolver(csdl.experimental.CustomImplicitOperation):
         # assign the computed flow states to outputs
         states = dafoam_instance.getStates()
         if dafoam_instance.primalFail != 0:
-            print('Primal solution failed!')
-            states = np.nan
-
-        output_vals['dafoam_solver_states'] = states
+            # If we didn't converge, send the optimizer a nan solution (we'll let DAFoam keep the unconverged solution, though)
+            output_vals['dafoam_solver_states'] = np.full((self.num_state_elements, ), np.nan)
+        else:
+            output_vals['dafoam_solver_states'] = states
 
         # set states
         dafoam_instance.setStates(states)
@@ -554,10 +553,6 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
             
                 if not reuse_jac or iter == 0:
                     jac_reduced = _compute_reduced_jacobian(phi, states)
-                
-
-
-
 
 
         else:
