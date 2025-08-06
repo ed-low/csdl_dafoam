@@ -18,7 +18,7 @@ import lsdo_geo
 
 # Optimization
 from modopt import CSDLAlphaProblem
-from modopt import PySLSQP
+from modopt import PySLSQP, OpenSQP
 
 # IDWarp and DAFoam
 from csdl_idwarp import DAFoamMeshWarper
@@ -500,7 +500,7 @@ elif optimization_case == 3:
     CD   = drag/(dynamic_pressure*A0)
 
     # Design variables
-    flight_conditions_group.angle_of_attack.set_as_design_variable(lower=0., upper=5., scaler=1./5)
+    flight_conditions_group.angle_of_attack.set_as_design_variable(lower=0., upper=10., scaler=1./10)
     percent_change_in_thickness_dof_wing.set_as_design_variable(lower=-10, upper=30., adder=10., scaler=1./40.)
     normalized_percent_camber_change_dof_wing.set_as_design_variable(lower=-20., upper=20., scaler=1./20.)
 
@@ -576,15 +576,20 @@ else:
     visualize_on_this_rank = False
 
 # Optimization solver setup and run
-solver_options = {'maxiter': 20,
-                  'iprint': 2,
-                  'visualize': visualize_on_this_rank,
-                  'summary_filename': f'rank{rank_str}_slsqp_summary.out',
-                  'save_figname':     f'rank{rank_str}_slsqp_plot.pdf',
-                  'save_filename':    f'rank{rank_str}_slsqp_recorder.hdf5'}
-
 prob        = CSDLAlphaProblem(problem_name=f'{problem_name}_rank{rank_str}', simulator=sim)
-optimizer   = PySLSQP(prob, solver_options=solver_options)
+
+# # PySLSQP optimizer setup
+# solver_options = {'maxiter': 20,
+#                   'iprint': 2,
+#                   'visualize': visualize_on_this_rank,
+#                   'summary_filename': f'rank{rank_str}_slsqp_summary.out',
+#                   'save_figname':     f'rank{rank_str}_slsqp_plot.pdf',
+#                   'save_filename':    f'rank{rank_str}_slsqp_recorder.hdf5'}
+# optimizer   = PySLSQP(prob, solver_options=solver_options)
+
+# OpenSQP optimizer setup
+
+optimizer   = OpenSQP(prob)
 
 # optimizer.check_first_derivatives(prob.x0)
 
