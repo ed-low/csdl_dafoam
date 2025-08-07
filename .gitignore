@@ -4,12 +4,14 @@ console_outputs/
 openfoam_*/
 stored_files/
 obj_*/
+ASO_2DAF_send/
 
 # Misc files
 *.txt
 *.out
 test_script.py
 *.zip
+*.tar.gz
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
