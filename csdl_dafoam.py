@@ -264,6 +264,23 @@ class DAFoamSolver(csdl.experimental.CustomImplicitOperation):
         if 'dafoam_solver_states' in d_residuals:
              # get the reverse mode AD seed from d_residuals
             seed = d_residuals['dafoam_solver_states']
+
+            # ---------- NOTE: This section was previously removed
+            # this computes [dRdW]^T*Psi using reverse mode AD
+            if 'dafoam_solver_states' in d_outputs:
+                product = np.zeros(self.num_state_elements)
+                jacInput = output_vals['dafoam_solver_states']
+                dafoam_instance.solverAD.calcJacTVecProduct(
+                    'dafoam_solver_states',
+                    "stateVar",
+                    jacInput,
+                    'aero_residuals',
+                    "residual",
+                    seed,
+                    product,
+                )
+                d_outputs['dafoam_solver_states'] += product
+            #-----------
  
             # loop over all inputs keys and compute the matrix-vector products accordingly
             inputDict = dafoam_instance.getOption("inputInfo")
