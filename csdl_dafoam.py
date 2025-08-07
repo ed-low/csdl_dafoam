@@ -78,7 +78,7 @@ class DAFoamSolver(csdl.experimental.CustomImplicitOperation):
                 self.declare_input(input_name, getattr(dafoam_input_variables_group, input_name))   
 
         # Set outputs
-        dafoam_solver_states = self.create_output('dafoam_solver_states', (self.num_state_elements,))
+        dafoam_solver_states = self.create_output('dafoam_solver_states', (self.num_local_state_elements,))
 
         return dafoam_solver_states
 
@@ -556,3 +556,159 @@ def has_global_nan_or_inf(arr, comm):
     local_has_nan_or_inf  = np.any(np.isnan(arr) | np.isinf(arr))
     global_has_nan_or_inf = comm.allreduce(local_has_nan_or_inf, op=MPI.LOR)
     return global_has_nan_or_inf
+
+
+
+class DAFoamROM(csdl.experimental.CustomImplicitOperation):
+    def __init__(self, dafoam_instance, tolerance=1e-6, max_iters=10, reuse_jacobian=True, phi:np.array=None, fom_states_ref:np.array=None):
+        super().__init__()
+        self.dafoam_instance        = dafoam_instance
+        self.tolerance              = tolerance
+        self.max_iters              = max_iters
+        self.solution_counter       = 1
+        self.reuse_jacobian         = reuse_jacobian
+        
+        # Check if user supplies a constant phi array (this cooresponds to a global basis)
+        if phi is not None:
+            self.phi                = phi
+            self.use_constant_phi  = True
+        else:
+            self.use_constant_phi   = False
+
+        # Check if user supplies a constant reference state (this cooresponds to a global reference)
+        if fom_states_ref is not None:
+            self.fom_states_ref     = fom_states_ref
+            self.use_constant_fom_reference_state = True
+        else:
+            self.use_constant_fom_reference_state = False
+
+
+    def evaluate(self, dafoam_input_variables_group:csdl.VariableGroup, phi:csdl.Variable=None, fom_states_ref:csdl.Variable=None):
+        # Read daOptions to set proper inputs
+        inputDict = self.dafoam_instance.getOption("inputInfo")
+        for inputName in inputDict.keys():
+            if "solver" in inputDict[inputName]["components"]:
+                self.declare_input(inputName, getattr(dafoam_input_variables_group, inputName))
+
+        # Set our basis as an input variable if not already set to a constant
+        if not self.use_constant_phi:
+            self.declare_input('phi', phi)
+            num_modes = phi.value.shape[1]
+        else:
+            num_modes = self.phi.shape[1]
+        
+        # Set the reference FOM states as an input variable if not already set to a constant
+        if not self.use_constant_fom_reference_state:
+            self.declare_input('fom_states_ref', fom_states_ref)
+
+        # Set outputs
+        dafoam_rom_states = self.create_output('dafoam_rom_states', (num_modes,))
+
+        return dafoam_rom_states
+
+
+    def solve_residual_equations(self, input_vals, output_vals):
+        # Pull values from self
+        dafoam_instance     = self.dafoam_instance
+        max_iters           = self.max_iters
+        use_constant_phi    = self.use_constant_phi
+        use_constant_fom_reference_state = self.use_constant_fom_reference_state
+
+        # Make sure solver is updated with the most recent input values
+        dafoam_instance.set_solver_input(input_vals)
+
+        # Determine if our basis is constant, or an input value
+        if use_constant_phi:
+            phi = self.phi
+        else:
+            phi = input_vals['phi']
+
+        # Determine if our reference state is constant, or an input value
+        if use_constant_fom_reference_state:
+            fom_states_ref = self.fom_states_ref
+        else:
+            fom_states_ref = input_vals['fom_states_ref']
+
+        # Initialize our newton convergence flag
+        converged = False
+
+        # Initialize our rom states (call them 'a' for now)
+        a = np.zeros((phi.shape[1], ))
+        
+        # Main Newton iteration loop
+        for iter in range(max_iters):
+            # Update states and update solver
+            fom_states = fom_states_ref + phi@a
+            dafoam_instance.setStates(fom_states)
+
+            # Compute residual at this new states value
+            res         = dafoam_instance.getResiduals()
+
+            # Reduce the residual and check if the tolerance is satisfied
+            res_reduced      = phi.T@res
+            res_reduced_norm = np.linalg.norm(res_reduced)
+
+            # Here we find the initial value for the residual
+            if iter == 0:
+                initial_res_reduced_norm = res_reduced_norm.copy()
+            
+            if res_reduced_norm/initial_res_reduced_norm < self.tolerance:
+                converged = True
+                break
+            
+            # (Re)compute Jacobian on first iteration or if not reusing the same Jacobian
+            if not reuse_jacobian or iter == 0:
+                jac_reduced = _compute_reduced_jacobian(phi, fom_states)
+
+            # Compute step and update ROM states
+            delta_a = np.linalg.solve(jac_reduced, -res_reduced)
+            a += delta_a
+        
+        # Once last state update for DAFoam
+        fom_states = fom_states_ref + phi@a
+        dafoam_instance.setStates(fom_states)
+
+        # Return NaN array as output (for the optimizer), otherwise return rom states
+        if converged:
+            output_vals['dafoam_rom_states'] = a
+        else:
+            print('Warning: ROM iteration limit reached!')
+            output_vals['dafoam_rom_states'] = np.full((a.shape[0], ), np.nan)
+
+
+    def apply_inverse_jacobian(self, input_vals, output_vals, d_outputs, d_residuals, mode):
+        raise NotImplementedError('DAFoamRomSolver apply_inverse_jacobian not implemented yet')
+
+    def compute_jacvec_product(self, input_vals, output_vals, d_inputs, d_outputs, d_residuals, mode):
+        raise NotImplementedError('DAFoamRomSolver compute_jacvec_product not implemented yet')
+
+
+    def _compute_reduced_jacobian(self, phi, states):
+        dafoam_instance     = self.dafoam_instance
+        phi_shape           = phi.shape
+        full_jac_times_phi  = np.zeros_like(phi)
+
+        # Update solver for desired states
+        dafoam_instance.setStates(states)
+        
+        # Loop over columns of phi
+        for i in range(phi_shape[1]):
+            seed    = phi[:, i]
+            product = np.zeros_like(seed)
+            dafoam_instance.solverAD.calcJacTVecProduct(
+                'dafoam_solver_states',
+                "stateVar",
+                dafoam_instance.getStates(),
+                'aero_residuals',
+                "residual",
+                seed,
+                product,
+            )
+
+            full_jac_times_phi[:, i] = product
+
+        reduced_jac = phi.T @ full_jac_times_phi
+
+        return reduced_jac
+
+
