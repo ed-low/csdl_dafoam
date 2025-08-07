@@ -578,9 +578,9 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
         # Check if user supplies a constant reference state (this cooresponds to a global reference)
         if fom_states_ref is not None:
             self.fom_states_ref     = fom_states_ref
-            self.use_constant_fom_reference_state = True
-        else:
             self.use_constant_fom_reference_state = False
+        else:
+            self.use_constant_fom_reference_state = True
 
 
     def evaluate(self, dafoam_input_variables_group:csdl.VariableGroup, phi:csdl.Variable=None, fom_states_ref:csdl.Variable=None):
