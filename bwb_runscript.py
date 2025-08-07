@@ -451,7 +451,7 @@ dafoam_function_outputs = dafoam_functions.evaluate(dafoam_solver_states,
 # 3: Minimize CD wrt angle-of-attack, wing shape (thickness/camber ffd), constrained by CL=0.5
 # 4: Minimize CD wrt angle-of-attack, wing shape (thickness/camber ffd) and wing twists, constrained by CL=0.5
 # 5: Maximize CL/CD wrt angle-of-attack and wing shape
-optimization_case = 3
+optimization_case = 1
 
 
 if optimization_case == 1:
