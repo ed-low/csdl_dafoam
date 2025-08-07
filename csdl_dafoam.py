@@ -604,6 +604,9 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
         # Set outputs
         dafoam_rom_states = self.create_output('dafoam_rom_states', (num_modes,))
 
+        # TODO: Add logic here to initialize a variable to save the most recent reduced jacobian evaluation?
+        # Or should this be in the __init__? In evaluate, we get the dimensions of phi...
+
         return dafoam_rom_states
 
 
