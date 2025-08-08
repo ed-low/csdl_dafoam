@@ -586,12 +586,18 @@ prob        = CSDLAlphaProblem(problem_name=f'{problem_name}_rank{rank_str}', si
 #                   'save_figname':     f'rank{rank_str}_slsqp_plot.pdf',
 #                   'save_filename':    f'rank{rank_str}_slsqp_recorder.hdf5'}
 # optimizer   = PySLSQP(prob, solver_options=solver_options)
+# optimizer.solve()
+# optimizer.print_results()
+
 
 # OpenSQP optimizer setup
-
 optimizer   = OpenSQP(prob)
-
-# optimizer.check_first_derivatives(prob.x0)
-
 optimizer.solve()
 optimizer.print_results()
+
+
+
+
+
+# # Extra items to use, if necessary
+# optimizer.check_first_derivatives(prob.x0)
