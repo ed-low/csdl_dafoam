@@ -268,8 +268,9 @@ class DAFoamSolver(csdl.experimental.CustomImplicitOperation):
         # Update solver states only if no NaNs exist
         if not global_has_nan:
             dafoam_instance.setStates(states)
+        else:
             if rank == 0:
-                print('DAFoamFunctions.compute: Detected NaN(s) in input_vals. Skipping DAFoam setStates')
+                print('DAFoamSolver.compute_jacvec_product: Detected NaN(s) in input_vals. Skipping DAFoam setStates')
 
         # Can't do forward mode
         if mode == 'fwd':
@@ -377,6 +378,7 @@ class DAFoamFunctions(csdl.CustomExplicitOperation):
         # Update solver states only if no NaNs exist
         if not global_has_nan:
             dafoam_instance.setStates(states)
+        else:
             if rank == 0:
                 print('DAFoamFunctions.compute: Detected NaN(s) in input_vals. Skipping DAFoam setStates')
 
@@ -405,8 +407,9 @@ class DAFoamFunctions(csdl.CustomExplicitOperation):
         # Update solver states only if no NaNs exist
         if not global_has_nan:
             dafoam_instance.setStates(states)
+        else:
             if rank == 0:
-                print('DAFoamFunctions.compute: Detected NaN(s) in input_vals. Skipping DAFoam setStates')
+                print('DAFoamFunctions.compute_jacvec_product: Detected NaN(s) in input_vals. Skipping DAFoam setStates')
 
         # Can't do forward mode
         if mode == 'fwd':
