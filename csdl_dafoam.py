@@ -89,20 +89,22 @@ class DAFoamSolver(csdl.experimental.CustomImplicitOperation):
 
         #*****************
         meshOK = 1#dafoam_instance.solver.checkMesh()
-        print('SKIPPING MESH CHECK. BE SURE TO CHANGE THIS BACK WHEN DONE DEBUGGING')
+        if dafoam_instance.rank == 0:
+            print('SKIPPING MESH CHECK. BE SURE TO CHANGE THIS BACK WHEN DONE DEBUGGING')
         #*****************
 
         # if the mesh is not OK, do not run the primal
         if meshOK != 1:
             dafoam_instance.solver.writeFailedMesh()
-            print('Mesh is not OK!')
+            if dafoam_instance.rank == 0:
+                print('Mesh is not OK!')
             return
 
         # Run primal
         dafoam_instance()
 
         # if the primal fails, do not set states and return
-        if dafoam_instance.primalFail != 0:
+        if dafoam_instance.primalFail != 0 and dafoam_instance.rank == 0:
             print('Primal solution failed!')
 
         # after solving the primal, we need to print its residual info
@@ -351,6 +353,10 @@ class DAFoamFunctions(csdl.CustomExplicitOperation):
 
     def compute(self, input_vals, output_vals):
         dafoam_instance = self.dafoam_instance
+
+        # Check if states contain any NaN or Inf values
+        states = input_vals['dafoam_solver_states']
+
 
         # Update solver states
         dafoam_instance.setStates(input_vals['dafoam_solver_states'])
