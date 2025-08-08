@@ -578,9 +578,9 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
         # Check if user supplies a constant reference state (this cooresponds to a global reference)
         if fom_states_ref is not None:
             self.fom_states_ref     = fom_states_ref
-            self.use_constant_fom_reference_state = False
-        else:
             self.use_constant_fom_reference_state = True
+        else:
+            self.use_constant_fom_reference_state = False
 
 
     def evaluate(self, dafoam_input_variables_group:csdl.VariableGroup, phi:csdl.Variable=None, fom_states_ref:csdl.Variable=None):
@@ -607,6 +607,11 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
         # TODO: Add logic here to initialize a variable to save the most recent reduced jacobian evaluation?
         # Or should this be in the __init__? In evaluate, we get the dimensions of phi...
 
+        # TODO: Add logic for determining the FOM reference state:
+        # Different options:
+        #     CSDL Variable/constant
+        #     Did user pass value in? If not use zero mean?
+
         return dafoam_rom_states
 
 
@@ -616,6 +621,9 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
         max_iters           = self.max_iters
         use_constant_phi    = self.use_constant_phi
         use_constant_fom_reference_state = self.use_constant_fom_reference_state
+        
+        # MPI stuff
+        rank = dafoam_instance.rank
 
         # Make sure solver is updated with the most recent input values
         dafoam_instance.set_solver_input(input_vals)
@@ -625,6 +633,10 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
             phi = self.phi
         else:
             phi = input_vals['phi']
+
+        # Create local version of our basis
+        vol_mesh_inds = dafoam_instance.getSolverMeshIndices().reshape(-1, 3)[:, 1]//3
+        phi_local     = phi[vol_mesh_inds, :]
 
         # Determine if our reference state is constant, or an input value
         if use_constant_fom_reference_state:
@@ -641,7 +653,8 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
         # Main Newton iteration loop
         for iter in range(max_iters):
             # Update states and update solver
-            fom_states = fom_states_ref + phi@a
+            print(f'Rank {rank} size: vol_mesh_inds ({vol_mesh_inds.shape}), fom_states_ref ({fom_states_ref.shape}), phi_local ({phi_local.shape}), a ({a.shape})')
+            fom_states = fom_states_ref + phi_local@a
             dafoam_instance.setStates(fom_states)
 
             # Compute residual at this new states value
