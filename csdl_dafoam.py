@@ -53,7 +53,7 @@ class DAFoamSolver(csdl.experimental.CustomImplicitOperation):
 
         # create the adjoint vector
         self.num_state_elements = dafoam_instance.getNLocalAdjointStates()
-        self.psi = PETSc.Vec().create(comm=PETSc.COMM_WORLD)
+        self.psi = PETSc.Vec().create(comm=dafoam_instance.comm)
         self.psi.setSizes((self.num_state_elements, PETSc.DECIDE), bsize=1)
         self.psi.setFromOptions()
         self.psi.zeroEntries()
