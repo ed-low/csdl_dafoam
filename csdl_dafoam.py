@@ -257,7 +257,18 @@ class DAFoamSolver(csdl.experimental.CustomImplicitOperation):
         # assign the states in outputs to the OpenFOAM flow fields
         # NOTE: this is not quite necessary because setStates have been called before in the solve_nonlinear
         # here we call it just be on the safe side
-        dafoam_instance.setStates(output_vals['dafoam_solver_states'])
+        # Check if states contain any NaN values (NaNs would be passed from optimizer)
+        # TODO: Maybe check for Inf as well?
+        states = output_vals['dafoam_solver_states']
+        has_nan = False
+        if np.any(np.isnan(states)):
+            has_nan = True
+            if dafoam_instance.rank == 0:
+                print('DAFoamSolver.compute_jacvec_product: Detected NaN(s) in output_vals. Skipping DAFoam setStates')
+
+        # Update solver states only if no NaNs exist
+        if not has_nan:
+            dafoam_instance.setStates(states)
 
         # Can't do forward mode
         if mode == 'fwd':
@@ -354,24 +365,45 @@ class DAFoamFunctions(csdl.CustomExplicitOperation):
     def compute(self, input_vals, output_vals):
         dafoam_instance = self.dafoam_instance
 
-        # Check if states contain any NaN or Inf values
+        # Check if states contain any NaN values (NaNs would be passed from optimizer)
+        # TODO: Maybe check for Inf as well?
         states = input_vals['dafoam_solver_states']
+        has_nan = False
+        if np.any(np.isnan(states)):
+            has_nan = True
 
+        # Update solver states only if no NaNs exist
+        if not has_nan:
+            dafoam_instance.setStates(states)
+            if dafoam_instance.rank == 0:
+                print('DAFoamFunctions.compute: Detected NaN(s) in input_vals. Skipping DAFoam setStates')
 
-        # Update solver states
-        dafoam_instance.setStates(input_vals['dafoam_solver_states'])
-
-        # Read daOptions to get outputs, and assign them to respective outputs
+        # Read daOptions to get outputs, and assign them to respective outputs.
+        # Assign NaN if NaN existed in state
         output_dict = self.dafoam_instance.getOption("function")
         for output_name in output_dict.keys():
-            output_vals[output_name] = dafoam_instance.solver.calcFunction(output_name)
+            function_val = dafoam_instance.solver.calcFunction(output_name)
+            if has_nan:
+                output_vals[output_name] = np.nan*function_val
+            else:
+                output_vals[output_name] = function_val
 
 
     def compute_jacvec_product(self, input_vals, output_vals, d_inputs, d_outputs, mode):
         dafoam_instance = self.dafoam_instance
 
-        # Update quantities
-        dafoam_instance.setStates(input_vals['dafoam_solver_states'])
+        # Check if states contain any NaN values (NaNs would be passed from optimizer)
+        # TODO: Maybe check for Inf as well?
+        states = input_vals['dafoam_solver_states']
+        has_nan = False
+        if np.any(np.isnan(states)):
+            has_nan = True
+            if dafoam_instance.rank == 0:
+                print('DAFoamFunctions.compute_jacvec_product: Detected NaN(s) in input_vals. Skipping DAFoam setStates')
+
+        # Update solver states only if no NaNs exist
+        if not has_nan:
+            dafoam_instance.setStates(states)
 
         # Can't do forward mode
         if mode == 'fwd':
