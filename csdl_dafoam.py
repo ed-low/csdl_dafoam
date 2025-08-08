@@ -352,19 +352,13 @@ class DAFoamFunctions(csdl.CustomExplicitOperation):
     def compute(self, input_vals, output_vals):
         dafoam_instance = self.dafoam_instance
 
-        # Update solver states (I don't think this is really necessary... Only the function values from the
-        # latest evaluation is retrieved - for CL and CD, at least.)
+        # Update solver states
         dafoam_instance.setStates(input_vals['dafoam_solver_states'])
 
-        # Initialize and evaluate
-        funcs = {}
-        dafoam_instance.evalFunctions(funcs)
-
         # Read daOptions to get outputs, and assign them to respective outputs
-        outputDict = self.dafoam_instance.getOption("function")
-        for outputName in outputDict.keys():
-            output_vals[outputName] = funcs[outputName]
-            output_vals[outputName] = funcs[outputName]
+        output_dict = self.dafoam_instance.getOption("function")
+        for output_name in output_dict.keys():
+            output_vals[output_name] = dafoam_instance.solver.calcFunction(output_name)
 
 
     def compute_jacvec_product(self, input_vals, output_vals, d_inputs, d_outputs, mode):
