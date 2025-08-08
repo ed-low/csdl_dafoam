@@ -241,8 +241,9 @@ class DAFoamSolver(csdl.experimental.CustomImplicitOperation):
             #raise AnalysisError("Adjoint solution failed!")
 
             #*****************
-            print("----------- !!!ADJOINT SOLUTION FAILED!!! -----------")
-            print("Continuing anyways! (Fix this in code later)")
+            if dafoam_instance.rank == 0:
+                print("----------- !!!ADJOINT SOLUTION FAILED!!! -----------")
+                print("Continuing anyways! (Fix this in code later)")
             #*****************
         
         # CHANGE DIRECTORY WORKAROUND 4/4
