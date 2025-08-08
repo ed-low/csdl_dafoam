@@ -67,10 +67,10 @@ class DAFoamSolver(csdl.experimental.CustomImplicitOperation):
 
     def evaluate(self, dafoam_input_variables_group:csdl.VariableGroup):
         # Read daOptions to set proper inputs
-        inputDict = self.dafoam_instance.getOption("inputInfo")
-        for inputName in inputDict.keys():
-            if "solver" in inputDict[inputName]["components"]:
-                self.declare_input(inputName, getattr(dafoam_input_variables_group, inputName))   
+        input_dict = self.dafoam_instance.getOption("inputInfo")
+        for input_name in input_dict.keys():
+            if "solver" in input_dict[input_name]["components"]:
+                self.declare_input(input_name, getattr(dafoam_input_variables_group, input_name))   
 
         # Set outputs
         dafoam_solver_states = self.create_output('dafoam_solver_states', (self.num_state_elements,))
@@ -266,21 +266,21 @@ class DAFoamSolver(csdl.experimental.CustomImplicitOperation):
             seed = d_residuals['dafoam_solver_states']
  
             # loop over all inputs keys and compute the matrix-vector products accordingly
-            inputDict = dafoam_instance.getOption("inputInfo")
-            for inputName in list(input_vals.keys()):
-                inputType = inputDict[inputName]["type"]
-                jacInput = input_vals[inputName].copy()
-                product = np.zeros_like(jacInput)
+            input_dict = dafoam_instance.getOption("inputInfo")
+            for input_name in list(input_vals.keys()):
+                input_type = input_dict[input_name]["type"]
+                jac_input = input_vals[input_name].copy()
+                product = np.zeros_like(jac_input)
                 dafoam_instance.solverAD.calcJacTVecProduct(
-                    inputName,
-                    inputType,
-                    jacInput,
+                    input_name,
+                    input_type,
+                    jac_input,
                     "aero_residuals",
                     "residual",
                     seed,
                     product,
                 )
-                d_inputs[inputName] += product
+                d_inputs[input_name] += product
 
 
     def _updateKSPTolerances(self, psi, dFdW, ksp):
@@ -293,12 +293,12 @@ class DAFoamSolver(csdl.experimental.CustomImplicitOperation):
         dafoam_instance = self.dafoam_instance
         # calculate the initial residual for the adjoint before solving
         rArray = np.zeros(self.num_state_elements)
-        jacInput = dafoam_instance.getStates()
+        jac_input = dafoam_instance.getStates()
         seed = dafoam_instance.vec2Array(psi)
         dafoam_instance.solverAD.calcJacTVecProduct(
             'dafoam_solver_states',
             "stateVar",
-            jacInput,
+            jac_input,
             'aero_residuals',
             "residual",
             seed,
@@ -333,10 +333,10 @@ class DAFoamFunctions(csdl.CustomExplicitOperation):
         self.declare_input("dafoam_solver_states", dafoam_solver_states)
         
         # Read daOptions to set proper inputs
-        inputDict = self.dafoam_instance.getOption("inputInfo")
-        for inputName in inputDict.keys():
-            if "function" in inputDict[inputName]["components"]:
-                self.declare_input(inputName, getattr(dafoam_input_variables_group, inputName))  
+        input_dict = self.dafoam_instance.getOption("inputInfo")
+        for input_name in input_dict.keys():
+            if "function" in input_dict[input_name]["components"]:
+                self.declare_input(input_name, getattr(dafoam_input_variables_group, input_name))  
         
         # Initialize output
         dafoam_function_output = csdl.VariableGroup()
@@ -371,7 +371,7 @@ class DAFoamFunctions(csdl.CustomExplicitOperation):
         if mode == 'fwd':
             raise NotImplementedError('forward mode has not been implemented for DAFoamFunctions')
         
-        inputDict = dafoam_instance.getOption("inputInfo")
+        input_dict = dafoam_instance.getOption("inputInfo")
         for functionName in list(d_outputs.keys()):
 
             seed = d_outputs[functionName]
@@ -380,15 +380,15 @@ class DAFoamFunctions(csdl.CustomExplicitOperation):
             if abs(seed) < 1e-12:
                 continue
 
-            for inputName in list(d_inputs.keys()):
+            for input_name in list(d_inputs.keys()):
                 # compute dFdW * seed
-                if inputName == 'dafoam_solver_states':
-                    jacInput = input_vals['dafoam_solver_states']
-                    product = np.zeros_like(jacInput)
+                if input_name == 'dafoam_solver_states':
+                    jac_input = input_vals['dafoam_solver_states']
+                    product = np.zeros_like(jac_input)
                     dafoam_instance.solverAD.calcJacTVecProduct(
                         'dafoam_solver_states',
                         "stateVar",
-                        jacInput,
+                        jac_input,
                         functionName,
                         "function",
                         seed,
@@ -396,19 +396,19 @@ class DAFoamFunctions(csdl.CustomExplicitOperation):
                     )
                     d_inputs['dafoam_solver_states'] += product
                 else:
-                    inputType = inputDict[inputName]["type"]
-                    jacInput = input_vals[inputName]
-                    product = np.zeros_like(jacInput)
+                    input_type = input_dict[input_name]["type"]
+                    jac_input = input_vals[input_name]
+                    product = np.zeros_like(jac_input)
                     dafoam_instance.solverAD.calcJacTVecProduct(
-                        inputName,
-                        inputType,
-                        jacInput,
+                        input_name,
+                        input_type,
+                        jac_input,
                         functionName,
                         "function",
                         seed,
                         product,
                     )
-                    d_inputs[inputName] += product
+                    d_inputs[input_name] += product
 
 
 
