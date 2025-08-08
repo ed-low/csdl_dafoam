@@ -3,7 +3,7 @@ bwb_geometry/
 console_outputs/
 openfoam_*/
 stored_files/
-obj_*/
+optimization_case_results/
 ASO_2DAF_send/
 
 # Misc files
