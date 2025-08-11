@@ -152,8 +152,12 @@ class DAFoamSolver(csdl.experimental.CustomImplicitOperation):
 
         # right hand side array from d_outputs
         dFdWArray = d_outputs['dafoam_solver_states']
+
+        # Check for NaNs - exit early if found
         if np.any(np.isnan(dFdWArray)):
-            print('Found NaN in dFdWArray')
+            print('DAFoamSolver.apply_inverse_jacobian: Found NaN in dFdWArray! Returning NaNs for d_residuals')
+            d_residuals['dafoam_solver_states'] = np.nan*np.ones((self.num_state_elements, ))
+            return
 
         # convert the array to vector
         dFdW = dafoam_instance.array2Vec(dFdWArray)
