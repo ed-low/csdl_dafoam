@@ -10,7 +10,7 @@ from mpi4py import MPI
 USE_CHANGE_DIRECTORY_WORKAROUND = True
 
 def instantiateDAFoam(options, comm, run_directory=None, mesh_options=None):
-    # CHANGE DIRECTORY WORKAROUND 1/4
+    # CHANGE DIRECTORY WORKAROUND 1/5
     # NOTE: This workaround was implemented so that we
     # can change back and forth from the run_directory to
     # whatever directory was initially in place. This serves
@@ -138,7 +138,7 @@ class DAFoamSolver(csdl.experimental.CustomImplicitOperation):
     def apply_inverse_jacobian(self, input_vals, output_vals, d_outputs, d_residuals, mode):
         dafoam_instance = self.dafoam_instance
 
-        # CHANGE DIRECTORY WORKAROUND 3/4
+        # CHANGE DIRECTORY WORKAROUND 3/5
         if USE_CHANGE_DIRECTORY_WORKAROUND:
             previous_directory = os.getcwd()
             os.chdir(dafoam_instance.run_directory)
@@ -154,9 +154,17 @@ class DAFoamSolver(csdl.experimental.CustomImplicitOperation):
         dFdWArray = d_outputs['dafoam_solver_states']
 
         # Check for NaNs - exit early if found
-        if np.any(np.isnan(dFdWArray)):
-            print('DAFoamSolver.apply_inverse_jacobian: Found NaN in dFdWArray! Returning NaNs for d_residuals')
+        if has_global_nan_or_inf(dFdWArray, dafoam_instance.comm):
+            if dafoam_instance.rank == 0:
+                print('DAFoamSolver.apply_inverse_jacobian: Found NaN in dFdWArray! Returning NaNs for d_residuals')
+            
             d_residuals['dafoam_solver_states'] = np.nan*np.ones((self.num_state_elements, ))
+            
+            # Have to change the directory back 
+            # CHANGE DIRECTORY WORKAROUND 4/5
+            if USE_CHANGE_DIRECTORY_WORKAROUND:
+                os.chdir(previous_directory)
+            # -------------------------------
             return
 
         # convert the array to vector
@@ -259,7 +267,7 @@ class DAFoamSolver(csdl.experimental.CustomImplicitOperation):
                 print("Continuing anyways! (Fix this in code later)")
             #*****************
         
-        # CHANGE DIRECTORY WORKAROUND 4/4
+        # CHANGE DIRECTORY WORKAROUND 5/5
         if USE_CHANGE_DIRECTORY_WORKAROUND:
             os.chdir(previous_directory)
         # -------------------------------
@@ -274,13 +282,10 @@ class DAFoamSolver(csdl.experimental.CustomImplicitOperation):
         # NOTE: this is not quite necessary because setStates have been called before in the solve_nonlinear
         # here we call it just be on the safe side
         # Check if states contain any NaN values (NaNs would be passed from optimizer)
-        # TODO: Maybe check for Inf as well?
         states = output_vals['dafoam_solver_states']
-        local_has_nan  = np.any(np.isnan(states))
-        global_has_nan = comm.allreduce(local_has_nan, op=MPI.LOR)
 
         # Update solver states only if no NaNs exist
-        if not global_has_nan:
+        if not has_global_nan_or_inf(states, comm):
             dafoam_instance.setStates(states)
         else:
             if rank == 0:
@@ -386,11 +391,10 @@ class DAFoamFunctions(csdl.CustomExplicitOperation):
         # Check if states contain any NaN values (NaNs would be passed from optimizer)
         # TODO: Maybe check for Inf as well?
         states = input_vals['dafoam_solver_states']
-        local_has_nan  = np.any(np.isnan(states))
-        global_has_nan = comm.allreduce(local_has_nan, op=MPI.LOR)
 
         # Update solver states only if no NaNs exist
-        if not global_has_nan:
+        has_nan_or_inf = has_global_nan_or_inf(states, comm)
+        if not has_nan_or_inf:
             dafoam_instance.setStates(states)
         else:
             if rank == 0:
@@ -401,7 +405,7 @@ class DAFoamFunctions(csdl.CustomExplicitOperation):
         output_dict = self.dafoam_instance.getOption("function")
         for output_name in output_dict.keys():
             function_val = dafoam_instance.solver.calcFunction(output_name)
-            if global_has_nan:
+            if has_nan_or_inf:
                 output_vals[output_name] = np.nan*function_val
             else:
                 output_vals[output_name] = function_val
@@ -415,11 +419,9 @@ class DAFoamFunctions(csdl.CustomExplicitOperation):
         # Check if states contain any NaN values (NaNs would be passed from optimizer)
         # TODO: Maybe check for Inf as well?
         states = input_vals['dafoam_solver_states']
-        local_has_nan  = np.any(np.isnan(states))
-        global_has_nan = comm.allreduce(local_has_nan, op=MPI.LOR)
 
         # Update solver states only if no NaNs exist
-        if not global_has_nan:
+        if not has_global_nan_or_inf(states, comm):
             dafoam_instance.setStates(states)
         else:
             if rank == 0:
@@ -528,3 +530,25 @@ def compute_dafoam_input_variables(dafoam_instance, ambient_conditions_group:csd
             raise NotImplementedError(f'unable to create csdl variable for "{input_name}" (type "{input_type}" interpretation not implemented)')
 
     return dafoam_input_variables_group
+
+
+
+def has_global_nan_or_inf(arr, comm):
+    """
+    Check if a distributed array contains any NaN or Inf values across all MPI ranks.
+
+    Parameters
+    ----------
+    arr : np.ndarray
+        Local portion of the array.
+    comm : MPI.Comm
+        MPI communicator.
+
+    Returns
+    -------
+    bool
+        True if any NaN or Inf exists in the *global* array, else False.
+    """
+    local_has_nan_or_inf  = np.any(np.isnan(arr) | np.isinf(arr))
+    global_has_nan_or_inf = comm.allreduce(local_has_nan_or_inf, op=MPI.LOR)
+    return global_has_nan_or_inf
