@@ -3,6 +3,8 @@ import numpy as np
 import csdl_alpha as csdl
 from petsc4py import PETSc
 import os
+from mpi4py import MPI
+
 
 
 USE_CHANGE_DIRECTORY_WORKAROUND = True
@@ -146,6 +148,9 @@ class DAFoamSolver(csdl.experimental.CustomImplicitOperation):
 
         # right hand side array from d_outputs
         dFdWArray = d_outputs['dafoam_solver_states']
+        if np.any(np.isnan(dFdWArray)):
+            print('Found NaN in dFdWArray')
+
         # convert the array to vector
         dFdW = dafoam_instance.array2Vec(dFdWArray)
 
@@ -262,7 +267,7 @@ class DAFoamSolver(csdl.experimental.CustomImplicitOperation):
         # here we call it just be on the safe side
         # Check if states contain any NaN values (NaNs would be passed from optimizer)
         # TODO: Maybe check for Inf as well?
-        states = input_vals['dafoam_solver_states']
+        states = output_vals['dafoam_solver_states']
         local_has_nan  = np.any(np.isnan(states))
         global_has_nan = comm.allreduce(local_has_nan, op=MPI.LOR)
 
