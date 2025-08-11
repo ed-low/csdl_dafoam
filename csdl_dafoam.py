@@ -114,8 +114,10 @@ class DAFoamSolver(csdl.experimental.CustomImplicitOperation):
         else:
             dafoam_instance.solver.calcPrimalResidualStatistics("print")
 
-        # assign the computed flow states to outputs
+        # Use this to assign the computed flow states
         states = dafoam_instance.getStates()
+
+        # Unconverged case - return NaN for CSDL, revert to last successful state for DAFoam
         if dafoam_instance.primalFail != 0:
             if dafoam_instance.rank == 0:
                 print('Primal solution failed!')
@@ -126,6 +128,8 @@ class DAFoamSolver(csdl.experimental.CustomImplicitOperation):
 
             # Revert solver to last successful primal state (to help with convergence on next iteration)
             dafoam_instance.setStates(self.last_successful_primal_states)
+
+        # Converged case - return states and update the last successful primal state with current
         else:
             output_vals['dafoam_solver_states'] = states
             self.last_successful_primal_states  = states
