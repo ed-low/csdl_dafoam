@@ -66,6 +66,9 @@ class DAFoamSolver(csdl.experimental.CustomImplicitOperation):
         else:
             self.runColoring = True 
 
+        # Saving last successful primal result (in case primal fails)
+        self.last_successful_primal_states = np.zeros((self.num_state_elements, ))
+
 
     def evaluate(self, dafoam_input_variables_group:csdl.VariableGroup):
         # Read daOptions to set proper inputs
@@ -105,11 +108,7 @@ class DAFoamSolver(csdl.experimental.CustomImplicitOperation):
         # Run primal
         dafoam_instance()
 
-        # if the primal fails, do not set states and return
-        if dafoam_instance.primalFail != 0 and dafoam_instance.rank == 0:
-            print('Primal solution failed!')
-
-        # after solving the primal, we need to print its residual info
+        # After solving the primal, we need to print its residual info
         if dafoam_instance.getOption("useAD")["mode"] == "forward":
             dafoam_instance.solverAD.calcPrimalResidualStatistics("print")
         else:
@@ -118,13 +117,18 @@ class DAFoamSolver(csdl.experimental.CustomImplicitOperation):
         # assign the computed flow states to outputs
         states = dafoam_instance.getStates()
         if dafoam_instance.primalFail != 0:
+            if dafoam_instance.rank == 0:
+                print('Primal solution failed!')
+                print('(Resetting DAFoam solver primal state to that of the last successful evaluation)')
+
             # If we didn't converge, send the optimizer a nan solution (we'll let DAFoam keep the unconverged solution, though)
             output_vals['dafoam_solver_states'] = np.full((self.num_state_elements, ), np.nan)
+
+            # Revert solver to last successful primal state (to help with convergence on next iteration)
+            dafoam_instance.setStates(self.last_successful_primal_states)
         else:
             output_vals['dafoam_solver_states'] = states
-
-        # set states
-        dafoam_instance.setStates(states)
+            self.last_successful_primal_states  = states
 
         # We also need to just calculate the residual for the AD mode to initialize vars like URes
         # We do not print the residual for AD, though
