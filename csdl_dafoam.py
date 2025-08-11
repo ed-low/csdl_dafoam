@@ -123,7 +123,7 @@ class DAFoamSolver(csdl.experimental.CustomImplicitOperation):
                 print('Primal solution failed!')
                 print('(Resetting DAFoam solver primal state to that of the last successful evaluation)')
 
-            # If we didn't converge, send the optimizer a nan solution (we'll let DAFoam keep the unconverged solution, though)
+            # If we didn't converge, send the optimizer a NaN solution
             output_vals['dafoam_solver_states'] = np.full((self.num_state_elements, ), np.nan)
 
             # Revert solver to last successful primal state (to help with convergence on next iteration)
