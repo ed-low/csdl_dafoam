@@ -214,7 +214,7 @@ x_surf_dafoam_initial_mpi   = dafoam_instance.getSurfaceCoordinates()
 x_vol_dafoam_initial_mpi    = dafoam_instance.xv0
 
 local_n_surf  = x_surf_dafoam_initial_mpi.shape[0]
-local_n_vol   = x_surf_dafoam_initial_mpi.shape[0]
+local_n_vol   = x_vol_dafoam_initial_mpi.shape[0]
 
 # Gathering surface mesh to rank 0 (need to do this to avoid 'no-element' ranks in the projection
 # and geometry evaluation functions)
