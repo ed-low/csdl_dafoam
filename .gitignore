@@ -1,5 +1,6 @@
 # Data folders
 bwb_geometry/
+airfoil_geometry
 console_outputs/
 openfoam_*/
 stored_files/
