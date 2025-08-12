@@ -619,6 +619,7 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
         # Pull values from self
         dafoam_instance     = self.dafoam_instance
         max_iters           = self.max_iters
+        reuse_jacobian      = self.reuse_jacobian
         use_constant_phi    = self.use_constant_phi
         use_constant_fom_reference_state = self.use_constant_fom_reference_state
         
@@ -634,9 +635,6 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
         else:
             phi = input_vals['phi']
 
-        # Create local version of our basis
-        vol_mesh_inds = dafoam_instance.getSolverMeshIndices().reshape(-1, 3)[:, 1]//3
-        phi_local     = phi[vol_mesh_inds, :]
 
         # Determine if our reference state is constant, or an input value
         if use_constant_fom_reference_state:
@@ -653,8 +651,7 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
         # Main Newton iteration loop
         for iter in range(max_iters):
             # Update states and update solver
-            print(f'Rank {rank} size: vol_mesh_inds ({vol_mesh_inds.shape}), fom_states_ref ({fom_states_ref.shape}), phi_local ({phi_local.shape}), a ({a.shape})')
-            fom_states = fom_states_ref + phi_local@a
+            fom_states = fom_states_ref + phi@a
             dafoam_instance.setStates(fom_states)
 
             # Compute residual at this new states value
@@ -674,7 +671,7 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
             
             # (Re)compute Jacobian on first iteration or if not reusing the same Jacobian
             if not reuse_jacobian or iter == 0:
-                jac_reduced = _compute_reduced_jacobian(phi, fom_states)
+                jac_reduced = self._compute_reduced_jacobian(phi, fom_states)
 
             # Compute step and update ROM states
             delta_a = np.linalg.solve(jac_reduced, -res_reduced)
@@ -709,7 +706,7 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
         
         # Loop over columns of phi
         for i in range(phi_shape[1]):
-            seed    = phi[:, i]
+            seed    = np.ascontiguousarray(phi[:, i])
             product = np.zeros_like(seed)
             dafoam_instance.solverAD.calcJacTVecProduct(
                 'dafoam_solver_states',
