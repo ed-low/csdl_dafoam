@@ -265,7 +265,9 @@ dafoam_input_variables_group = compute_dafoam_input_variables(dafoam_instance,
 dafoam_rom           = DAFoamROM(dafoam_instance, phi=phi_full, fom_states_ref=fom_states_ref)
 dafoam_rom_states    = dafoam_rom.evaluate(dafoam_input_variables_group)
 
-dafoam_fom_states    = phi_full*dafoam_rom_states
+print(f'dafoam_rom_states: {dafoam_rom_states.value}')
+
+dafoam_fom_states    = csdl.matvec(phi_full, dafoam_rom_states)
 
 # DAFoamFunctions Explicit component setup and evaluation
 dafoam_functions = DAFoamFunctions(dafoam_instance)
