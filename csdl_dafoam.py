@@ -54,9 +54,9 @@ class DAFoamSolver(csdl.experimental.CustomImplicitOperation):
         dafoam_instance.solverAD.initializedRdWTMatrixFree()
 
         # create the adjoint vector
-        self.num_state_elements = dafoam_instance.getNLocalAdjointStates()
+        self.num_local_state_elements = dafoam_instance.getNLocalAdjointStates()
         self.psi = PETSc.Vec().create(comm=dafoam_instance.comm)
-        self.psi.setSizes((self.num_state_elements, PETSc.DECIDE), bsize=1)
+        self.psi.setSizes((self.num_local_state_elements, PETSc.DECIDE), bsize=1)
         self.psi.setFromOptions()
         self.psi.zeroEntries()
 
@@ -67,7 +67,7 @@ class DAFoamSolver(csdl.experimental.CustomImplicitOperation):
             self.runColoring = True 
 
         # Saving last successful primal result (in case primal fails)
-        self.last_successful_primal_states = np.zeros((self.num_state_elements, ))
+        self.last_successful_primal_states = np.zeros((self.num_local_state_elements, ))
 
 
     def evaluate(self, dafoam_input_variables_group:csdl.VariableGroup):
@@ -105,6 +105,11 @@ class DAFoamSolver(csdl.experimental.CustomImplicitOperation):
                 print('Mesh is not OK!')
             return
 
+        # Revert solver to last successful primal state (to help with convergence on next iteration)
+        # (This helps when we had an unconverged run last - placing here instead of at end in unconverged
+        #  scenario allows us to still used the unconverged results from the solver if necessary)   
+        dafoam_instance.setStates(self.last_successful_primal_states)
+
         # Run primal
         dafoam_instance()
 
@@ -124,10 +129,7 @@ class DAFoamSolver(csdl.experimental.CustomImplicitOperation):
                 print('(Resetting DAFoam solver primal state to that of the last successful evaluation)')
 
             # If we didn't converge, send the optimizer a NaN solution
-            output_vals['dafoam_solver_states'] = np.full((self.num_state_elements, ), np.nan)
-
-            # Revert solver to last successful primal state (to help with convergence on next iteration)
-            dafoam_instance.setStates(self.last_successful_primal_states)
+            output_vals['dafoam_solver_states'] = np.full((self.num_local_state_elements, ), np.nan)
 
         # Converged case - return states and update the last successful primal state with current
         else:
@@ -162,7 +164,7 @@ class DAFoamSolver(csdl.experimental.CustomImplicitOperation):
             if dafoam_instance.rank == 0:
                 print('DAFoamSolver.apply_inverse_jacobian: Found NaN in dFdWArray! Returning NaNs for d_residuals')
             
-            d_residuals['dafoam_solver_states'] = np.nan*np.ones((self.num_state_elements, ))
+            d_residuals['dafoam_solver_states'] = np.nan*np.ones((self.num_local_state_elements, ))
             
             # Have to change the directory back 
             # CHANGE DIRECTORY WORKAROUND 4/5
@@ -330,7 +332,7 @@ class DAFoamSolver(csdl.experimental.CustomImplicitOperation):
 
         dafoam_instance = self.dafoam_instance
         # calculate the initial residual for the adjoint before solving
-        rArray = np.zeros(self.num_state_elements)
+        rArray = np.zeros(self.num_local_state_elements)
         jac_input = dafoam_instance.getStates()
         seed = dafoam_instance.vec2Array(psi)
         dafoam_instance.solverAD.calcJacTVecProduct(
@@ -483,11 +485,11 @@ def compute_dafoam_input_variables(dafoam_instance, ambient_conditions_group:csd
     # a_m_s (Speed of sound [m/s])
 
     # Currently expect the flight_conditions_group to, at minimum, contain the following variables:
-    # airspeed_m_s     (airspeed [m/s])
-    # angle_of_attack  (Angle of attack [deg])
+    # airspeed_m_s         (airspeed [m/s])
+    # angle_of_attack_deg  (Angle of attack [deg])
     # OR
-    # mach_number      (Mach number)
-    # angle_of_attack  (Angle of attack [deg])
+    # mach_number          (Mach number)
+    # angle_of_attack_deg  (Angle of attack [deg])
     
     # Initialize dafoam variable group
     dafoam_input_variables_group = csdl.VariableGroup()
@@ -510,7 +512,7 @@ def compute_dafoam_input_variables(dafoam_instance, ambient_conditions_group:csd
                 flight_conditions_group.airspeed_m_s = flight_conditions_group.mach_number*ambient_conditions_group.a_m_s
 
             # Create the patchVelocity input
-            patchVelocity = csdl.concatenate((flight_conditions_group.airspeed_m_s, flight_conditions_group.angle_of_attack))
+            patchVelocity = csdl.concatenate((flight_conditions_group.airspeed_m_s, flight_conditions_group.angle_of_attack_deg))
             setattr(dafoam_input_variables_group, input_name, patchVelocity)
         
         # If the type is a patchVar, we assign the appropriate value to the CSDL variable
