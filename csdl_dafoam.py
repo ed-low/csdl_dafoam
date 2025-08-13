@@ -69,7 +69,7 @@ class DAFoamSolver(csdl.experimental.CustomImplicitOperation):
             self.runColoring = True 
 
         # Saving last successful primal result (in case primal fails)
-        self.last_successful_primal_states = np.zeros((self.num_local_state_elements, ))
+        self.last_successful_primal_states = dafoam_instance.getStates()
 
 
     # region evaluate
