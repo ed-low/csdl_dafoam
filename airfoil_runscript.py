@@ -305,7 +305,7 @@ x_vol_dafoam    = idwarp_model.evaluate(x_surf_dafoam)
 # Flight condition variables
 flight_conditions_group                 = csdl.VariableGroup()
 flight_conditions_group.mach_number     = csdl.Variable(value=0.7, name="mach_number")
-flight_conditions_group.angle_of_attack = csdl.Variable(value=aoa0, name="angle_of_attack")
+flight_conditions_group.angle_of_attack_deg = csdl.Variable(value=aoa0, name="angle_of_attack_deg")
 flight_conditions_group.altitude_m      = csdl.Variable(value=0., name="altitude (m)")
 
 # Atmospheric condition variables
@@ -345,7 +345,7 @@ if optimization_case == 1:
     drag = dafoam_function_outputs.drag
 
     # Design variables
-    flight_conditions_group.angle_of_attack.set_as_design_variable(lower=0, upper=10, scaler=1./10)
+    flight_conditions_group.angle_of_attack_deg.set_as_design_variable(lower=0, upper=10, scaler=1./10)
 
     # Objectives
     objective_fun = -lift/drag
@@ -361,7 +361,7 @@ elif optimization_case == 2:
     CD   = drag/(dynamic_pressure*A0)
 
     # Design variables
-    flight_conditions_group.angle_of_attack.set_as_design_variable(lower=0, upper=10, scaler=1./10)
+    flight_conditions_group.angle_of_attack_deg.set_as_design_variable(lower=0, upper=10, scaler=1./10)
     percent_change_in_thickness_dof.set_as_design_variable(lower=-100, upper=100, scaler=1./100)
     normalized_percent_camber_change_dof.set_as_design_variable(lower=-50, upper=50, scaler=1./50)
 
@@ -377,7 +377,7 @@ elif optimization_case == 3:
     drag = dafoam_function_outputs.drag
 
     # Design variables
-    flight_conditions_group.angle_of_attack.set_as_design_variable(lower=0, upper=10, scaler=1./10)
+    flight_conditions_group.angle_of_attack_deg.set_as_design_variable(lower=0, upper=10, scaler=1./10)
     percent_change_in_thickness_dof.set_as_design_variable(lower=-100, upper=100, scaler=1./100)
     normalized_percent_camber_change_dof.set_as_design_variable(lower=-50, upper=50, scaler=1./50)
 
@@ -405,7 +405,7 @@ sim = csdl.experimental.PySimulator(recorder)
 
 # Uncomment to run and check derivatives via finite difference
 # sim.check_totals()
-# derivs = sim.compute_totals([CD],[root_twist, tip_twist, flight_conditions_group.angle_of_attack])
+# derivs = sim.compute_totals([CD],[root_twist, tip_twist, flight_conditions_group.angle_of_attack_deg])
 
 # Only allow visualization on the root rank
 if rank == 0 and not is_headless():
