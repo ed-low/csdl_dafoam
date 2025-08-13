@@ -560,13 +560,14 @@ def has_global_nan_or_inf(arr, comm):
 
 
 class DAFoamROM(csdl.experimental.CustomImplicitOperation):
-    def __init__(self, dafoam_instance, tolerance=1e-6, max_iters=10, reuse_jacobian=True, phi:np.array=None, fom_states_ref:np.array=None):
+    def __init__(self, dafoam_instance, tolerance=1e-6, max_iters=100, reuse_jacobian=True, phi:np.array=None, fom_states_ref:np.array=None):
         super().__init__()
         self.dafoam_instance        = dafoam_instance
         self.tolerance              = tolerance
         self.max_iters              = max_iters
         self.solution_counter       = 1
         self.reuse_jacobian         = reuse_jacobian
+        self.reduced_jacobian       = None
         
         # Check if user supplies a constant phi array (this cooresponds to a global basis)
         if phi is not None:
@@ -616,6 +617,8 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
 
 
     def solve_residual_equations(self, input_vals, output_vals):
+        # TODO!!!!!!: Normalize PHI, and all FOM states
+
         # Pull values from self
         dafoam_instance     = self.dafoam_instance
         max_iters           = self.max_iters
@@ -646,12 +649,13 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
         converged = False
 
         # Initialize our rom states (call them 'a' for now)
-        a = np.zeros((phi.shape[1], ))
+        a = phi.T@(dafoam_instance.getStates() - fom_states_ref)
         
         # Main Newton iteration loop
         for iter in range(max_iters):
             # Update states and update solver
             fom_states = fom_states_ref + phi@a
+            
             dafoam_instance.setStates(fom_states)
 
             # Compute residual at this new states value
@@ -660,6 +664,8 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
             # Reduce the residual and check if the tolerance is satisfied
             res_reduced      = phi.T@res
             res_reduced_norm = np.linalg.norm(res_reduced)
+
+            print(f'ROM Newton iteration {iter} residual norm: {res_reduced_norm}')
 
             # Here we find the initial value for the residual
             if iter == 0:
@@ -672,9 +678,12 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
             # (Re)compute Jacobian on first iteration or if not reusing the same Jacobian
             if not reuse_jacobian or iter == 0:
                 jac_reduced = self._compute_reduced_jacobian(phi, fom_states)
+                self.reduced_jacobian = jac_reduced
 
             # Compute step and update ROM states
             delta_a = np.linalg.solve(jac_reduced, -res_reduced)
+            print(f'delta_a: {delta_a}')
+            print(f'a: {a}')
             a += delta_a
         
         # Once last state update for DAFoam
