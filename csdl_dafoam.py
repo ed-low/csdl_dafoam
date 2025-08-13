@@ -107,7 +107,8 @@ class DAFoamSolver(csdl.experimental.CustomImplicitOperation):
 
         # Revert solver to last successful primal state (to help with convergence on next iteration)
         # (This helps when we had an unconverged run last - placing here instead of at end in unconverged
-        #  scenario allows us to still used the unconverged results from the solver if necessary)   
+        #  scenario allows us to still used the unconverged results from the solver if necessary) 
+        print('Initializing DAFoam solver with last converged primal state')  
         dafoam_instance.setStates(self.last_successful_primal_states)
 
         # Run primal
@@ -126,13 +127,14 @@ class DAFoamSolver(csdl.experimental.CustomImplicitOperation):
         if dafoam_instance.primalFail != 0:
             if dafoam_instance.rank == 0:
                 print('Primal solution failed!')
-                print('(Resetting DAFoam solver primal state to that of the last successful evaluation)')
 
             # If we didn't converge, send the optimizer a NaN solution
             output_vals['dafoam_solver_states'] = np.full((self.num_local_state_elements, ), np.nan)
 
         # Converged case - return states and update the last successful primal state with current
         else:
+            print('Primal solution converged!')
+            print('Caching successful primal state...')
             output_vals['dafoam_solver_states'] = states
             self.last_successful_primal_states  = states
 
