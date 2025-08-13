@@ -9,6 +9,7 @@ from mpi4py import MPI
 
 USE_CHANGE_DIRECTORY_WORKAROUND = True
 
+# region INSTANTIATEDAFOAM
 def instantiateDAFoam(options, comm, run_directory=None, mesh_options=None):
     # CHANGE DIRECTORY WORKAROUND 1/5
     # NOTE: This workaround was implemented so that we
@@ -43,6 +44,7 @@ def instantiateDAFoam(options, comm, run_directory=None, mesh_options=None):
 
 
 
+# region DAFOAMSOLVER
 class DAFoamSolver(csdl.experimental.CustomImplicitOperation):
     def __init__(self, dafoam_instance):
         super().__init__()
@@ -70,6 +72,7 @@ class DAFoamSolver(csdl.experimental.CustomImplicitOperation):
         self.last_successful_primal_states = np.zeros((self.num_local_state_elements, ))
 
 
+    # region evaluate
     def evaluate(self, dafoam_input_variables_group:csdl.VariableGroup):
         # Read daOptions to set proper inputs
         input_dict = self.dafoam_instance.getOption("inputInfo")
@@ -82,7 +85,7 @@ class DAFoamSolver(csdl.experimental.CustomImplicitOperation):
 
         return dafoam_solver_states
 
-
+    # region solve_residual_equations
     def solve_residual_equations(self, input_vals, output_vals):
         dafoam_instance = self.dafoam_instance
 
@@ -143,6 +146,7 @@ class DAFoamSolver(csdl.experimental.CustomImplicitOperation):
         dafoam_instance.solverAD.calcPrimalResidualStatistics("calc")
 
 
+    # region apply_inverse_jacobian
     def apply_inverse_jacobian(self, input_vals, output_vals, d_outputs, d_residuals, mode):
         dafoam_instance = self.dafoam_instance
 
@@ -281,6 +285,7 @@ class DAFoamSolver(csdl.experimental.CustomImplicitOperation):
         # -------------------------------
 
 
+    # region compute_jacvec_product
     def compute_jacvec_product(self, input_vals, output_vals, d_inputs, d_outputs, d_residuals, mode):
         dafoam_instance = self.dafoam_instance
         comm            = dafoam_instance.comm
@@ -325,6 +330,7 @@ class DAFoamSolver(csdl.experimental.CustomImplicitOperation):
                 d_inputs[input_name] += product
 
 
+    # region _updateKSPTolerances
     def _updateKSPTolerances(self, psi, dFdW, ksp):
         # Here we need to manually update the KSP tolerances because the default
         # relative tolerance will always want to converge the adjoint to a fixed
@@ -364,12 +370,14 @@ class DAFoamSolver(csdl.experimental.CustomImplicitOperation):
 
 
 
+# region DAFOAMFUNCTIONS
 class DAFoamFunctions(csdl.CustomExplicitOperation):
     def __init__(self, dafoam_instance):
         super().__init__()
         self.dafoam_instance = dafoam_instance
 
 
+    # region evaluate
     def evaluate(self, dafoam_solver_states:csdl.Variable, dafoam_input_variables_group:csdl.VariableGroup):
         # Solver states is the easy one
         self.declare_input("dafoam_solver_states", dafoam_solver_states)
@@ -390,7 +398,7 @@ class DAFoamFunctions(csdl.CustomExplicitOperation):
 
         return dafoam_function_output
 
-
+    # region compute
     def compute(self, input_vals, output_vals):
         dafoam_instance = self.dafoam_instance
         comm            = dafoam_instance.comm
@@ -419,6 +427,7 @@ class DAFoamFunctions(csdl.CustomExplicitOperation):
                 output_vals[output_name] = function_val
 
 
+    # region compute_jacvec_product
     def compute_jacvec_product(self, input_vals, output_vals, d_inputs, d_outputs, mode):
         dafoam_instance = self.dafoam_instance
         comm            = dafoam_instance.comm
@@ -480,6 +489,7 @@ class DAFoamFunctions(csdl.CustomExplicitOperation):
 
 
 
+# region COMPUTE_DAFOAM_INPUT_VARIABLES
 def compute_dafoam_input_variables(dafoam_instance, ambient_conditions_group:csdl.VariableGroup, flight_conditions_group:csdl.VariableGroup, aerodynamic_volume_coordinates:csdl.Variable):
     # Currently expect the ambient_conditions_group to, at minimum, contain the following variables:
     # T_K   (Temperature [K])
@@ -541,6 +551,7 @@ def compute_dafoam_input_variables(dafoam_instance, ambient_conditions_group:csd
 
 
 
+# region HAS_GLOBAL_NAN_OR_INF
 def has_global_nan_or_inf(arr, comm):
     """
     Check if a distributed array contains any NaN or Inf values across all MPI ranks.
@@ -563,6 +574,7 @@ def has_global_nan_or_inf(arr, comm):
 
 
 
+# region DAFOAMROM
 class DAFoamROM(csdl.experimental.CustomImplicitOperation):
     def __init__(self, dafoam_instance, tolerance=1e-6, max_iters=100, reuse_jacobian=True, phi:np.array=None, fom_states_ref:np.array=None):
         super().__init__()
@@ -588,6 +600,7 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
             self.use_constant_fom_reference_state = False
 
 
+    # region evaluate
     def evaluate(self, dafoam_input_variables_group:csdl.VariableGroup, phi:csdl.Variable=None, fom_states_ref:csdl.Variable=None):
         # Read daOptions to set proper inputs
         inputDict = self.dafoam_instance.getOption("inputInfo")
@@ -620,6 +633,7 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
         return dafoam_rom_states
 
 
+    # region solve_residual_equations
     def solve_residual_equations(self, input_vals, output_vals):
         # TODO!!!!!!: Normalize PHI, and all FOM states
 
@@ -702,13 +716,17 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
             output_vals['dafoam_rom_states'] = np.full((a.shape[0], ), np.nan)
 
 
+    # region apply_inverse_jacobian
     def apply_inverse_jacobian(self, input_vals, output_vals, d_outputs, d_residuals, mode):
         raise NotImplementedError('DAFoamRomSolver apply_inverse_jacobian not implemented yet')
 
+
+    # region compute_jacvec_product
     def compute_jacvec_product(self, input_vals, output_vals, d_inputs, d_outputs, d_residuals, mode):
         raise NotImplementedError('DAFoamRomSolver compute_jacvec_product not implemented yet')
 
 
+    # region _compute_reduced_jacobian
     def _compute_reduced_jacobian(self, phi, states):
         dafoam_instance     = self.dafoam_instance
         phi_shape           = phi.shape
