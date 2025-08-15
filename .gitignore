@@ -13,6 +13,7 @@ ASO_2DAF_send/
 test_script.py
 *.zip
 *.gz
+*.npy
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
