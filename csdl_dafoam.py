@@ -70,6 +70,7 @@ class DAFoamSolver(csdl.experimental.CustomImplicitOperation):
 
         # Saving last successful primal result (in case primal fails)
         self.last_successful_primal_states = dafoam_instance.getStates()
+        self.last_time_converged = True
 
 
     # region evaluate
@@ -111,8 +112,9 @@ class DAFoamSolver(csdl.experimental.CustomImplicitOperation):
         # Revert solver to last successful primal state (to help with convergence on next iteration)
         # (This helps when we had an unconverged run last - placing here instead of at end in unconverged
         #  scenario allows us to still used the unconverged results from the solver if necessary) 
-        print('Initializing DAFoam solver with last converged primal state')  
-        dafoam_instance.setStates(self.last_successful_primal_states)
+        if not self.last_time_converged:
+            print('Initializing DAFoam solver with last converged primal state')  
+            dafoam_instance.setStates(self.last_successful_primal_states)
 
         # Run primal
         dafoam_instance()
@@ -134,12 +136,16 @@ class DAFoamSolver(csdl.experimental.CustomImplicitOperation):
             # If we didn't converge, send the optimizer a NaN solution
             output_vals['dafoam_solver_states'] = np.full((self.num_local_state_elements, ), np.nan)
 
+            # Save convergence flag
+            self.last_time_converged            = False
+
         # Converged case - return states and update the last successful primal state with current
         else:
             print('Primal solution converged!')
             print('Caching successful primal state...')
             output_vals['dafoam_solver_states'] = states
             self.last_successful_primal_states  = states
+            self.last_time_converged            = True
 
         # We also need to just calculate the residual for the AD mode to initialize vars like URes
         # We do not print the residual for AD, though
@@ -730,7 +736,7 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
     def _compute_reduced_jacobian(self, phi, states):
         dafoam_instance     = self.dafoam_instance
         phi_shape           = phi.shape
-        full_jac_times_phi  = np.zeros_like(phi)
+        full_jacT_times_phi  = np.zeros_like(phi)
 
         # Update solver for desired states
         dafoam_instance.setStates(states)
@@ -749,9 +755,11 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
                 product,
             )
 
-            full_jac_times_phi[:, i] = product
-
-        reduced_jac = phi.T @ full_jac_times_phi
+            full_jacT_times_phi[:, i] = product
+            
+        reduced_jac_T = (phi.T @ full_jacT_times_phi)
+        reduced_jac   = reduced_jac_T.T
+        print(reduced_jac)
 
         return reduced_jac
 
