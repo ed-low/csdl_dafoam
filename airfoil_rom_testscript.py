@@ -240,10 +240,10 @@ fom_states_ref  = np.zeros_like(dafoam_instance.getStates())
 
 
 # Flight condition variables
-flight_conditions_group                 = csdl.VariableGroup()
-flight_conditions_group.mach_number     = csdl.Variable(value=0.6, name="mach_number")
-flight_conditions_group.angle_of_attack = csdl.Variable(value=aoa0, name="angle_of_attack")
-flight_conditions_group.altitude_m      = csdl.Variable(value=0., name="altitude (m)")
+flight_conditions_group                     = csdl.VariableGroup()
+flight_conditions_group.mach_number         = csdl.Variable(value=0.7,    name="mach_number")
+flight_conditions_group.angle_of_attack_deg = csdl.Variable(value=3,      name="angle_of_attack_deg")
+flight_conditions_group.altitude_m          = csdl.Variable(value=10000., name="altitude (m)")
 
 # Atmospheric condition variables
 ambient_conditions_group = sam.compute_ambient_conditions_group(flight_conditions_group.altitude_m)
@@ -255,11 +255,6 @@ dafoam_input_variables_group = compute_dafoam_input_variables(dafoam_instance,
                                                               ambient_conditions_group, 
                                                               flight_conditions_group,
                                                               x_vol_dafoam)
-
-# # DAFoamROM Implicit component setup and evaluation
-# from csdl_dafoam import DAFoamROM
-# dafoam_rom           = DAFoamROM(dafoam_instance, phi=phi_full, fom_states_ref=np.zeros_like(dafoam_instance.getStates()))
-# dafoam_rom_states    = dafoam_rom.evaluate(dafoam_input_variables_group)
 
 # DAFoamSolver Implicit component setup and evaluation
 dafoam_rom           = DAFoamROM(dafoam_instance, phi=phi_full, fom_states_ref=fom_states_ref)
