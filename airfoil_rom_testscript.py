@@ -510,7 +510,7 @@ os.chdir(current_dir)
 
 
 # DAFoamSolver Implicit component setup and evaluation
-dafoam_rom           = DAFoamROM(dafoam_instance, phi=pod_modes, tolerance=1e-10, fom_states_ref=scaling_factors*y_reference, max_iters=1000, scaling_factors=scaling_factors, weights=weights, update_jac_frequency=2)
+dafoam_rom           = DAFoamROM(dafoam_instance, pod_modes=pod_modes, tolerance=1e-10, fom_ref_state=scaling_factors*y_reference, max_iters=1000, scaling_factors=scaling_factors, weights=weights, update_jac_frequency=2)
 dafoam_rom_states    = dafoam_rom.evaluate(dafoam_input_variables_group)
 
 print(f'dafoam_rom_states: {dafoam_rom_states.value}')
