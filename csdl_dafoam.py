@@ -695,8 +695,12 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
         # Initialize our newton convergence flag
         converged = False
 
-        # Initialize our ROM states
+        # Initialize our ROM/FOM states, solver, and ROM/FOM residuals 
         y_rom = np.zeros((num_modes, ))
+        y_fom = y_fom_ref + D*(phi@y_rom)
+        dafoam_instance.setStates(y_fom)
+        r_fom = dafoam_instance.getResiduals()
+        r_rom = phi.T@(W*r_fom)
 
         # Some plotting for diagnostics
         #----------------------
@@ -729,53 +733,51 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
 
         # Main Newton iteration loop
         for iter in range(max_iters):
-            # Update states and update solver
-            y_fom = y_fom_ref + D*(phi@y_rom)
+            print('\n')
+            print('-------------------------------------')
+            print(f'ROM Newton iteration {iter}')
+            print('-------------------------------------')
 
-            # Double check to make sure our mapping is consistent
-            print(f'Computed FOM state - obtained FOM state: {np.linalg.norm(y_fom - dafoam_instance.getStates())}')
+            # (Re)compute Jacobian on first iteration or if not reusing the same Jacobian
+            if iter%update_jac_frequency == 0 or iter == 0:
+                print('Computing reduced Jacobian...')
+                J_rom = self._compute_reduced_jacobian(phi, y_fom, W, D)
+                self.reduced_jacobian = J_rom
+
+            # Compute step and update ROM and FOM states
+            print('Updating ROM and FOM states...')
+            delta_y_rom = np.linalg.solve(J_rom, -r_rom)
+            y_rom       += delta_y_rom
+            y_fom       = y_fom_ref + D*(phi@y_rom)
             
-            # Set primal states and print residual information
+            # Set primal states and get residual at this value
             dafoam_instance.setStates(y_fom)
-            if dafoam_instance.getOption("useAD")["mode"] == "forward":
-                dafoam_instance.solverAD.calcPrimalResidualStatistics("print")
-            else:
-                dafoam_instance.solver.calcPrimalResidualStatistics("print")
-
-            # Compute residual at this new states value
-            r_fom            = dafoam_instance.getResiduals()
+            r_fom = dafoam_instance.getResiduals()
 
             # Reduce the residual and check if the tolerance is satisfied
-            r_rom            = phi.T@(W*r_fom)
-            r_rom_norm       = np.linalg.norm(r_rom)
+            r_rom      = phi.T@(W*r_fom)
+            r_rom_norm = np.linalg.norm(r_rom)
 
             # Save the initial value of the reduced residual
             if iter == 0:
                 r_rom_norm0 = r_rom_norm.copy()
 
-            print(f'ROM Newton iteration {iter}')
-            print('\t{:<30} : {:.4E}'.format('Residual norm', np.linalg.norm(r_fom)))
-            print('\t{:<30} : {:.4E}'.format('Reduced residual norm', r_rom_norm))
-            print('\t{:<30} : {:.4E}'.format('Start/current reduced norm', r_rom_norm/r_rom_norm0))
+            # Will print out the relevant residual statistics here
+            print('Residual summary:')
+            print('\t{:<30} : {:.4E}'.format('FOM residual norm', np.linalg.norm(r_fom)))
+            print('\t{:<30} : {:.4E}'.format('ROM residual norm', r_rom_norm))
+            print('\t{:<30} : {:.4E}'.format('Start/current ROM norm ratio', r_rom_norm/r_rom_norm0))
+            # if dafoam_instance.getOption("useAD")["mode"] == "forward":
+            #     dafoam_instance.solverAD.calcPrimalResidualStatistics("print")
+            # else:
+            #     dafoam_instance.solver.calcPrimalResidualStatistics("print")
             
+            # Exit condition
             if r_rom_norm < tolerance:
                 converged = True
                 break
             
-            # (Re)compute Jacobian on first iteration or if not reusing the same Jacobian
-            if iter%update_jac_frequency == 0 or iter == 0:
-                J_rom = self._compute_reduced_jacobian(phi, y_fom, W, D)
-                self.reduced_jacobian = J_rom
-
-            # Compute step and update ROM states (and print to console)
-            delta_y_rom = np.linalg.solve(J_rom, -r_rom)
-
-            print(f"\t{'Current a':>15} {'delta_a':>15}")  # header
-            for yi, dyi in zip(y_rom, delta_y_rom):
-                print(f"\t{yi:15.4E} {dyi:15.4E}")
-
-            y_rom += delta_y_rom
-
+            # Upate plots
             x_data.append(iter+1)
             for i, line in enumerate(lines):
                 y_data[i].append(y_rom[i])
@@ -792,13 +794,15 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
             ax3.autoscale_view()
             plt.draw()
             plt.pause(0.1)
-
-        # Update reduced jacobain to most recent state
-        J_rom = self._compute_reduced_jacobian(phi, y_fom, W, D)
-        self.reduced_jacobian = J_rom
         
         # Return NaN array as output (for the optimizer), otherwise return rom states
         if converged:
+            print('\n\n Specified tolerance reached!')
+            # Update reduced jacobain to most recent state
+            print('Updating Jacobian to most recent state value...')
+            J_rom = self._compute_reduced_jacobian(phi, y_fom, W, D)
+            self.reduced_jacobian = J_rom
+
             output_vals['dafoam_rom_states'] = y_rom
         else:
             print('Warning: ROM iteration limit reached!')
@@ -812,7 +816,56 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
 
     # region compute_jacvec_product
     def compute_jacvec_product(self, input_vals, output_vals, d_inputs, d_outputs, d_residuals, mode):
-        raise NotImplementedError('DAFoamRomSolver compute_jacvec_product not implemented yet')
+        dafoam_instance = self.dafoam_instance
+        comm            = dafoam_instance.comm
+        rank            = dafoam_instance.rank
+
+        D         = self.scaling_factors
+        W         = self.weights
+        phi       = self.pod_modes
+        y_fom_ref = self.fom_ref_state
+
+        dafoam_scaling_factors = dafoam_instance.getStateScalingFactors()
+
+        # assign the states in outputs to the OpenFOAM flow fields
+        # NOTE: this is not quite necessary because setStates have been called before in the solve_nonlinear
+        # here we call it just be on the safe side
+        # Check if states contain any NaN values (NaNs would be passed from optimizer)
+        y_rom = output_vals['dafoam_rom_states']
+        y_fom = y_fom_ref + D*(phi@y_rom)
+
+        # Update solver states only if no NaNs exist
+        if not has_global_nan_or_inf(states, comm):
+            dafoam_instance.setStates(y_fom)
+        else:
+            if rank == 0:
+                print('DAFoamSolver.compute_jacvec_product: Detected NaN(s) in input_vals. Skipping DAFoam setStates')
+
+        # Can't do forward mode
+        if mode == 'fwd':
+            raise NotImplementedError('forward mode has not been implemented for DAFoamROM')
+
+        if 'dafoam_rom_states' in d_residuals:
+             # get the reverse mode AD seed from d_residuals and expand to FOM size
+            seed_r = d_residuals['dafoam_rom_states']
+            seed   = W*(phi@seed_r)
+ 
+            # loop over all inputs keys and compute the matrix-vector products accordingly
+            input_dict = dafoam_instance.getOption("inputInfo")
+            for input_name in list(input_vals.keys()):
+                input_type = input_dict[input_name]["type"]
+                jac_input = input_vals[input_name].copy()
+                product = np.zeros_like(jac_input)
+                dafoam_instance.solverAD.calcJacTVecProduct(
+                    input_name,
+                    input_type,
+                    jac_input,
+                    "aero_residuals",
+                    "residual",
+                    seed,
+                    product,
+                )
+                d_inputs[input_name] += product/dafoam_scaling_factors
 
 
     # region _compute_reduced_jacobian
