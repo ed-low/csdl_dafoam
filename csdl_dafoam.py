@@ -811,7 +811,13 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
 
     # region apply_inverse_jacobian
     def apply_inverse_jacobian(self, input_vals, output_vals, d_outputs, d_residuals, mode):
-        raise NotImplementedError('DAFoamRomSolver apply_inverse_jacobian not implemented yet')
+        # Can't do forward mode
+        if mode == 'fwd':
+            raise NotImplementedError('forward mode has not been implemented for DAFoamROM')
+        
+        J_romT = self.reduced_jacobian.T
+        v      = d_outputs['dafoam_rom_states']
+        d_residuals['dafoam_rom_states'] = np.linalg.solve(J_romT, v)
 
 
     # region compute_jacvec_product
