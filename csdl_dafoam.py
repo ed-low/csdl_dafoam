@@ -841,7 +841,7 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
         y_fom = y_fom_ref + D*(phi@y_rom)
 
         # Update solver states only if no NaNs exist
-        if not has_global_nan_or_inf(states, comm):
+        if not has_global_nan_or_inf(y_fom, comm):
             dafoam_instance.setStates(y_fom)
         else:
             if rank == 0:
@@ -871,7 +871,7 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
                     seed,
                     product,
                 )
-                d_inputs[input_name] += product/dafoam_scaling_factors
+                d_inputs[input_name] += product
 
 
     # region _compute_reduced_jacobian
