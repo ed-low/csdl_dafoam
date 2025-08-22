@@ -113,7 +113,8 @@ class DAFoamSolver(csdl.experimental.CustomImplicitOperation):
         # (This helps when we had an unconverged run last - placing here instead of at end in unconverged
         #  scenario allows us to still used the unconverged results from the solver if necessary) 
         if not self.last_time_converged:
-            print('Initializing DAFoam solver with last converged primal state')  
+            if dafoam_instance.rank == 0:
+                print('Initializing DAFoam solver with last converged primal state')  
             dafoam_instance.setStates(self.last_successful_primal_states)
 
         # Run primal
@@ -141,8 +142,9 @@ class DAFoamSolver(csdl.experimental.CustomImplicitOperation):
 
         # Converged case - return states and update the last successful primal state with current
         else:
-            print('Primal solution converged!')
-            print('Caching successful primal state...')
+            if dafoam_instance.rank == 0:
+                print('Primal solution converged!')
+                print('Caching successful primal state...')
             output_vals['dafoam_solver_states'] = states
             self.last_successful_primal_states  = states
             self.last_time_converged            = True
@@ -600,6 +602,7 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
         self.solution_counter       = 1
         self.update_jac_frequency   = update_jac_frequency if update_jac_frequency > 0 else np.nan
         self.reduced_jacobian       = None
+        self.solution_counter       = 1
 
         # Do some checks here to assign default values if none passed. Alert user if none are passed.
         if weights is None:
@@ -656,7 +659,7 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
 
         return dafoam_rom_states
 
-
+    
     # region solve_residual_equations
     def solve_residual_equations(self, input_vals, output_vals):
 
@@ -701,6 +704,7 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
         dafoam_instance.setStates(y_fom)
         r_fom = dafoam_instance.getResiduals()
         r_rom = phi.T@(W*r_fom)
+        r_rom_norm = np.linalg.norm(r_rom)
 
         # Some plotting for diagnostics
         #----------------------
@@ -744,18 +748,23 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
                 J_rom = self._compute_reduced_jacobian(phi, y_fom, W, D)
                 self.reduced_jacobian = J_rom
 
-            # Compute step and update ROM and FOM states
+            # Compute step (robust linear solve with lstsq fallback)
             print('Updating ROM and FOM states...')
-            delta_y_rom = np.linalg.solve(J_rom, -r_rom)
-            y_rom       += delta_y_rom
-            y_fom       = y_fom_ref + D*(phi@y_rom)
-            
-            # Set primal states and get residual at this value
+            try:
+                delta_y_rom = np.linalg.solve(J_rom, -r_rom)
+            except np.linalg.LinAlgError:
+                # fallback to least-squares if matrix singular or near-singular
+                delta_y_rom, *_ = np.linalg.lstsq(J_rom, -r_rom, rcond=1e-12)
+                delta_y_rom = delta_y_rom.reshape(-1,)
+                print('\tWarning: reduced Jacobian singular; used least-squares fallback.')
+
+            y_rom  += delta_y_rom
+            y_fom = y_fom_ref + D*(phi@y_rom)
+
+            # evaluate residual at candidate state
             dafoam_instance.setStates(y_fom)
             r_fom = dafoam_instance.getResiduals()
-
-            # Reduce the residual and check if the tolerance is satisfied
-            r_rom      = phi.T@(W*r_fom)
+            r_rom = phi.T@(W*r_fom)
             r_rom_norm = np.linalg.norm(r_rom)
 
             # Save the initial value of the reduced residual
@@ -767,16 +776,12 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
             print('\t{:<30} : {:.4E}'.format('FOM residual norm', np.linalg.norm(r_fom)))
             print('\t{:<30} : {:.4E}'.format('ROM residual norm', r_rom_norm))
             print('\t{:<30} : {:.4E}'.format('Start/current ROM norm ratio', r_rom_norm/r_rom_norm0))
-            # if dafoam_instance.getOption("useAD")["mode"] == "forward":
-            #     dafoam_instance.solverAD.calcPrimalResidualStatistics("print")
-            # else:
-            #     dafoam_instance.solver.calcPrimalResidualStatistics("print")
-            
+
             # Exit condition
             if r_rom_norm < tolerance:
                 converged = True
                 break
-            
+
             # Upate plots
             x_data.append(iter+1)
             for i, line in enumerate(lines):
@@ -809,6 +814,9 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
             output_vals['dafoam_rom_states'] = np.full((num_modes, ), np.nan)
 
 
+
+
+
     # region apply_inverse_jacobian
     def apply_inverse_jacobian(self, input_vals, output_vals, d_outputs, d_residuals, mode):
         # Can't do forward mode
@@ -819,6 +827,15 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
         v      = d_outputs['dafoam_rom_states']
         d_residuals['dafoam_rom_states'] = np.linalg.solve(J_romT, v)
 
+        # Write solution to file
+        dafoam_instance = self.dafoam_instance
+        n_points = dafoam_instance.solver.getNLocalPoints()
+        points0  = np.zeros(n_points*3)
+        dafoam_instance.solver.getOFMeshPoints(points0)
+        dafoam_instance.solver.writeMeshPoints(points0, self.solution_counter)
+        dafoam_instance.solver.writeAdjointFields('sol', self.solution_counter, dafoam_instance.getStates())
+        self.solution_counter += 1
+        
 
     # region compute_jacvec_product
     def compute_jacvec_product(self, input_vals, output_vals, d_inputs, d_outputs, d_residuals, mode):
@@ -875,35 +892,74 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
 
 
     # region _compute_reduced_jacobian
-    def _compute_reduced_jacobian(self, phi, y_fom, W, D):
-        dafoam_instance        = self.dafoam_instance
-        phi_shape              = phi.shape
-        J_romT_W_phi           = np.zeros_like(phi)
-        W_phi                  = W[:, None]*phi
-        dafoam_scaling_factors = dafoam_instance.getStateScalingFactors()
+    def _compute_reduced_jacobian(self, phi, y_fom, W, D, mode='fom_jTvp', fd_eps=1e-6):
+        dafoam_instance = self.dafoam_instance
+        num_modes       = phi.shape[1]
 
-        # Update solver for desired states
-        dafoam_instance.setStates(y_fom)
-        
-        # Loop over columns of phi
-        for i in range(phi_shape[1]):
-            seed    = np.ascontiguousarray(W_phi[:, i])
-            product = np.zeros_like(seed)
-            dafoam_instance.solverAD.calcJacTVecProduct(
-                'dafoam_solver_states',
-                "stateVar",
-                y_fom,
-                'aero_residuals',
-                "residual",
-                seed,
-                product,
-            )
+        if mode == 'fom_jTvp': # Computing using DAFoamSolver's calcJacTVecProduct column by column
+            J_romT_W_phi           = np.zeros_like(phi)
+            W_phi                  = W[:, None]*phi
+            dafoam_scaling_factors = dafoam_instance.getStateScalingFactors()
 
-            J_romT_W_phi[:, i] = product/dafoam_scaling_factors
+            # Update solver for desired states
+            dafoam_instance.setStates(y_fom)
             
-        J_romT = phi.T@(D[:, None]*J_romT_W_phi)
-        J_rom   = J_romT.T
+            # Loop over columns of phi
+            for i in range(num_modes):
+                seed    = np.ascontiguousarray(W_phi[:, i])
+                product = np.zeros_like(seed)
+                dafoam_instance.solverAD.calcJacTVecProduct(
+                    'dafoam_solver_states',
+                    "stateVar",
+                    y_fom,
+                    'aero_residuals',
+                    "residual",
+                    seed,
+                    product,
+                )
 
-        return J_rom
+                J_romT_W_phi[:, i] = product/dafoam_scaling_factors
+                
+            J_romT = phi.T@(D[:, None]*J_romT_W_phi)
+            J_rom   = J_romT.T
 
+            return J_rom
 
+        elif mode == 'fd': # Finite difference method in reduced space
+            J_rom  = np.zeros((num_modes, num_modes))
+            
+            # Get reduced residual
+            dafoam_instance.setStates(y_fom)
+            r_fom  = dafoam_instance.getResiduals()
+            r_rom0 = phi.T@(W*r_fom)
+
+            for j in range(num_modes):         
+                # Perturb the reduced coordinates
+                e_j = np.zeros(num_modes)
+                e_j[j] = 1.0
+                y_fom_pert = y_fom + fd_eps*D*(phi@e_j)
+
+                # Get perturbed reduced residuals
+                r_rom_pert = self._compute_reduced_residual(phi, y_fom_pert, W, D)
+
+                # Add to respective reduced jacobian column
+                J_rom[:, j] = (r_rom_pert - r_rom0)/fd_eps
+
+            # Reset states in DAFoam
+            dafoam_instance.setStates(y_fom)
+
+            return J_rom
+
+        else:
+            raise ValueError(f"Unknown J_rom computation mode '{mode}'. Choose from 'fom_jTvp' or 'fd'")
+    
+
+    # This is just a helper function for convenience
+    def _compute_reduced_residual(self, phi, y_fom, W, D):
+        dafoam_instance = self.dafoam_instance
+
+        dafoam_instance.setStates(y_fom)
+        r_fom = dafoam_instance.getResiduals()
+        r_rom = phi.T@(W*r_fom)
+
+        return r_rom

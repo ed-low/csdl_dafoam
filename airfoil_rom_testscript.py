@@ -354,7 +354,7 @@ centering_mode = 1
 # 0: no scaling
 # 1: scale by normalization factors in da_options["normalizeStates"]
 # 2: scale by statistics (standard deviation of data)
-scaling_mode = 1
+scaling_mode = 2
 
 # Inner product weighting
 # Options:
@@ -447,143 +447,49 @@ else:
 pod_modes = u[:, :num_modes]/np.sqrt(weights)[:, None]
 
 
-# Write modes to file for visualization
-current_dir = os.getcwd()
-os.chdir(dafoam_directory)
-base_index = 5000
-n_cells = dafoam_instance.solver.getNLocalCells()
-for i in range(num_modes):
-    try:
-        os.mkdir(f'./{base_index + i}')
-    except:
-        None
-    ofm.writeField(f'U_mode',       'volVectorField', np.ascontiguousarray(pod_modes[0*n_cells:3*n_cells, i]))
-    ofm.writeField(f'p_mode',       'volScalarField', np.ascontiguousarray(pod_modes[3*n_cells:4*n_cells, i]))
-    ofm.writeField(f'T_mode',       'volScalarField', np.ascontiguousarray(pod_modes[4*n_cells:5*n_cells, i]))
-    ofm.writeField(f'nuTilda_mode', 'volScalarField', np.ascontiguousarray(pod_modes[5*n_cells:6*n_cells, i]))
-    os.rename(f'./0/U_mode.gz',       f'./{base_index + i}/U_mode.gz')
-    os.rename(f'./0/p_mode.gz',       f'./{base_index + i}/p_mode.gz')
-    os.rename(f'./0/T_mode.gz',       f'./{base_index + i}/T_mode.gz')
-    os.rename(f'./0/nuTilda_mode.gz', f'./{base_index + i}/nuTilda_mode.gz')
-os.chdir(current_dir)
+# ----- Plotting section -----
+show_training_plots = False
+n_cells             = dafoam_instance.solver.getNLocalCells()
 
+if show_training_plots:
+    plt.figure(1)
+    for i in range(1,7): plt.axvline(n_cells*i, alpha=0.5, linestyle='--', color='gray')
+    plt.plot(scaling_factors[:, None]*y_training)
+    plt.plot(scaling_factors*y_reference, label='reference state')
+    plt.title('Raw training data')
 
+    plt.figure(2)
+    for i in range(1,7): plt.axvline(n_cells*i, alpha=0.5, linestyle='--', color='gray')
+    plt.plot(y_training)
+    plt.plot(y_reference, label='reference state')
+    plt.title('Scaled training data')
 
-os.chdir(dafoam_directory)
-base_index = 6000
-n_cells = dafoam_instance.solver.getNLocalCells()
-for i in range(num_modes):
-    try:
-        os.mkdir(f'./{base_index + i}')
-    except:
-        None
-    ofm.writeField(f'U_temp',       'volVectorField', np.ascontiguousarray(y_training[0*n_cells:3*n_cells, i]))
-    ofm.writeField(f'p_temp',       'volScalarField', np.ascontiguousarray(y_training[3*n_cells:4*n_cells, i]))
-    ofm.writeField(f'T_temp',       'volScalarField', np.ascontiguousarray(y_training[4*n_cells:5*n_cells, i]))
-    ofm.writeField(f'nuTilda_temp', 'volScalarField', np.ascontiguousarray(y_training[5*n_cells:6*n_cells, i]))
-    os.rename(f'./0/U_temp.gz',       f'./{base_index + i}/U_temp.gz')
-    os.rename(f'./0/p_temp.gz',       f'./{base_index + i}/p_temp.gz')
-    os.rename(f'./0/T_temp.gz',       f'./{base_index + i}/T_temp.gz')
-    os.rename(f'./0/nuTilda_temp.gz', f'./{base_index + i}/nuTilda_temp.gz')
-os.chdir(current_dir)
+    plt.figure(3)
+    for i in range(1,7): plt.axvline(n_cells*i, alpha=0.5, linestyle='--', color='gray')
+    plt.plot(z)
+    plt.title('Scaled, centered training data')
 
-
-
-base_index = 7000
-for i in range(num_modes):
-    dafoam_instance.solver.writeAdjointFields('mode', base_index + i, np.ascontiguousarray(pod_modes[:, i]))
-
-
-os.chdir(dafoam_directory)
-base_index = 8000
-n_cells = dafoam_instance.solver.getNLocalCells()
-for i in range(num_modes):
-    try:
-        os.mkdir(f'./{base_index + i}')
-    except:
-        None
-    ofm.writeField(f'z_U',       'volVectorField', np.ascontiguousarray(z[0*n_cells:3*n_cells, i]))
-    ofm.writeField(f'z_p',       'volScalarField', np.ascontiguousarray(z[3*n_cells:4*n_cells, i]))
-    ofm.writeField(f'z_T',       'volScalarField', np.ascontiguousarray(z[4*n_cells:5*n_cells, i]))
-    ofm.writeField(f'z_nuTilda', 'volScalarField', np.ascontiguousarray(z[5*n_cells:6*n_cells, i]))
-    os.rename(f'./0/z_U.gz',       f'./{base_index + i}/z_U.gz')
-    os.rename(f'./0/z_p.gz',       f'./{base_index + i}/z_p.gz')
-    os.rename(f'./0/z_T.gz',       f'./{base_index + i}/z_T.gz')
-    os.rename(f'./0/z_nuTilda.gz', f'./{base_index + i}/z_nuTilda.gz')
-os.chdir(current_dir)
-
-
-os.chdir(dafoam_directory)
-base_index = 9000
-n_cells = dafoam_instance.solver.getNLocalCells()
-for i in range(1):
-    try:
-        os.mkdir(f'./{base_index + i}')
-    except:
-        None
-    ofm.writeField(f'U_weights',         'volVectorField', np.ascontiguousarray(weights[0*n_cells:3*n_cells]))
-    ofm.writeField(f'p_weights',         'volScalarField', np.ascontiguousarray(weights[3*n_cells:4*n_cells]))
-    ofm.writeField(f'T_weights',         'volScalarField', np.ascontiguousarray(weights[4*n_cells:5*n_cells]))
-    ofm.writeField(f'nuTilda_weights',   'volScalarField', np.ascontiguousarray(weights[5*n_cells:6*n_cells]))
-    os.rename(f'./0/U_weights.gz',       f'./{base_index + i}/U_weights.gz')
-    os.rename(f'./0/p_weights.gz',       f'./{base_index + i}/p_weights.gz')
-    os.rename(f'./0/T_weights.gz',       f'./{base_index + i}/T_weights.gz')
-    os.rename(f'./0/nuTilda_weights.gz',       f'./{base_index + i}/nuTilda_weights.gz')
-
-
-    ofm.writeField(f'U_sqrt_weights',         'volVectorField', np.ascontiguousarray(np.sqrt(weights[0*n_cells:3*n_cells])))
-    ofm.writeField(f'p_sqrt_weights',         'volScalarField', np.ascontiguousarray(np.sqrt(weights[3*n_cells:4*n_cells])))
-    ofm.writeField(f'T_sqrt_weights',         'volScalarField', np.ascontiguousarray(np.sqrt(weights[4*n_cells:5*n_cells])))
-    ofm.writeField(f'nuTilda_sqrt_weights',   'volScalarField', np.ascontiguousarray(np.sqrt(weights[5*n_cells:6*n_cells])))
-    os.rename(f'./0/U_sqrt_weights.gz',       f'./{base_index + i}/U_sqrt_weights.gz')
-    os.rename(f'./0/p_sqrt_weights.gz',       f'./{base_index + i}/p_sqrt_weights.gz')
-    os.rename(f'./0/T_sqrt_weights.gz',       f'./{base_index + i}/T_sqrt_weights.gz')
-    os.rename(f'./0/nuTilda_sqrt_weights.gz',       f'./{base_index + i}/nuTilda_sqrt_weights.gz')
-
-    ofm.writeField(f'U_scale',         'volVectorField', np.ascontiguousarray(scaling_factors[0*n_cells:3*n_cells]))
-    ofm.writeField(f'p_scale',         'volScalarField', np.ascontiguousarray(scaling_factors[3*n_cells:4*n_cells]))
-    ofm.writeField(f'T_scale',         'volScalarField', np.ascontiguousarray(scaling_factors[4*n_cells:5*n_cells]))
-    ofm.writeField(f'nuTilda_scale',   'volScalarField', np.ascontiguousarray(scaling_factors[5*n_cells:6*n_cells]))
-    os.rename(f'./0/U_scale.gz',       f'./{base_index + i}/U_scale.gz')
-    os.rename(f'./0/p_scale.gz',       f'./{base_index + i}/p_scale.gz')
-    os.rename(f'./0/T_scale.gz',       f'./{base_index + i}/T_scale.gz')
-    os.rename(f'./0/nuTilda_scale.gz',       f'./{base_index + i}/nuTilda_scale.gz')
-
-    ofm.writeField(f'U_ref',         'volVectorField', np.ascontiguousarray(y_reference[0*n_cells:3*n_cells]))
-    ofm.writeField(f'p_ref',         'volScalarField', np.ascontiguousarray(y_reference[3*n_cells:4*n_cells]))
-    ofm.writeField(f'T_ref',         'volScalarField', np.ascontiguousarray(y_reference[4*n_cells:5*n_cells]))
-    ofm.writeField(f'nuTilda_ref',   'volScalarField', np.ascontiguousarray(y_reference[5*n_cells:6*n_cells]))
-    os.rename(f'./0/U_ref.gz',       f'./{base_index + i}/U_ref.gz')
-    os.rename(f'./0/p_ref.gz',       f'./{base_index + i}/p_ref.gz')
-    os.rename(f'./0/T_ref.gz',       f'./{base_index + i}/T_ref.gz')
-    os.rename(f'./0/nuTilda_ref.gz',       f'./{base_index + i}/nuTilda_ref.gz')
-os.chdir(current_dir)
-
-
-os.chdir(dafoam_directory)
-base_index = 10000
-n_cells = dafoam_instance.solver.getNLocalCells()
-for i in range(num_modes):
-    try:
-        os.mkdir(f'./{base_index + i}')
-    except:
-        None
-    ofm.writeField(f'U_centered',       'volVectorField', np.ascontiguousarray(y_training[0*n_cells:3*n_cells, i] - y_reference[0*n_cells:3*n_cells]))
-    ofm.writeField(f'p_centered',       'volScalarField', np.ascontiguousarray(y_training[3*n_cells:4*n_cells, i] - y_reference[3*n_cells:4*n_cells]))
-    ofm.writeField(f'T_centered',       'volScalarField', np.ascontiguousarray(y_training[4*n_cells:5*n_cells, i] - y_reference[4*n_cells:5*n_cells]))
-    ofm.writeField(f'nuTilda_centered', 'volScalarField', np.ascontiguousarray(y_training[5*n_cells:6*n_cells, i] - y_reference[5*n_cells:6*n_cells]))
-    os.rename(f'./0/U_centered.gz',       f'./{base_index + i}/U_centered.gz')
-    os.rename(f'./0/p_centered.gz',       f'./{base_index + i}/p_centered.gz')
-    os.rename(f'./0/T_centered.gz',       f'./{base_index + i}/T_centered.gz')
-    os.rename(f'./0/nuTilda_centered.gz', f'./{base_index + i}/nuTilda_centered.gz')
-os.chdir(current_dir)
-
-
+    plt.figure(4)
+    plt.plot(energy_fraction)
+    plt.axvline(num_modes, label=f'Target ({target_energy*100}%)', color='gray', alpha=0.5, linestyle='--')
+    plt.title('POD mode variance capture')
+    plt.xlabel('Number of modes')
+    plt.ylabel('Cumulative variance')
+    plt.legend()
+    plt.show()
 
 
 
 # DAFoamSolver Implicit component setup and evaluation
-dafoam_rom           = DAFoamROM(dafoam_instance, pod_modes=pod_modes, tolerance=1e-10, fom_ref_state=scaling_factors*y_reference, max_iters=1000, scaling_factors=scaling_factors, weights=weights, update_jac_frequency=1)
+dafoam_rom           = DAFoamROM(dafoam_instance, 
+                                 pod_modes=pod_modes, 
+                                 tolerance=1e-10, 
+                                 fom_ref_state=scaling_factors*y_reference, 
+                                 max_iters=100, 
+                                 scaling_factors=scaling_factors, 
+                                 weights=weights, 
+                                 update_jac_frequency=1)
+                                 
 dafoam_rom_states    = dafoam_rom.evaluate(dafoam_input_variables_group)
 
 print(f'dafoam_rom_states: {dafoam_rom_states.value}')
@@ -642,8 +548,8 @@ elif optimization_case == 3:
     drag = dafoam_function_outputs.drag
 
     # Design variables
-    percent_change_in_thickness_dof.set_as_design_variable(lower=-100, upper=100, scaler=1./100)
-    normalized_percent_camber_change_dof.set_as_design_variable(lower=-50, upper=50, scaler=1./50)
+    percent_change_in_thickness_dof.set_as_design_variable(lower=-10, upper=10, scaler=1./10)
+    normalized_percent_camber_change_dof.set_as_design_variable(lower=-10, upper=10, scaler=1./10)
 
     # Objectives
     objective_fun = -lift/drag
@@ -852,3 +758,143 @@ optimizer.solve()
 
 
 # recorder.stop()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# # Write modes to file for visualization
+# current_dir = os.getcwd()
+# os.chdir(dafoam_directory)
+# base_index = 5000
+# n_cells = dafoam_instance.solver.getNLocalCells()
+# for i in range(num_modes):
+#     try:
+#         os.mkdir(f'./{base_index + i}')
+#     except:
+#         None
+#     ofm.writeField(f'U_mode',       'volVectorField', np.ascontiguousarray(pod_modes[0*n_cells:3*n_cells, i]))
+#     ofm.writeField(f'p_mode',       'volScalarField', np.ascontiguousarray(pod_modes[3*n_cells:4*n_cells, i]))
+#     ofm.writeField(f'T_mode',       'volScalarField', np.ascontiguousarray(pod_modes[4*n_cells:5*n_cells, i]))
+#     ofm.writeField(f'nuTilda_mode', 'volScalarField', np.ascontiguousarray(pod_modes[5*n_cells:6*n_cells, i]))
+#     os.rename(f'./0/U_mode.gz',       f'./{base_index + i}/U_mode.gz')
+#     os.rename(f'./0/p_mode.gz',       f'./{base_index + i}/p_mode.gz')
+#     os.rename(f'./0/T_mode.gz',       f'./{base_index + i}/T_mode.gz')
+#     os.rename(f'./0/nuTilda_mode.gz', f'./{base_index + i}/nuTilda_mode.gz')
+# os.chdir(current_dir)
+
+# os.chdir(dafoam_directory)
+# base_index = 6000
+# n_cells = dafoam_instance.solver.getNLocalCells()
+# for i in range(num_modes):
+#     try:
+#         os.mkdir(f'./{base_index + i}')
+#     except:
+#         None
+#     ofm.writeField(f'U_temp',       'volVectorField', np.ascontiguousarray(y_training[0*n_cells:3*n_cells, i]))
+#     ofm.writeField(f'p_temp',       'volScalarField', np.ascontiguousarray(y_training[3*n_cells:4*n_cells, i]))
+#     ofm.writeField(f'T_temp',       'volScalarField', np.ascontiguousarray(y_training[4*n_cells:5*n_cells, i]))
+#     ofm.writeField(f'nuTilda_temp', 'volScalarField', np.ascontiguousarray(y_training[5*n_cells:6*n_cells, i]))
+#     os.rename(f'./0/U_temp.gz',       f'./{base_index + i}/U_temp.gz')
+#     os.rename(f'./0/p_temp.gz',       f'./{base_index + i}/p_temp.gz')
+#     os.rename(f'./0/T_temp.gz',       f'./{base_index + i}/T_temp.gz')
+#     os.rename(f'./0/nuTilda_temp.gz', f'./{base_index + i}/nuTilda_temp.gz')
+# os.chdir(current_dir)
+
+# base_index = 7000
+# for i in range(num_modes):
+#     dafoam_instance.solver.writeAdjointFields('mode', base_index + i, np.ascontiguousarray(pod_modes[:, i]))
+
+# os.chdir(dafoam_directory)
+# base_index = 8000
+# n_cells = dafoam_instance.solver.getNLocalCells()
+# for i in range(num_modes):
+#     try:
+#         os.mkdir(f'./{base_index + i}')
+#     except:
+#         None
+#     ofm.writeField(f'z_U',       'volVectorField', np.ascontiguousarray(z[0*n_cells:3*n_cells, i]))
+#     ofm.writeField(f'z_p',       'volScalarField', np.ascontiguousarray(z[3*n_cells:4*n_cells, i]))
+#     ofm.writeField(f'z_T',       'volScalarField', np.ascontiguousarray(z[4*n_cells:5*n_cells, i]))
+#     ofm.writeField(f'z_nuTilda', 'volScalarField', np.ascontiguousarray(z[5*n_cells:6*n_cells, i]))
+#     os.rename(f'./0/z_U.gz',       f'./{base_index + i}/z_U.gz')
+#     os.rename(f'./0/z_p.gz',       f'./{base_index + i}/z_p.gz')
+#     os.rename(f'./0/z_T.gz',       f'./{base_index + i}/z_T.gz')
+#     os.rename(f'./0/z_nuTilda.gz', f'./{base_index + i}/z_nuTilda.gz')
+# os.chdir(current_dir)
+
+# os.chdir(dafoam_directory)
+# base_index = 9000
+# n_cells = dafoam_instance.solver.getNLocalCells()
+# for i in range(1):
+#     try:
+#         os.mkdir(f'./{base_index + i}')
+#     except:
+#         None
+#     ofm.writeField(f'U_weights',         'volVectorField', np.ascontiguousarray(weights[0*n_cells:3*n_cells]))
+#     ofm.writeField(f'p_weights',         'volScalarField', np.ascontiguousarray(weights[3*n_cells:4*n_cells]))
+#     ofm.writeField(f'T_weights',         'volScalarField', np.ascontiguousarray(weights[4*n_cells:5*n_cells]))
+#     ofm.writeField(f'nuTilda_weights',   'volScalarField', np.ascontiguousarray(weights[5*n_cells:6*n_cells]))
+#     os.rename(f'./0/U_weights.gz',       f'./{base_index + i}/U_weights.gz')
+#     os.rename(f'./0/p_weights.gz',       f'./{base_index + i}/p_weights.gz')
+#     os.rename(f'./0/T_weights.gz',       f'./{base_index + i}/T_weights.gz')
+#     os.rename(f'./0/nuTilda_weights.gz',       f'./{base_index + i}/nuTilda_weights.gz')
+
+#     ofm.writeField(f'U_sqrt_weights',         'volVectorField', np.ascontiguousarray(np.sqrt(weights[0*n_cells:3*n_cells])))
+#     ofm.writeField(f'p_sqrt_weights',         'volScalarField', np.ascontiguousarray(np.sqrt(weights[3*n_cells:4*n_cells])))
+#     ofm.writeField(f'T_sqrt_weights',         'volScalarField', np.ascontiguousarray(np.sqrt(weights[4*n_cells:5*n_cells])))
+#     ofm.writeField(f'nuTilda_sqrt_weights',   'volScalarField', np.ascontiguousarray(np.sqrt(weights[5*n_cells:6*n_cells])))
+#     os.rename(f'./0/U_sqrt_weights.gz',       f'./{base_index + i}/U_sqrt_weights.gz')
+#     os.rename(f'./0/p_sqrt_weights.gz',       f'./{base_index + i}/p_sqrt_weights.gz')
+#     os.rename(f'./0/T_sqrt_weights.gz',       f'./{base_index + i}/T_sqrt_weights.gz')
+#     os.rename(f'./0/nuTilda_sqrt_weights.gz',       f'./{base_index + i}/nuTilda_sqrt_weights.gz')
+
+#     ofm.writeField(f'U_scale',         'volVectorField', np.ascontiguousarray(scaling_factors[0*n_cells:3*n_cells]))
+#     ofm.writeField(f'p_scale',         'volScalarField', np.ascontiguousarray(scaling_factors[3*n_cells:4*n_cells]))
+#     ofm.writeField(f'T_scale',         'volScalarField', np.ascontiguousarray(scaling_factors[4*n_cells:5*n_cells]))
+#     ofm.writeField(f'nuTilda_scale',   'volScalarField', np.ascontiguousarray(scaling_factors[5*n_cells:6*n_cells]))
+#     os.rename(f'./0/U_scale.gz',       f'./{base_index + i}/U_scale.gz')
+#     os.rename(f'./0/p_scale.gz',       f'./{base_index + i}/p_scale.gz')
+#     os.rename(f'./0/T_scale.gz',       f'./{base_index + i}/T_scale.gz')
+#     os.rename(f'./0/nuTilda_scale.gz',       f'./{base_index + i}/nuTilda_scale.gz')
+
+#     ofm.writeField(f'U_ref',         'volVectorField', np.ascontiguousarray(y_reference[0*n_cells:3*n_cells]))
+#     ofm.writeField(f'p_ref',         'volScalarField', np.ascontiguousarray(y_reference[3*n_cells:4*n_cells]))
+#     ofm.writeField(f'T_ref',         'volScalarField', np.ascontiguousarray(y_reference[4*n_cells:5*n_cells]))
+#     ofm.writeField(f'nuTilda_ref',   'volScalarField', np.ascontiguousarray(y_reference[5*n_cells:6*n_cells]))
+#     os.rename(f'./0/U_ref.gz',       f'./{base_index + i}/U_ref.gz')
+#     os.rename(f'./0/p_ref.gz',       f'./{base_index + i}/p_ref.gz')
+#     os.rename(f'./0/T_ref.gz',       f'./{base_index + i}/T_ref.gz')
+#     os.rename(f'./0/nuTilda_ref.gz',       f'./{base_index + i}/nuTilda_ref.gz')
+# os.chdir(current_dir)
+
+# os.chdir(dafoam_directory)
+# base_index = 10000
+# n_cells = dafoam_instance.solver.getNLocalCells()
+# for i in range(num_modes):
+#     try:
+#         os.mkdir(f'./{base_index + i}')
+#     except:
+#         None
+#     ofm.writeField(f'U_centered',       'volVectorField', np.ascontiguousarray(y_training[0*n_cells:3*n_cells, i] - y_reference[0*n_cells:3*n_cells]))
+#     ofm.writeField(f'p_centered',       'volScalarField', np.ascontiguousarray(y_training[3*n_cells:4*n_cells, i] - y_reference[3*n_cells:4*n_cells]))
+#     ofm.writeField(f'T_centered',       'volScalarField', np.ascontiguousarray(y_training[4*n_cells:5*n_cells, i] - y_reference[4*n_cells:5*n_cells]))
+#     ofm.writeField(f'nuTilda_centered', 'volScalarField', np.ascontiguousarray(y_training[5*n_cells:6*n_cells, i] - y_reference[5*n_cells:6*n_cells]))
+#     os.rename(f'./0/U_centered.gz',       f'./{base_index + i}/U_centered.gz')
+#     os.rename(f'./0/p_centered.gz',       f'./{base_index + i}/p_centered.gz')
+#     os.rename(f'./0/T_centered.gz',       f'./{base_index + i}/T_centered.gz')
+#     os.rename(f'./0/nuTilda_centered.gz', f'./{base_index + i}/nuTilda_centered.gz')
+# os.chdir(current_dir)
+
+# base_index = 11000
+# for i in range(num_modes):
+#     dafoam_instance.solver.writeAdjointFields('sol', base_index + i, np.ascontiguousarray(local_data["snapshots_local"][:, i]))
