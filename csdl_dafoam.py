@@ -274,18 +274,16 @@ class DAFoamSolver(csdl.experimental.CustomImplicitOperation):
         solTimeFloat = (self.solution_counter - 1) / 1e4
         dafoam_instance.writeAdjointFields("function", solTimeFloat, psi_array)
 
-        # convert the solution vector to array and assign it to d_residuals
-        d_residuals['dafoam_solver_states'] = dafoam_instance.vec2Array(self.psi)
+        if not fail:
+            # convert the solution vector to array and assign it to d_residuals
+            d_residuals['dafoam_solver_states'] = dafoam_instance.vec2Array(self.psi)
 
-        # if the adjoint solution fail, we return analysisError and let the optimizer handle it
-        if fail:
-            #raise AnalysisError("Adjoint solution failed!")
-
-            #*****************
+        # if the adjoint solution fail, we return NaN and let the optimizer handle it
+        else:
             if dafoam_instance.rank == 0:
-                print("----------- !!!ADJOINT SOLUTION FAILED!!! -----------")
-                print("Continuing anyways! (Fix this in code later)")
-            #*****************
+                print("Adjoint solution failed! Returning NANs")
+
+            d_residuals['dafoam_solver_states'] = np.nan*np.ones((self.num_local_state_elements, ))
         
         # CHANGE DIRECTORY WORKAROUND 5/5
         if USE_CHANGE_DIRECTORY_WORKAROUND:
