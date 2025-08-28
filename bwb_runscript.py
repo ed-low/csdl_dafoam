@@ -348,7 +348,7 @@ comm.Barrier()
 
 # region Design variables
 # ============================ Design variables ===========================
-root_twist  = csdl.Variable(shape=(1,), value=np.array([10*np.pi/180.]))
+root_twist  = csdl.Variable(shape=(1,), value=np.array([0]))
 tip_twist   = csdl.Variable(shape=(1,), value=np.array([0.]))
 mid_twist   = csdl.Variable(shape=(2,), value=np.array([0., 0.]))
 wing_twists = csdl.concatenate((root_twist, mid_twist, tip_twist))
@@ -410,38 +410,48 @@ with Timer(f'evaluating geometry component'):
 
 # region Surface mesh distribution
 i0, i1          = x_surf_dafoam_initial_indices[rank]
-x_surf_dafoam   = x_surf_dafoam_full[i0:i1, :]
-x_surf_dafoam   = x_surf_dafoam.flatten()
-
-# region IDWarp and DAFoam
-idwarp_model    = DAFoamMeshWarper(dafoam_instance)
-x_vol_dafoam    = idwarp_model.evaluate(x_surf_dafoam)
 
 # Flight condition variables
-flight_conditions_group                 = csdl.VariableGroup()
-flight_conditions_group.mach_number     = csdl.Variable(value=0.6, name="mach_number")
-flight_conditions_group.angle_of_attack = csdl.Variable(value=aoa0, name="angle_of_attack")
-flight_conditions_group.altitude_m      = csdl.Variable(value=0., name="altitude (m)")
+flight_conditions_group                     = csdl.VariableGroup()
+flight_conditions_group.mach_number         = csdl.Variable(value=0.6, name="mach_number")
+flight_conditions_group.angle_of_attack_deg = csdl.Variable(value=aoa0, name="angle_of_attack")
+flight_conditions_group.altitude_m          = csdl.Variable(value=0., name="altitude (m)")
+flight_conditions_group.airspeed_m_s        = csdl.Variable(value=U0, name="airspeed (m/s)")
 
 # Atmospheric condition variables
 ambient_conditions_group = sam.compute_ambient_conditions_group(flight_conditions_group.altitude_m)
 
-# DAFoam input variable generation
-# Generate our DAFoam CSDL input variable group 
-# (this will add airspeed_m_s to the flight conditions group if not already present)
-dafoam_input_variables_group = compute_dafoam_input_variables(dafoam_instance, 
-                                                              ambient_conditions_group, 
-                                                              flight_conditions_group,
-                                                              x_vol_dafoam)
 
-# DAFoamSolver Implicit component setup and evaluation
-dafoam_solver           = DAFoamSolver(dafoam_instance)
-dafoam_solver_states    = dafoam_solver.evaluate(dafoam_input_variables_group)
+with csdl.experimental.mpi.enter_mpi_region(rank, comm) as mpi_region:
 
-# DAFoamFunctions Explicit component setup and evaluation
-dafoam_functions = DAFoamFunctions(dafoam_instance)
-dafoam_function_outputs = dafoam_functions.evaluate(dafoam_solver_states, 
-                                                    dafoam_input_variables_group)
+    x_surf_dafoam   = x_surf_dafoam_full[i0:i1, :]
+    x_surf_dafoam   = x_surf_dafoam.flatten()
+    
+    # region IDWarp and DAFoam
+    idwarp_model    = DAFoamMeshWarper(dafoam_instance)
+    x_vol_dafoam    = idwarp_model.evaluate(x_surf_dafoam)
+
+    flight_conditions_group.angle_of_attack_deg = mpi_region.split_custom(flight_conditions_group.angle_of_attack_deg, split_func = lambda x:x)
+    
+    # DAFoam input variable generation
+    # Generate our DAFoam CSDL input variable group 
+    # (this will add airspeed_m_s to the flight conditions group if not already present)
+    dafoam_input_variables_group = compute_dafoam_input_variables(dafoam_instance, 
+                                                                ambient_conditions_group, 
+                                                                flight_conditions_group,
+                                                                x_vol_dafoam)
+
+    # DAFoamSolver Implicit component setup and evaluation
+    dafoam_solver           = DAFoamSolver(dafoam_instance)
+    dafoam_solver_states    = dafoam_solver.evaluate(dafoam_input_variables_group)
+
+    # DAFoamFunctions Explicit component setup and evaluation
+    dafoam_functions = DAFoamFunctions(dafoam_instance)
+    dafoam_function_outputs = dafoam_functions.evaluate(dafoam_solver_states, 
+                                                        dafoam_input_variables_group)
+
+    mpi_region.set_as_global_output(dafoam_function_outputs.lift)
+    mpi_region.set_as_global_output(dafoam_function_outputs.drag)
 
 
 # region Optimization problem selection
@@ -451,7 +461,9 @@ dafoam_function_outputs = dafoam_functions.evaluate(dafoam_solver_states,
 # 3: Minimize CD wrt angle-of-attack, wing shape (thickness/camber ffd), constrained by CL=0.5
 # 4: Minimize CD wrt angle-of-attack, wing shape (thickness/camber ffd) and wing twists, constrained by CL=0.5
 # 5: Maximize CL/CD wrt angle-of-attack and wing shape
-optimization_case = 3
+# 6: Maximize CL/CD wrt angle-of-attack, wing shape (thickness/camber ffd) and wing twists
+# 7: Maximize CL/CD wrt angle-of-attack, wing shape (camber ffd) and wing twists
+optimization_case = 7
 
 
 if optimization_case == 1:
@@ -460,7 +472,7 @@ if optimization_case == 1:
     drag = dafoam_function_outputs.drag
 
     # Design variables
-    flight_conditions_group.angle_of_attack.set_as_design_variable(lower=0, upper=10)
+    flight_conditions_group.angle_of_attack_deg.set_as_design_variable(lower=0, upper=10)
 
     # Objectives
     objective_fun = -lift/drag
@@ -480,7 +492,7 @@ elif optimization_case == 2:
     twist_lim_rad   = twist_lim_deg*np.pi/180
 
     # Design variables
-    flight_conditions_group.angle_of_attack.set_as_design_variable(lower=0, upper=10)
+    flight_conditions_group.angle_of_attack_deg.set_as_design_variable(lower=0, upper=10)
     root_twist.set_as_design_variable(lower=-twist_lim_rad, upper=twist_lim_rad, scaler=1/twist_lim_rad)
     tip_twist.set_as_design_variable(lower=-twist_lim_rad, upper=twist_lim_rad, scaler=1/twist_lim_rad)
 
@@ -500,7 +512,7 @@ elif optimization_case == 3:
     CD   = drag/(dynamic_pressure*A0)
 
     # Design variables
-    flight_conditions_group.angle_of_attack.set_as_design_variable(lower=0., upper=10., scaler=1./10)
+    flight_conditions_group.angle_of_attack_deg.set_as_design_variable(lower=0., upper=10., scaler=1./12)
     percent_change_in_thickness_dof_wing.set_as_design_variable(lower=-10, upper=30., adder=10., scaler=1./40.)
     normalized_percent_camber_change_dof_wing.set_as_design_variable(lower=-20., upper=20., scaler=1./20.)
 
@@ -522,7 +534,7 @@ elif optimization_case == 4:
     twist_lim_rad   = twist_lim_deg*np.pi/180
 
     # Design variables
-    flight_conditions_group.angle_of_attack.set_as_design_variable(lower=-2., upper=10., adder=2., scaler=1./10.)
+    flight_conditions_group.angle_of_attack_deg.set_as_design_variable(lower=-2., upper=10., adder=2., scaler=1./12.)
     percent_change_in_thickness_dof_wing.set_as_design_variable(lower=-10, upper=30., adder=10., scaler=1./40.)
     normalized_percent_camber_change_dof_wing.set_as_design_variable(lower=-20., upper=20., scaler=1./20.)
     wing_twists.set_as_design_variable(lower=-twist_lim_rad, upper=twist_lim_rad, scaler=1/twist_lim_rad)
@@ -539,7 +551,7 @@ elif optimization_case == 5:
     drag = dafoam_function_outputs.drag
 
     # Design variables
-    flight_conditions_group.angle_of_attack.set_as_design_variable(lower=0, upper=10, scaler=1./10.)
+    flight_conditions_group.angle_of_attack_deg.set_as_design_variable(lower=0, upper=10, scaler=1./12.)
     percent_change_in_thickness_dof_wing.set_as_design_variable(lower=-10, upper=30., adder=10., scaler=1./40.)
     normalized_percent_camber_change_dof_wing.set_as_design_variable(lower=-20., upper=20., scaler=1./20.)
 
@@ -547,6 +559,40 @@ elif optimization_case == 5:
     objective_fun = -lift/drag
     objective_fun.set_as_objective()
 
+
+elif optimization_case == 6:
+    # Declaring and naming some variables
+    lift = dafoam_function_outputs.lift
+    drag = dafoam_function_outputs.drag
+    twist_lim_deg   = 5
+    twist_lim_rad   = twist_lim_deg*np.pi/180
+
+    # Design variables
+    flight_conditions_group.angle_of_attack_deg.set_as_design_variable(lower=-2., upper=10., adder=2., scaler=1./12.)
+    percent_change_in_thickness_dof_wing.set_as_design_variable(lower=-10, upper=30., adder=10., scaler=1./40.)
+    normalized_percent_camber_change_dof_wing.set_as_design_variable(lower=-20., upper=20., scaler=1./20.)
+    wing_twists.set_as_design_variable(lower=-twist_lim_rad, upper=twist_lim_rad, scaler=1/twist_lim_rad)
+
+    # Objective
+    objective_fun = -lift/drag
+    objective_fun.set_as_objective()
+
+
+elif optimization_case == 7:
+    # Declaring and naming some variables
+    lift = dafoam_function_outputs.lift
+    drag = dafoam_function_outputs.drag
+    twist_lim_deg   = 10
+    twist_lim_rad   = twist_lim_deg*np.pi/180
+
+    # Design variables
+    flight_conditions_group.angle_of_attack_deg.set_as_design_variable(lower=-2., upper=10., adder=2., scaler=1./12.)
+    normalized_percent_camber_change_dof_wing.set_as_design_variable(lower=-30., upper=30., scaler=1./30.)
+    wing_twists.set_as_design_variable(lower=-twist_lim_rad, upper=twist_lim_rad, scaler=1/twist_lim_rad)
+
+    # Objective
+    objective_fun = -lift/drag
+    objective_fun.set_as_objective()
 
 else:
     print('Not a valid case number')
@@ -578,20 +624,23 @@ else:
 # Optimization solver setup and run
 prob        = CSDLAlphaProblem(problem_name=f'{problem_name}_rank{rank_str}', simulator=sim)
 
-# # PySLSQP optimizer setup
-# solver_options = {'maxiter': 20,
-#                   'iprint': 2,
-#                   'visualize': visualize_on_this_rank,
-#                   'summary_filename': f'rank{rank_str}_slsqp_summary.out',
-#                   'save_figname':     f'rank{rank_str}_slsqp_plot.pdf',
-#                   'save_filename':    f'rank{rank_str}_slsqp_recorder.hdf5'}
-# optimizer   = PySLSQP(prob, solver_options=solver_options)
-# optimizer.solve()
-# optimizer.print_results()
+# # # PySLSQP optimizer setup
+# # solver_options = {'maxiter': 20,
+# #                   'iprint': 2,
+# #                   'visualize': visualize_on_this_rank,
+# #                   'summary_filename': f'rank{rank_str}_slsqp_summary.out',
+# #                   'save_figname':     f'rank{rank_str}_slsqp_plot.pdf',
+# #                   'save_filename':    f'rank{rank_str}_slsqp_recorder.hdf5'}
+# # optimizer   = PySLSQP(prob, solver_options=solver_options)
+# # optimizer.solve()
+# # optimizer.print_results()
 
 
 # OpenSQP optimizer setup
-optimizer   = OpenSQP(prob)
+open_sqp_options = {'maxiter': 40,
+                    'readable_outputs': ['x'],
+                    'recording': True}
+optimizer   = OpenSQP(prob, **open_sqp_options)
 optimizer.solve()
 optimizer.print_results()
 
@@ -599,5 +648,5 @@ optimizer.print_results()
 
 
 
-# # Extra items to use, if necessary
-# optimizer.check_first_derivatives(prob.x0)
+# # # Extra items to use, if necessary
+# # optimizer.check_first_derivatives(prob.x0)
