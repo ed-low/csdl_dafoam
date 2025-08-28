@@ -447,8 +447,15 @@ else:
 pod_modes = u[:, :num_modes]/np.sqrt(weights)[:, None]
 
 
+dafoam_instance()
+n_cells             = dafoam_instance.solver.getNLocalCells()
+plt.figure(0)
+for i in range(1,7): plt.axvline(n_cells*i, alpha=0.5, linestyle='--', color='gray')
+plt.plot(dafoam_instance.getResiduals())
+plt.show()
+
 # ----- Plotting section -----
-show_training_plots = False
+show_training_plots = True
 n_cells             = dafoam_instance.solver.getNLocalCells()
 
 if show_training_plots:
@@ -479,22 +486,21 @@ if show_training_plots:
     plt.show()
 
 
-
 # DAFoamSolver Implicit component setup and evaluation
 dafoam_rom           = DAFoamROM(dafoam_instance, 
                                  pod_modes=pod_modes, 
-                                 tolerance=1e-10, 
+                                 tolerance=1e-8, 
                                  fom_ref_state=scaling_factors*y_reference, 
                                  max_iters=100, 
                                  scaling_factors=scaling_factors, 
                                  weights=weights, 
                                  update_jac_frequency=1)
-                                 
+
 dafoam_rom_states    = dafoam_rom.evaluate(dafoam_input_variables_group)
 
 print(f'dafoam_rom_states: {dafoam_rom_states.value}')
 
-dafoam_fom_states    = csdl.matvec(pod_modes, dafoam_rom_states)
+dafoam_fom_states    =  scaling_factors*y_reference + scaling_factors*csdl.matvec(pod_modes, dafoam_rom_states)
 
 # DAFoamFunctions Explicit component setup and evaluation
 dafoam_functions = DAFoamFunctions(dafoam_instance)
@@ -570,6 +576,12 @@ sim = csdl.experimental.PySimulator(recorder)
 # Can set design variables here and run sim to test
 # sim[root_twist]  = 3*3.14159/180
 # sim.run()
+# dafoam_instance.solver.writeAdjointFields('sol', 11001, np.ascontiguousarray(dafoam_fom_states.value))
+
+# dafoam_instance()
+
+# dafoam_instance.solver.writeAdjointFields('sol', 11002, np.ascontiguousarray(dafoam_instance.getStates()))
+
 
 # Uncomment to run and check derivatives via finite difference
 # sim.check_totals()
