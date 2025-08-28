@@ -129,7 +129,7 @@ class DAFoamSolver(csdl.experimental.CustomImplicitOperation):
         # Use this to assign the computed flow states
         states = dafoam_instance.getStates()
 
-        # Unconverged case - return NaN for CSDL, revert to last successful state for DAFoam
+        # Unconverged case - return NaN for CSDL, flag to revert to last successful state for DAFoam
         if dafoam_instance.primalFail != 0:
             if dafoam_instance.rank == 0:
                 print('Primal solution failed!')
