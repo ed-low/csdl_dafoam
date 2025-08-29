@@ -962,7 +962,7 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
                 y_fom_pert = y_fom + fd_eps*D*(phi@e_j)
 
                 # Get perturbed reduced residuals
-                r_rom_pert = self._compute_reduced_residual(phi, y_fom_pert, W, D)
+                r_rom_pert = self._compute_residuals(phi, y_fom_pert, W, D)[1]
 
                 # Add to respective reduced jacobian column
                 J_rom[:, j] = (r_rom_pert - r_rom0)/fd_eps
