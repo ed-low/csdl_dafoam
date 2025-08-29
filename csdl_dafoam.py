@@ -56,9 +56,9 @@ class DAFoamSolver(csdl.experimental.CustomImplicitOperation):
         dafoam_instance.solverAD.initializedRdWTMatrixFree()
 
         # create the adjoint vector
-        self.num_local_state_elements = dafoam_instance.getNLocalAdjointStates()
+        self.n_local_state_elements = dafoam_instance.getNLocalAdjointStates()
         self.psi = PETSc.Vec().create(comm=dafoam_instance.comm)
-        self.psi.setSizes((self.num_local_state_elements, PETSc.DECIDE), bsize=1)
+        self.psi.setSizes((self.n_local_state_elements, PETSc.DECIDE), bsize=1)
         self.psi.setFromOptions()
         self.psi.zeroEntries()
 
@@ -82,7 +82,7 @@ class DAFoamSolver(csdl.experimental.CustomImplicitOperation):
                 self.declare_input(input_name, getattr(dafoam_input_variables_group, input_name))   
 
         # Set outputs
-        dafoam_solver_states = self.create_output('dafoam_solver_states', (self.num_local_state_elements,))
+        dafoam_solver_states = self.create_output('dafoam_solver_states', (self.n_local_state_elements,))
 
         return dafoam_solver_states
 
@@ -135,7 +135,7 @@ class DAFoamSolver(csdl.experimental.CustomImplicitOperation):
                 print('Primal solution failed!')
 
             # If we didn't converge, send the optimizer a NaN solution
-            output_vals['dafoam_solver_states'] = np.full((self.num_local_state_elements, ), np.nan)
+            output_vals['dafoam_solver_states'] = np.full((self.n_local_state_elements, ), np.nan)
 
             # Save convergence flag
             self.last_time_converged            = False
@@ -178,7 +178,7 @@ class DAFoamSolver(csdl.experimental.CustomImplicitOperation):
             if dafoam_instance.rank == 0:
                 print('DAFoamSolver.apply_inverse_jacobian: Found NaN in dFdWArray! Returning NaNs for d_residuals')
             
-            d_residuals['dafoam_solver_states'] = np.nan*np.ones((self.num_local_state_elements, ))
+            d_residuals['dafoam_solver_states'] = np.nan*np.ones((self.n_local_state_elements, ))
             
             # Have to change the directory back 
             # CHANGE DIRECTORY WORKAROUND 4/5
@@ -283,7 +283,7 @@ class DAFoamSolver(csdl.experimental.CustomImplicitOperation):
             if dafoam_instance.rank == 0:
                 print("Adjoint solution failed! Returning NANs")
 
-            d_residuals['dafoam_solver_states'] = np.nan*np.ones((self.num_local_state_elements, ))
+            d_residuals['dafoam_solver_states'] = np.nan*np.ones((self.n_local_state_elements, ))
         
         # CHANGE DIRECTORY WORKAROUND 5/5
         if USE_CHANGE_DIRECTORY_WORKAROUND:
@@ -346,7 +346,7 @@ class DAFoamSolver(csdl.experimental.CustomImplicitOperation):
 
         dafoam_instance = self.dafoam_instance
         # calculate the initial residual for the adjoint before solving
-        rArray = np.zeros(self.num_local_state_elements)
+        rArray = np.zeros(self.n_local_state_elements)
         jac_input = dafoam_instance.getStates()
         seed = dafoam_instance.vec2Array(psi)
         dafoam_instance.solverAD.calcJacTVecProduct(
@@ -601,6 +601,8 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
         self.update_jac_frequency   = update_jac_frequency if update_jac_frequency > 0 else np.nan
         self.reduced_jacobian       = None
         self.solution_counter       = 1
+        self.n_local_state_elements = dafoam_instance.getNLocalAdjointStates()
+        self.n_local_cells          = dafoam_instance.solver.getNLocalCells()
 
         # Do some checks here to assign default values if none passed. Alert user if none are passed.
         if weights is None:
@@ -699,9 +701,7 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
         # Initialize our ROM/FOM states, solver, and ROM/FOM residuals 
         y_rom = np.zeros((num_modes, ))
         y_fom = y_fom_ref + D*(phi@y_rom)
-        dafoam_instance.setStates(y_fom)
-        r_fom = dafoam_instance.getResiduals()
-        r_rom = phi.T@(W*r_fom)
+        r_fom, r_rom = self._compute_residuals(phi, y_fom, W, D)
         r_rom_norm = np.linalg.norm(r_rom)
 
         # Some plotting for diagnostics
@@ -743,7 +743,7 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
             # (Re)compute Jacobian on first iteration or if not reusing the same Jacobian
             if iter%update_jac_frequency == 0 or iter == 0:
                 print('Computing reduced Jacobian...')
-                J_rom = self._compute_reduced_jacobian(phi, y_fom, W, D, 'fom_jTvp')
+                J_rom = self._compute_reduced_jacobian(phi, y_fom, W, D, mode='fd', fd_eps=1e-8)
                 self.reduced_jacobian = J_rom
 
             # Compute step (robust linear solve with lstsq fallback)
@@ -763,8 +763,7 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
                 y_rom_test = y_rom + alpha*delta_y_rom
                 y_fom_test = y_fom_ref + D*(phi@y_rom_test)
                 dafoam_instance.setStates(y_fom_test)
-                r_fom_test = dafoam_instance.getResiduals()
-                r_rom_test = phi.T@(W*r_fom_test)
+                r_fom_test, r_rom_test = self._compute_residuals(phi, y_fom_test, W, D)
                 r_rom_test_norm = np.linalg.norm(r_rom_test)
 
                 if r_rom_test_norm < r_rom_norm:
@@ -781,9 +780,7 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
                 print('Line search failed! Taking small step...')
                 y_rom = y_rom + 1e-4*delta_y_rom
                 y_fom = y_fom_ref + D*(phi@y_rom)
-                dafoam_instance.setStates(y_fom)
-                r_fom = dafoam_instance.getResiduals()
-                r_rom = phi.T@(W*r_fom)
+                r_fom, r_rom = self._compute_residuals(phi, y_fom, W, D)
                 r_rom_norm = np.linalg.norm(r_rom)
 
             # Save the initial value of the reduced residual
@@ -956,9 +953,7 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
             J_rom  = np.zeros((num_modes, num_modes))
             
             # Get reduced residual
-            dafoam_instance.setStates(y_fom)
-            r_fom  = dafoam_instance.getResiduals()
-            r_rom0 = phi.T@(W*r_fom)
+            r_fom, r_rom0 = self._compute_residuals(phi, y_fom, W, D)
 
             for j in range(num_modes):         
                 # Perturb the reduced coordinates
@@ -981,15 +976,16 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
             raise ValueError(f"Unknown J_rom computation mode '{mode}'. Choose from 'fom_jTvp' or 'fd'")
     
 
+    # region _compute_residuals
     # This is just a helper function for convenience
-    def _compute_reduced_residual(self, phi, y_fom, W, D):
+    def _compute_residuals(self, phi, y_fom, W, D):
         dafoam_instance = self.dafoam_instance
 
         dafoam_instance.setStates(y_fom)
         r_fom = dafoam_instance.getResiduals()
         r_rom = phi.T@(W*r_fom)
 
-        return r_rom
+        return r_fom, r_rom
 
 
 
