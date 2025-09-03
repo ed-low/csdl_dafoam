@@ -739,6 +739,8 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
             print('-------------------------------------')
             print(f'ROM Newton iteration {iter}')
             print('-------------------------------------')
+            y_rom_old = y_rom
+            r_rom_old = r_rom
 
             # (Re)compute Jacobian on first iteration or if not reusing the same Jacobian
             if iter%update_jac_frequency == 0 or iter == 0:
@@ -752,7 +754,7 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
                 delta_y_rom = np.linalg.solve(J_rom, -r_rom)
             except np.linalg.LinAlgError:
                 # fallback to least-squares if matrix singular or near-singular
-                delta_y_rom, *_ = np.linalg.lstsq(J_rom, -r_rom, rcond=1e-12)
+                delta_y_rom = np.linalg.lstsq(J_rom, -r_rom, rcond=1e-12)[0]
                 delta_y_rom = delta_y_rom.reshape(-1,)
                 print('\tWarning: reduced Jacobian singular; used least-squares fallback.')
 
@@ -797,6 +799,9 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
             if r_rom_norm < tolerance:
                 converged = True
                 break
+
+            # Broyden update
+            self._broyden_update(J_rom, y_rom_old, y_rom, r_rom_old, r_rom)
 
             # Upate plots
             x_data.append(iter+1)
@@ -916,7 +921,7 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
 
 
     # region _compute_reduced_jacobian
-    def _compute_reduced_jacobian(self, phi, y_fom, W, D, mode='fom_jTvp', fd_eps=1e-6):
+    def _compute_reduced_jacobian(self, phi, y_fom, W, D, mode='fom_jTvp', fd_eps=1e-8):
         dafoam_instance = self.dafoam_instance
         num_modes       = phi.shape[1]
 
@@ -987,7 +992,12 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
 
         return r_fom, r_rom
 
-
+    
+    # region _broyden_update
+    def _broyden_update(self, J, x_old, x_new, f_old, f_new):
+        dx = x_new - x_old
+        df = f_new - f_old
+        J += np.outer((df - np.dot(J, dx)), dx)/np.dot(dx, dx)
 
 
 
