@@ -790,7 +790,7 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
             # (Re)compute Jacobian on first iteration(s) or if triggered (maybe by update frequency)
             if iter%update_jac_frequency == 0 or iter < num_initial_jac_updates or trigger_jac_recompute:
                 print('Computing reduced Jacobian...')
-                J_rom = self._compute_reduced_jacobian(phi, y_fom, W, D, mode='fd', fd_eps=1e-8)
+                J_rom = self._compute_reduced_jacobian(phi, y_fom, y_rom, W, D, mode='fd')
                 self.reduced_jacobian = J_rom
                 trigger_jac_recompute = False
 
@@ -882,7 +882,7 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
             print('\n\n Specified tolerance reached!')
             # Update reduced jacobain to most recent state
             print('Updating Jacobian to most recent state value...')
-            J_rom = self._compute_reduced_jacobian(phi, y_fom, W, D)
+            J_rom = self._compute_reduced_jacobian(phi, y_fom, y_rom, W, D)
             self.reduced_jacobian = J_rom
 
             output_vals['dafoam_rom_states'] = y_rom
@@ -911,7 +911,7 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
         D               = self.scaling_factors
         W               = self.weights
         y_fom_ref       = self.fom_ref_state
-        phi             = input_vals['pod_modes'] if pod_modes_is_csdl_var else self.pod_modes
+        phi             = input_vals['pod_modes'] if self.pod_modes_is_csdl_var else self.pod_modes
         y_rom           = output_vals['dafoam_rom_states']
         y_fom           = y_fom_ref + D*(phi@y_rom)
         n_points        = dafoam_instance.solver.getNLocalPoints()
@@ -987,7 +987,7 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
 
 
     # region _compute_reduced_jacobian
-    def _compute_reduced_jacobian(self, phi, y_fom, W, D, mode='fom_jTvp', fd_eps=1e-8):
+    def _compute_reduced_jacobian(self, phi, y_fom, y_rom, W, D, mode='fom_jTvp', fd_eps=1e-6):
         dafoam_instance = self.dafoam_instance
         num_modes       = phi.shape[1]
 
@@ -1026,20 +1026,22 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
             # Get reduced residual
             r_fom, r_rom0 = self._compute_residuals(phi, y_fom, W, D)
 
+            # Will choose this value if the stepsize gets too small
+            min_stepsize_magnitude = 1e-8
+
             for j in range(num_modes):         
-                # Perturb the reduced coordinates
-                e_j = np.zeros(num_modes)
-                e_j[j] = 1.0
-                y_fom_pert = y_fom + fd_eps*D*(phi@e_j)
+                # Perturb the reduced coordinates by fd_eps (choose lower bound if too small)
+                delta_j = max(np.abs(fd_eps*y_rom[j]), min_stepsize_magnitude)
+                y_fom_pert = y_fom + D*phi[:, j]*delta_j
 
                 # Get perturbed reduced residuals
                 r_rom_pert = self._compute_residuals(phi, y_fom_pert, W, D)[1]
 
                 # Add to respective reduced jacobian column
-                J_rom[:, j] = (r_rom_pert - r_rom0)/fd_eps
+                J_rom[:, j] = (r_rom_pert - r_rom0)/delta_j
 
             # Reset states in DAFoam
-            dafoam_instance.setStates(y_fom)
+            dafoam_instance.setStates(y_fom) 
 
             return J_rom
 
