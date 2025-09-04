@@ -328,8 +328,8 @@ class DAFoamSolver(csdl.experimental.CustomImplicitOperation):
                 input_dict = dafoam_instance.getOption("inputInfo")
                 for input_name in list(input_vals.keys()):
                     input_type = input_dict[input_name]["type"]
-                    jac_input = input_vals[input_name].copy()
-                    product = np.zeros_like(jac_input)
+                    jac_input  = input_vals[input_name].copy()
+                    product    = np.zeros_like(jac_input)
                     dafoam_instance.solverAD.calcJacTVecProduct(
                         input_name,
                         input_type,
@@ -969,8 +969,8 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
                     # (Taking care of the DAFoam inputs here)
                     if input_name in input_dict:
                         input_type = input_dict[input_name]["type"]
-                        jac_input = input_vals[input_name].copy()
-                        product = np.zeros_like(jac_input)
+                        jac_input  = input_vals[input_name].copy()
+                        product    = np.zeros_like(jac_input)
                         dafoam_instance.solverAD.calcJacTVecProduct(
                             input_name,
                             input_type,
@@ -980,7 +980,7 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
                             seed,
                             product,
                         )
-                        d_inputs[input_name] += product
+                        d_inputs[input_name] = product
         
         else:
             raise ValueError(f'"{mode}" not recognized. Only support "fwd" and "rev" modes')
@@ -1031,7 +1031,7 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
 
             for j in range(num_modes):         
                 # Perturb the reduced coordinates by fd_eps (choose lower bound if too small)
-                delta_j = max(np.abs(fd_eps*y_rom[j]), min_stepsize_magnitude)
+                delta_j    = max(np.abs(fd_eps*y_rom[j]), min_stepsize_magnitude)
                 y_fom_pert = y_fom + D*phi[:, j]*delta_j
 
                 # Get perturbed reduced residuals
