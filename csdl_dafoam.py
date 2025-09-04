@@ -597,14 +597,17 @@ def has_global_nan_or_inf(arr, comm):
 class DAFoamROM(csdl.experimental.CustomImplicitOperation):
     def __init__(self, 
                  dafoam_instance,
-                 pod_modes:np.array      =None,
-                 fom_ref_state:np.array  =None, 
-                 tolerance               =1e-6, 
-                 max_iters:int           =100, 
-                 update_jac_frequency:int=0, 
-                 fom_states_ref:np.array =None,
-                 weights:np.array        =None,
-                 scaling_factors:np.array=None):
+                 pod_modes:np.array         =None,
+                 fom_ref_state:np.array     =None, 
+                 tolerance                  =1e-6, 
+                 max_iters:int              =100, 
+                 update_jac_frequency:int   =0,
+                 num_initial_jac_updates:int=1, 
+                 fom_states_ref:np.array    =None,
+                 weights:np.array           =None,
+                 scaling_factors:np.array   =None,
+                 coefficient_matrix:np.array=None,
+                 snapshot_configurations    =None):
 
         super().__init__()
         self.dafoam_instance        = dafoam_instance
@@ -612,10 +615,14 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
         self.max_iters              = max_iters
         self.solution_counter       = 1
         self.update_jac_frequency   = update_jac_frequency if update_jac_frequency > 0 else np.nan
+        self.num_initial_jac_updates= num_initial_jac_updates
         self.reduced_jacobian       = None
         self.solution_counter       = 1
         self.n_local_state_elements = dafoam_instance.getNLocalAdjointStates()
         self.n_local_cells          = dafoam_instance.solver.getNLocalCells()
+
+        # self.coefficient_matrix     = coefficient_matrix
+        # self.snapshot_configurations= snapshot_configurations
 
         # Do some checks here to assign default values if none passed. Alert user if none are passed.
         if weights is None:
@@ -645,7 +652,7 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
 
         
     # region evaluate
-    def evaluate(self, dafoam_input_variables_group:csdl.VariableGroup, pod_modes:csdl.Variable=None):
+    def evaluate(self, dafoam_input_variables_group:csdl.VariableGroup, pod_modes:csdl.Variable=None, design_variable_configuration:csdl.Variable=None):
         
         # Read daOptions to set proper inputs
         inputDict = self.dafoam_instance.getOption("inputInfo")
@@ -662,10 +669,26 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
             self.pod_modes_is_csdl_var = True
         else:
             if self.pod_modes is None:
-                TypeError('No POD modes assigned to ROM. Please pass a constant POD mode set during initialization, or a POD mode in the evaluate section.')
+                TypeError('No POD modes assigned to ROM. Please pass a constant POD mode set during initialization, or a POD mode set in the evaluate section.')
             else:
                 num_modes = self.pod_modes.shape[1]
                 self.pod_modes_is_csdl_var = False
+
+        # # Check for design variable configuration passing and ignore if not set up to handle
+        # if design_variable_configuration is not None:
+        #     self.interpolate_initial_condition = True
+        #     if self.coefficient_matrix is None:
+        #         print('Design variable configuration passed as input, but no coefficient matrix provided.')
+        #         self.interpolate_initial_condition = False
+
+        #     if self.snapshot_configurations is None:
+        #         print('Design variable configuration passed as input, but no snapshot configuration array provided.')
+        #         self.interpolate_initial_condition = False
+
+        #     if self.interpolate_initial_condition is True:
+        #         self.declare_input('design_variable_configuration', design_variable_configuration)
+            # else:
+            #     print('Ignoring design variable condition input...')
         
         # Set outputs
         dafoam_rom_states = self.create_output('dafoam_rom_states', (num_modes,))
@@ -675,26 +698,26 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
 
     # region solve_residual_equations
     def solve_residual_equations(self, input_vals, output_vals):
-
-        # Pull values from self
         dafoam_instance       = self.dafoam_instance
-        max_iters             = self.max_iters
-        update_jac_frequency  = self.update_jac_frequency
-        tolerance             = self.tolerance
+
+        # Solver parameters/options (not all have been exposed as options yet. Tweak here if necessary.)
+        max_iters                       = self.max_iters
+        update_jac_frequency            = self.update_jac_frequency
+        num_initial_jac_updates         = self.num_initial_jac_updates
+        tolerance                       = self.tolerance
+        line_search_minimum_reduction   = 1e-4
+        line_search_shrink_factor       = 0.5
+        trigger_jac_recompute_threshold = 3
+       
+        # Check if we're working with the pod modes as a constant or as a variable
         pod_modes_is_csdl_var = self.pod_modes_is_csdl_var
 
         # Some important quanitites
-        y_fom_ref    = self.fom_ref_state
-        W            = self.weights
-        D            = self.scaling_factors
-
-        # Determine if our basis is constant, or an input value
-        if pod_modes_is_csdl_var:
-            phi      = input_vals['pod_modes']
-        else:
-            phi      = self.pod_modes
-
-        num_modes    = phi.shape[1]
+        y_fom_ref  = self.fom_ref_state
+        W          = self.weights
+        D          = self.scaling_factors
+        phi        = input_vals['pod_modes'] if pod_modes_is_csdl_var else self.pod_modes
+        num_modes  = phi.shape[1]
         
         # MPI stuff
         # TODO: will have to make this all MPI compatible eventually
@@ -707,15 +730,16 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
         # We do not print the residual for AD, though
         # NOTE: This was taken from DAFoamSolver.solve_residual_equation
         dafoam_instance.solverAD.calcPrimalResidualStatistics("calc")
-
-        # Initialize our newton convergence flag
-        converged = False
-
-        # Initialize our ROM/FOM states, solver, and ROM/FOM residuals 
+        
+        # Initialize our ROM/FOM states and ROM/FOM residuals
         y_rom = np.zeros((num_modes, ))
-        y_fom = y_fom_ref + D*(phi@y_rom)
-        r_fom, r_rom = self._compute_residuals(phi, y_fom, W, D)
+        y_fom, r_fom, r_rom = self._rom_states_to_res_and_fom(phi, y_rom, W, D)
         r_rom_norm = np.linalg.norm(r_rom)
+        # if self.interpolate_initial_condition:
+        #     y_rom = self._interpolate_coeffs(input_vals["design_variable_configuration"])
+        #     print(f'y_rom: {y_rom}')
+        # else:
+        #     y_rom = np.zeros((num_modes, ))
 
         # Some plotting for diagnostics
         #----------------------
@@ -746,20 +770,29 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
             plt.pause(0.1)
         #-------------------------
 
+        # Initializing loop counters and flags
+        trigger_jac_recompute_counter   = 0
+        trigger_jac_recompute           = False
+        last_accepted                   = True
+        converged                       = False
+
         # Main Newton iteration loop
         for iter in range(max_iters):
             print('\n')
             print('-------------------------------------')
             print(f'ROM Newton iteration {iter}')
             print('-------------------------------------')
+
+            # Save old ROM values (for Broyden update)
             y_rom_old = y_rom
             r_rom_old = r_rom
 
-            # (Re)compute Jacobian on first iteration or if not reusing the same Jacobian
-            if iter%update_jac_frequency == 0 or iter == 0:
+            # (Re)compute Jacobian on first iteration(s) or if triggered (maybe by update frequency)
+            if iter%update_jac_frequency == 0 or iter < num_initial_jac_updates or trigger_jac_recompute:
                 print('Computing reduced Jacobian...')
                 J_rom = self._compute_reduced_jacobian(phi, y_fom, W, D, mode='fd', fd_eps=1e-8)
                 self.reduced_jacobian = J_rom
+                trigger_jac_recompute = False
 
             # Compute step (robust linear solve with lstsq fallback)
             print('Updating ROM and FOM states...')
@@ -771,32 +804,42 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
                 delta_y_rom = delta_y_rom.reshape(-1,)
                 print('\tWarning: reduced Jacobian singular; used least-squares fallback.')
 
+            # Initialize line search params and begin search
             accepted = False
-            alpha = 1
-            while alpha > 1e-4:
+            alpha    = 1
+            while alpha > line_search_minimum_reduction:
                 print(f'Line search: alpha = {alpha}')
                 y_rom_test = y_rom + alpha*delta_y_rom
-                y_fom_test = y_fom_ref + D*(phi@y_rom_test)
-                dafoam_instance.setStates(y_fom_test)
-                r_fom_test, r_rom_test = self._compute_residuals(phi, y_fom_test, W, D)
+                y_fom_test, r_fom_test, r_rom_test = self._rom_states_to_res_and_fom(phi, y_rom_test, W, D)
                 r_rom_test_norm = np.linalg.norm(r_rom_test)
 
                 if r_rom_test_norm < r_rom_norm:
-                    y_rom = y_rom_test
-                    y_fom = y_fom_test
-                    r_rom = r_rom_test
-                    r_fom = r_fom_test
+                    y_rom      = y_rom_test
+                    y_fom      = y_fom_test
+                    r_rom      = r_rom_test
+                    r_fom      = r_fom_test
                     r_rom_norm = r_rom_test_norm
-                    accepted = True
+                    accepted   = True
+                    trigger_jac_recompute_counter = 0
                     break
-                alpha *= 0.5
+
+                alpha *= line_search_shrink_factor
 
             if not accepted:
                 print('Line search failed! Taking small step...')
-                y_rom = y_rom + 1e-4*delta_y_rom
-                y_fom = y_fom_ref + D*(phi@y_rom)
-                r_fom, r_rom = self._compute_residuals(phi, y_fom, W, D)
+                y_rom = y_rom + line_search_minimum_reduction*delta_y_rom
+                y_fom, r_fom, r_rom = self._rom_states_to_res_and_fom(phi, y_rom, W, D)
                 r_rom_norm = np.linalg.norm(r_rom)
+
+                # Check if the line search failed last time
+                if not last_accepted:
+                    trigger_jac_recompute_counter += 1
+                    
+                    # Trigger recompute after threshold number of sequential failures (have to subtract 1 because counter starts at 0)
+                    if trigger_jac_recompute_counter >= trigger_jac_recompute_threshold - 1:
+                        trigger_jac_recompute = True
+
+            last_accepted = accepted
 
             # Save the initial value of the reduced residual
             if iter == 0:
@@ -834,7 +877,7 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
             plt.draw()
             plt.pause(0.1)
         
-        # Return NaN array as output if failed (for the optimizer), otherwise return rom states
+        # Return NaN array as output if failed (for the OpenSQP optimizer), otherwise return rom states
         if converged:
             print('\n\n Specified tolerance reached!')
             # Update reduced jacobain to most recent state
@@ -843,6 +886,7 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
             self.reduced_jacobian = J_rom
 
             output_vals['dafoam_rom_states'] = y_rom
+
         else:
             print('Warning: ROM iteration limit reached!')
             output_vals['dafoam_rom_states'] = np.full((num_modes, ), np.nan)
@@ -947,7 +991,7 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
         dafoam_instance = self.dafoam_instance
         num_modes       = phi.shape[1]
 
-        if mode == 'fom_jTvp': # Computing using DAFoamSolver's calcJacTVecProduct column by column
+        if mode == 'fom_jTvp': # Computing using DAFoamSolver's calcJacTVecProduct column by column and projecting
             J_romT_W_phi           = np.zeros_like(phi)
             W_phi                  = W[:, None]*phi
             dafoam_scaling_factors = dafoam_instance.getStateScalingFactors()
@@ -1015,12 +1059,40 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
         return r_fom, r_rom
 
     
+    # region _rom_states_to_res_and_fom
+    def _rom_states_to_res_and_fom(self, phi, y_rom, W, D):
+        dafoam_instance = self.dafoam_instance
+        y_fom_ref       = self.fom_ref_state
+
+        y_fom = y_fom_ref + D*(phi@y_rom)
+        r_fom, r_rom = self._compute_residuals(phi, y_fom, W, D)
+
+        return y_fom, r_fom, r_rom
+
+    
     # region _broyden_update
     def _broyden_update(self, J, x_old, x_new, f_old, f_new):
         dx = x_new - x_old
         df = f_new - f_old
         J += np.outer((df - np.dot(J, dx)), dx)/np.dot(dx, dx)
 
+    
+    # region _interpolate_coeffs
+    def _interpolate_coeffs(self, desired_parameter_config):
+        # This function is used to help initialize the ROM by interpolating the columns of the s*vh array (from svd) for
+        # a set of coefficients that corresponds to the solution at the new, desired parameter configuration
+        #  
+        # Interpolate to get starting coefficients
+        from scipy.interpolate import RBFInterpolator
+
+        a                = self.coefficient_matrix
+        snapshot_configs = self.snapshot_configurations
+
+        rbf              = RBFInterpolator(snapshot_configs, a.T, kernel='cubic', neighbors=20)
+
+        a_desired        = rbf([desired_parameter_config]).ravel()
+
+        return a_desired
 
 
 
