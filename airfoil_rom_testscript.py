@@ -423,7 +423,7 @@ elif weight_mode == 'cell':
     weights_v[2::3] = cell_volumes
     # Bandaid solution to get face areas for now
     face_areas = dafoam_instance.getStateScalingFactors()[6*dafoam_instance.solver.getNLocalCells():]
-    weights = np.concatenate((weights_v, np.tile(cell_volumes, 3), face_areas), axis=None)
+    weights    = np.concatenate((weights_v, np.tile(cell_volumes, 3), face_areas), axis=None)
 
 
 # Scale and zero-mean our data
@@ -444,31 +444,37 @@ if num_modes == -1:
 else:
     print(f"{num_modes} captures {energy_fraction[num_modes - 1]*100}% of the total energy")
 
-pod_modes = u[:, :num_modes]/np.sqrt(weights)[:, None]
+pod_modes          = u[:, :num_modes]/np.sqrt(weights)[:, None]
+coefficient_matrix = (s[:, None]*vh)[:num_modes, :]
+snapshot_configs   = global_metadata["snapshot_configurations"]
+desired_config     = csdl.concatenate((percent_change_in_thickness_dof, normalized_percent_camber_change_dof))
 
 
-dafoam_instance()
-n_cells             = dafoam_instance.solver.getNLocalCells()
-plt.figure(0)
-for i in range(1,7): plt.axvline(n_cells*i, alpha=0.5, linestyle='--', color='gray')
-plt.plot(dafoam_instance.getResiduals())
-plt.show()
+# This was just a test to see the FOM residuals
+# dafoam_instance()
+# n_cells             = dafoam_instance.solver.getNLocalCells()
+# plt.figure(0)
+# for i in range(1,7): plt.axvline(n_cells*i, alpha=0.5, linestyle='--', color='gray')
+# plt.plot(dafoam_instance.getResiduals())
+# plt.show()
 
 # ----- Plotting section -----
-show_training_plots = True
+show_training_plots = False
 n_cells             = dafoam_instance.solver.getNLocalCells()
 
 if show_training_plots:
     plt.figure(1)
     for i in range(1,7): plt.axvline(n_cells*i, alpha=0.5, linestyle='--', color='gray')
     plt.plot(scaling_factors[:, None]*y_training)
-    plt.plot(scaling_factors*y_reference, label='reference state')
+    plt.plot(scaling_factors*y_reference, linestyle=':', label='reference state')
+    plt.legend()
     plt.title('Raw training data')
 
     plt.figure(2)
     for i in range(1,7): plt.axvline(n_cells*i, alpha=0.5, linestyle='--', color='gray')
     plt.plot(y_training)
-    plt.plot(y_reference, label='reference state')
+    plt.plot(y_reference, linestyle=':', label='reference state')
+    plt.legend()
     plt.title('Scaled training data')
 
     plt.figure(3)
@@ -485,6 +491,8 @@ if show_training_plots:
     plt.legend()
     plt.show()
 
+# dafoam_solver           = DAFoamSolver(dafoam_instance)
+# dafoam_solver_states    = dafoam_solver.evaluate(dafoam_input_variables_group)
 
 # DAFoamSolver Implicit component setup and evaluation
 dafoam_rom           = DAFoamROM(dafoam_instance, 
@@ -494,16 +502,58 @@ dafoam_rom           = DAFoamROM(dafoam_instance,
                                  max_iters=100, 
                                  scaling_factors=scaling_factors, 
                                  weights=weights, 
-                                 update_jac_frequency=1)
+                                 update_jac_frequency=10,
+                                 num_initial_jac_updates=1,
+                                 coefficient_matrix=coefficient_matrix,
+                                 snapshot_configurations=snapshot_configs)
 
-dafoam_rom_states    = dafoam_rom.evaluate(dafoam_input_variables_group)
-
-print(f'dafoam_rom_states: {dafoam_rom_states.value}')
+dafoam_rom_states    = dafoam_rom.evaluate(dafoam_input_variables_group)#, design_variable_configuration=desired_config)
 
 dafoam_fom_states    =  scaling_factors*y_reference + scaling_factors*csdl.matvec(pod_modes, dafoam_rom_states)
 
+
+
+# # Comparing FD to JVP J rom
+# import matplotlib as mpl
+
+# J_rom_jvp = dafoam_rom._compute_reduced_jacobian(pod_modes, dafoam_fom_states.value, dafoam_rom_states.value, weights, scaling_factors)
+# J_rom_fd  = dafoam_rom._compute_reduced_jacobian(pod_modes, dafoam_fom_states.value, dafoam_rom_states.value, weights, scaling_factors, mode='fd')
+
+# fig, axs = plt.subplots(2, 2)
+
+# pclr = axs[0, 0].pcolor(J_rom_jvp)
+# axs[0, 0].set_title('J_rom JVP')
+# plt.colorbar(pclr, ax=axs[0, 0])
+
+# pclr = axs[0, 1].pcolor(J_rom_fd)
+# axs[0, 1].set_title('J_rom FD')
+# plt.colorbar(pclr, ax=axs[0, 1])
+
+# pclr = axs[1, 0].pcolor(J_rom_fd - J_rom_jvp)
+# axs[1, 0].set_title('J_rom diff (FD - JVP)')
+# plt.colorbar(pclr, ax=axs[1, 0])
+
+# pclr = axs[1, 1].pcolor((J_rom_fd - J_rom_jvp)/J_rom_jvp, cmap=mpl.colormaps['seismic'], vmin=-0.1, vmax=0.1)
+# axs[1, 1].set_title('J_rom rel diff (FD - JVP)/JVP')
+# plt.colorbar(pclr, ax=axs[1, 1])
+
+# input('Press ENTER to continue...')
+
+
+# # Compare FOM and ROM initial solution
+# plt.figure()
+# dafoam_state_diff    = (dafoam_solver_states - dafoam_fom_states)
+# plt.scatter(np.array(range(dafoam_instance.getNLocalAdjointStates())), dafoam_state_diff.value, label='FOM-ROM')
+# plt.scatter(np.array(range(dafoam_instance.getNLocalAdjointStates())), dafoam_fom_states.value, label='ROM predicted')
+# plt.scatter(np.array(range(dafoam_instance.getNLocalAdjointStates())), dafoam_solver_states.value, label='FOM')
+# # plt.ylim((-1,1))
+# plt.legend()
+# plt.show()
+# input('Press ENTER to continue')
+
+
 # DAFoamFunctions Explicit component setup and evaluation
-dafoam_functions = DAFoamFunctions(dafoam_instance)
+dafoam_functions        = DAFoamFunctions(dafoam_instance)
 dafoam_function_outputs = dafoam_functions.evaluate(dafoam_fom_states, 
                                                     dafoam_input_variables_group)
 
@@ -554,8 +604,8 @@ elif optimization_case == 3:
     drag = dafoam_function_outputs.drag
 
     # Design variables
-    percent_change_in_thickness_dof.set_as_design_variable(lower=-10, upper=10, scaler=1./10)
-    normalized_percent_camber_change_dof.set_as_design_variable(lower=-10, upper=10, scaler=1./10)
+    percent_change_in_thickness_dof.set_as_design_variable(lower=-8, upper=8, scaler=1./10)
+    normalized_percent_camber_change_dof.set_as_design_variable(lower=-8, upper=8, scaler=1./10)
 
     # Objectives
     objective_fun = -lift/drag
