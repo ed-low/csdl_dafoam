@@ -168,122 +168,127 @@ class DAFoamSolver(csdl.experimental.CustomImplicitOperation):
         if mode == 'fwd':
             raise NotImplementedError('forward mode has not been implemented for DAFoamSolver')
 
-        adjEqnSolMethod = dafoam_instance.getOption("adjEqnSolMethod")
+        elif mode == 'rev':
 
-        # right hand side array from d_outputs
-        dFdWArray = d_outputs['dafoam_solver_states']
+            adjEqnSolMethod = dafoam_instance.getOption("adjEqnSolMethod")
 
-        # Check for NaNs - exit early if found
-        if has_global_nan_or_inf(dFdWArray, dafoam_instance.comm):
-            if dafoam_instance.rank == 0:
-                print('DAFoamSolver.apply_inverse_jacobian: Found NaN in dFdWArray! Returning NaNs for d_residuals')
-            
-            d_residuals['dafoam_solver_states'] = np.nan*np.ones((self.n_local_state_elements, ))
-            
-            # Have to change the directory back 
-            # CHANGE DIRECTORY WORKAROUND 4/5
-            if USE_CHANGE_DIRECTORY_WORKAROUND:
-                os.chdir(previous_directory)
-            # -------------------------------
-            return
+            # right hand side array from d_outputs
+            dFdWArray = d_outputs['dafoam_solver_states']
 
-        # convert the array to vector
-        dFdW = dafoam_instance.array2Vec(dFdWArray)
+            # Check for NaNs - exit early if found
+            if has_global_nan_or_inf(dFdWArray, dafoam_instance.comm):
+                if dafoam_instance.rank == 0:
+                    print('DAFoamSolver.apply_inverse_jacobian: Found NaN in dFdWArray! Returning NaNs for d_residuals')
+                
+                d_residuals['dafoam_solver_states'] = np.nan*np.ones((self.n_local_state_elements, ))
+                
+                # Have to change the directory back 
+                # CHANGE DIRECTORY WORKAROUND 4/5
+                if USE_CHANGE_DIRECTORY_WORKAROUND:
+                    os.chdir(previous_directory)
+                # -------------------------------
+                return
 
-        # run coloring
-        if self.dafoam_instance.getOption("adjUseColoring") and self.runColoring:
-            self.dafoam_instance.solver.runColoring()
-            self.runColoring = False
+            # convert the array to vector
+            dFdW = dafoam_instance.array2Vec(dFdWArray)
 
-        if adjEqnSolMethod == "Krylov":
-            # solve the adjoint equation using the Krylov method
-            # if writeMinorIterations=True, we rename the solution in pyDAFoam.py. So we don't recompute the PC
-            if dafoam_instance.getOption("writeMinorIterations"):
-                if dafoam_instance.dRdWTPC is None or dafoam_instance.ksp is None:
-                    dafoam_instance.dRdWTPC = PETSc.Mat().create(dafoam_instance.comm)
-                    dafoam_instance.solver.calcdRdWT(1, dafoam_instance.dRdWTPC)
-                    dafoam_instance.ksp = PETSc.KSP().create(dafoam_instance.comm)
-                    dafoam_instance.solverAD.createMLRKSPMatrixFree(dafoam_instance.dRdWTPC, dafoam_instance.ksp)
+            # run coloring
+            if self.dafoam_instance.getOption("adjUseColoring") and self.runColoring:
+                self.dafoam_instance.solver.runColoring()
+                self.runColoring = False
 
-            # otherwise, we need to recompute the PC mat based on adjPCLag
-            else:
-                # NOTE: this function will be called multiple times (one time for one obj func) in each opt iteration
-                # so we don't want to print the total info and recompute PC for each obj, we need to use renamed
-                # to check if a recompute is needed. In other words, we only recompute the PC for the first obj func
-                # adjoint solution
+            if adjEqnSolMethod == "Krylov":
+                # solve the adjoint equation using the Krylov method
+                # if writeMinorIterations=True, we rename the solution in pyDAFoam.py. So we don't recompute the PC
+                if dafoam_instance.getOption("writeMinorIterations"):
+                    if dafoam_instance.dRdWTPC is None or dafoam_instance.ksp is None:
+                        dafoam_instance.dRdWTPC = PETSc.Mat().create(dafoam_instance.comm)
+                        dafoam_instance.solver.calcdRdWT(1, dafoam_instance.dRdWTPC)
+                        dafoam_instance.ksp = PETSc.KSP().create(dafoam_instance.comm)
+                        dafoam_instance.solverAD.createMLRKSPMatrixFree(dafoam_instance.dRdWTPC, dafoam_instance.ksp)
+
+                # otherwise, we need to recompute the PC mat based on adjPCLag
+                else:
+                    # NOTE: this function will be called multiple times (one time for one obj func) in each opt iteration
+                    # so we don't want to print the total info and recompute PC for each obj, we need to use renamed
+                    # to check if a recompute is needed. In other words, we only recompute the PC for the first obj func
+                    # adjoint solution
+                    solutionTime, renamed = dafoam_instance.renameSolution(self.solution_counter)
+
+                    if renamed:
+                        if dafoam_instance.comm.rank == 0:
+                            print("Driver total derivatives for iteration: %d" % self.solution_counter, flush=True)
+                            print("---------------------------------------------", flush=True)
+                        self.solution_counter += 1
+
+                    # compute the preconditioner matrix for the adjoint linear equation solution
+                    # and initialize the ksp object. We reinitialize them every adjPCLag
+                    adjPCLag = dafoam_instance.getOption("adjPCLag")
+                    if dafoam_instance.dRdWTPC is None or dafoam_instance.ksp is None or (self.solution_counter - 1) % adjPCLag == 0:
+                        if renamed:
+                            # calculate the PC mat
+                            if dafoam_instance.dRdWTPC is not None:
+                                dafoam_instance.dRdWTPC.destroy()
+                            dafoam_instance.dRdWTPC = PETSc.Mat().create(dafoam_instance.comm)
+                            dafoam_instance.solver.calcdRdWT(1, dafoam_instance.dRdWTPC)
+                            # reset the KSP
+                            if dafoam_instance.ksp is not None:
+                                dafoam_instance.ksp.destroy()
+                            dafoam_instance.ksp = PETSc.KSP().create(dafoam_instance.comm)
+                            dafoam_instance.solverAD.createMLRKSPMatrixFree(dafoam_instance.dRdWTPC, dafoam_instance.ksp)
+
+                # if useNonZeroInitGuess is False, we will manually reset self.psi to zero
+                # this is important because we need the correct psi to update the KSP tolerance
+                # in the next line
+                if not self.dafoam_instance.getOption("adjEqnOption")["useNonZeroInitGuess"]:
+                    self.psi.set(0)
+                else:
+                    # if useNonZeroInitGuess is True, we will assign the OM's psi to self.psi
+                    self.psi = dafoam_instance.array2Vec(d_residuals['dafoam_solver_states'].copy())
+
+                if self.dafoam_instance.getOption("adjEqnOption")["dynAdjustTol"]:
+                    # if we want to dynamically adjust the tolerance, call this function. This is mostly used
+                    # in the block Gauss-Seidel method in two discipline coupling
+                    # update the KSP tolerances the coupled adjoint before solving
+                    self._updateKSPTolerances(self.psi, dFdW, dafoam_instance.ksp)
+
+                # actually solving the adjoint linear equation using Petsc
+                fail = dafoam_instance.solverAD.solveLinearEqn(dafoam_instance.ksp, dFdW, self.psi)
+
+            elif adjEqnSolMethod == "fixedPoint":
                 solutionTime, renamed = dafoam_instance.renameSolution(self.solution_counter)
-
                 if renamed:
+                    # write the deformed FFD for post-processing
+                    # dafoam_instance.writeDeformedFFDs(self.solution_counter)
+                    # print the solution counter
                     if dafoam_instance.comm.rank == 0:
                         print("Driver total derivatives for iteration: %d" % self.solution_counter, flush=True)
                         print("---------------------------------------------", flush=True)
                     self.solution_counter += 1
+                # solve the adjoint equation using the fixed-point adjoint approach
+                fail = dafoam_instance.solverAD.runFPAdj(dFdW, self.psi)
 
-                # compute the preconditioner matrix for the adjoint linear equation solution
-                # and initialize the ksp object. We reinitialize them every adjPCLag
-                adjPCLag = dafoam_instance.getOption("adjPCLag")
-                if dafoam_instance.dRdWTPC is None or dafoam_instance.ksp is None or (self.solution_counter - 1) % adjPCLag == 0:
-                    if renamed:
-                        # calculate the PC mat
-                        if dafoam_instance.dRdWTPC is not None:
-                            dafoam_instance.dRdWTPC.destroy()
-                        dafoam_instance.dRdWTPC = PETSc.Mat().create(dafoam_instance.comm)
-                        dafoam_instance.solver.calcdRdWT(1, dafoam_instance.dRdWTPC)
-                        # reset the KSP
-                        if dafoam_instance.ksp is not None:
-                            dafoam_instance.ksp.destroy()
-                        dafoam_instance.ksp = PETSc.KSP().create(dafoam_instance.comm)
-                        dafoam_instance.solverAD.createMLRKSPMatrixFree(dafoam_instance.dRdWTPC, dafoam_instance.ksp)
-
-            # if useNonZeroInitGuess is False, we will manually reset self.psi to zero
-            # this is important because we need the correct psi to update the KSP tolerance
-            # in the next line
-            if not self.dafoam_instance.getOption("adjEqnOption")["useNonZeroInitGuess"]:
-                self.psi.set(0)
             else:
-                # if useNonZeroInitGuess is True, we will assign the OM's psi to self.psi
-                self.psi = dafoam_instance.array2Vec(d_residuals['dafoam_solver_states'].copy())
+                raise RuntimeError("adjEqnSolMethod=%s not valid! Options are: Krylov or fixedPoint" % adjEqnSolMethod)
 
-            if self.dafoam_instance.getOption("adjEqnOption")["dynAdjustTol"]:
-                # if we want to dynamically adjust the tolerance, call this function. This is mostly used
-                # in the block Gauss-Seidel method in two discipline coupling
-                # update the KSP tolerances the coupled adjoint before solving
-                self._updateKSPTolerances(self.psi, dFdW, dafoam_instance.ksp)
+            # optionally write the adjoint vector as OpenFOAM field format for post-processing
+            psi_array = dafoam_instance.vec2Array(self.psi)
+            solTimeFloat = (self.solution_counter - 1) / 1e4
+            dafoam_instance.writeAdjointFields("function", solTimeFloat, psi_array)
 
-            # actually solving the adjoint linear equation using Petsc
-            fail = dafoam_instance.solverAD.solveLinearEqn(dafoam_instance.ksp, dFdW, self.psi)
+            if not fail:
+                # convert the solution vector to array and assign it to d_residuals
+                d_residuals['dafoam_solver_states'] = dafoam_instance.vec2Array(self.psi)
 
-        elif adjEqnSolMethod == "fixedPoint":
-            solutionTime, renamed = dafoam_instance.renameSolution(self.solution_counter)
-            if renamed:
-                # write the deformed FFD for post-processing
-                # dafoam_instance.writeDeformedFFDs(self.solution_counter)
-                # print the solution counter
-                if dafoam_instance.comm.rank == 0:
-                    print("Driver total derivatives for iteration: %d" % self.solution_counter, flush=True)
-                    print("---------------------------------------------", flush=True)
-                self.solution_counter += 1
-            # solve the adjoint equation using the fixed-point adjoint approach
-            fail = dafoam_instance.solverAD.runFPAdj(dFdW, self.psi)
+            # if the adjoint solution fail, we return NaN and let the optimizer handle it
+            else:
+                if dafoam_instance.rank == 0:
+                    print("Adjoint solution failed! Returning NANs")
+
+                d_residuals['dafoam_solver_states'] = np.nan*np.ones((self.n_local_state_elements, ))
 
         else:
-            raise RuntimeError("adjEqnSolMethod=%s not valid! Options are: Krylov or fixedPoint" % adjEqnSolMethod)
-
-        # optionally write the adjoint vector as OpenFOAM field format for post-processing
-        psi_array = dafoam_instance.vec2Array(self.psi)
-        solTimeFloat = (self.solution_counter - 1) / 1e4
-        dafoam_instance.writeAdjointFields("function", solTimeFloat, psi_array)
-
-        if not fail:
-            # convert the solution vector to array and assign it to d_residuals
-            d_residuals['dafoam_solver_states'] = dafoam_instance.vec2Array(self.psi)
-
-        # if the adjoint solution fail, we return NaN and let the optimizer handle it
-        else:
-            if dafoam_instance.rank == 0:
-                print("Adjoint solution failed! Returning NANs")
-
-            d_residuals['dafoam_solver_states'] = np.nan*np.ones((self.n_local_state_elements, ))
+           raise ValueError(f'"{mode}" not recognized. Only support "fwd" and "rev" modes') 
         
         # CHANGE DIRECTORY WORKAROUND 5/5
         if USE_CHANGE_DIRECTORY_WORKAROUND:
@@ -300,9 +305,9 @@ class DAFoamSolver(csdl.experimental.CustomImplicitOperation):
         # assign the states in outputs to the OpenFOAM flow fields
         # NOTE: this is not quite necessary because setStates have been called before in the solve_nonlinear
         # here we call it just be on the safe side
-        # Check if states contain any NaN values (NaNs would be passed from optimizer)
         states = output_vals['dafoam_solver_states']
 
+        # Check if states contain any NaN values (NaNs would be passed from optimizer)
         # Update solver states only if no NaNs exist
         if not has_global_nan_or_inf(states, comm):
             dafoam_instance.setStates(states)
@@ -314,28 +319,32 @@ class DAFoamSolver(csdl.experimental.CustomImplicitOperation):
         if mode == 'fwd':
             raise NotImplementedError('forward mode has not been implemented for DAFoamSolver')
 
-        if 'dafoam_solver_states' in d_residuals:
-             # get the reverse mode AD seed from d_residuals
-            seed = d_residuals['dafoam_solver_states']
- 
-            # loop over all inputs keys and compute the matrix-vector products accordingly
-            input_dict = dafoam_instance.getOption("inputInfo")
-            for input_name in list(input_vals.keys()):
-                input_type = input_dict[input_name]["type"]
-                jac_input = input_vals[input_name].copy()
-                product = np.zeros_like(jac_input)
-                dafoam_instance.solverAD.calcJacTVecProduct(
-                    input_name,
-                    input_type,
-                    jac_input,
-                    "aero_residuals",
-                    "residual",
-                    seed,
-                    product,
-                )
-                d_inputs[input_name] += product
+        elif mode == 'rev':
+            if 'dafoam_solver_states' in d_residuals:
+                # get the reverse mode AD seed from d_residuals
+                seed = d_residuals['dafoam_solver_states']
+    
+                # loop over all inputs keys and compute the matrix-vector products accordingly
+                input_dict = dafoam_instance.getOption("inputInfo")
+                for input_name in list(input_vals.keys()):
+                    input_type = input_dict[input_name]["type"]
+                    jac_input = input_vals[input_name].copy()
+                    product = np.zeros_like(jac_input)
+                    dafoam_instance.solverAD.calcJacTVecProduct(
+                        input_name,
+                        input_type,
+                        jac_input,
+                        "aero_residuals",
+                        "residual",
+                        seed,
+                        product,
+                    )
+                    d_inputs[input_name] += product
 
+        else:
+            raise ValueError(f'"{mode}" not recognized. Only support "fwd" and "rev" modes')
 
+        
     # region _updateKSPTolerances
     def _updateKSPTolerances(self, psi, dFdW, ksp):
         # Here we need to manually update the KSP tolerances because the default
@@ -454,44 +463,48 @@ class DAFoamFunctions(csdl.CustomExplicitOperation):
         if mode == 'fwd':
             raise NotImplementedError('forward mode has not been implemented for DAFoamFunctions')
         
-        input_dict = dafoam_instance.getOption("inputInfo")
-        for functionName in list(d_outputs.keys()):
+        elif mode == 'rev':
+            input_dict = dafoam_instance.getOption("inputInfo")
+            for functionName in list(d_outputs.keys()):
 
-            seed = d_outputs[functionName]
+                seed = d_outputs[functionName]
 
-            # if the seed is zero, do not compute
-            if abs(seed) < 1e-12:
-                continue
+                # if the seed is zero, do not compute
+                if abs(seed) < 1e-12:
+                    continue
 
-            for input_name in list(d_inputs.keys()):
-                # compute dFdW * seed
-                if input_name == 'dafoam_solver_states':
-                    jac_input = input_vals['dafoam_solver_states']
-                    product = np.zeros_like(jac_input)
-                    dafoam_instance.solverAD.calcJacTVecProduct(
-                        'dafoam_solver_states',
-                        "stateVar",
-                        jac_input,
-                        functionName,
-                        "function",
-                        seed,
-                        product,
-                    )
-                    d_inputs['dafoam_solver_states'] += product
-                else:
-                    input_type = input_dict[input_name]["type"]
-                    jac_input = input_vals[input_name]
-                    product = np.zeros_like(jac_input)
-                    dafoam_instance.solverAD.calcJacTVecProduct(
-                        input_name,
-                        input_type,
-                        jac_input,
-                        functionName,
-                        "function",
-                        seed,
-                        product,
-                    )
-                    d_inputs[input_name] += product
+                for input_name in list(d_inputs.keys()):
+                    # compute dFdW * seed
+                    if input_name == 'dafoam_solver_states':
+                        jac_input = input_vals['dafoam_solver_states']
+                        product = np.zeros_like(jac_input)
+                        dafoam_instance.solverAD.calcJacTVecProduct(
+                            'dafoam_solver_states',
+                            "stateVar",
+                            jac_input,
+                            functionName,
+                            "function",
+                            seed,
+                            product,
+                        )
+                        d_inputs['dafoam_solver_states'] += product
+                    else:
+                        input_type = input_dict[input_name]["type"]
+                        jac_input = input_vals[input_name]
+                        product = np.zeros_like(jac_input)
+                        dafoam_instance.solverAD.calcJacTVecProduct(
+                            input_name,
+                            input_type,
+                            jac_input,
+                            functionName,
+                            "function",
+                            seed,
+                            product,
+                        )
+                        d_inputs[input_name] += product
+        
+        else:
+            raise ValueError(f'"{mode}" not recognized. Only support "fwd" and "rev" modes')
 
 
 
@@ -841,27 +854,30 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
         if mode == 'fwd':
             raise NotImplementedError('forward mode has not been implemented for DAFoamROM')
         
-        J_romT = self.reduced_jacobian.T
-        v      = d_outputs['dafoam_rom_states']
-        d_residuals['dafoam_rom_states'] = np.linalg.solve(J_romT, v)
+        elif mode == 'rev':
+            J_romT = self.reduced_jacobian.T
+            v      = d_outputs['dafoam_rom_states']
+            d_residuals['dafoam_rom_states'] = np.linalg.solve(J_romT, v)
+
+        else:
+            raise ValueError(f'"{mode}" not recognized. Only support "fwd" and "rev" modes')
 
         # Write solution to file
         dafoam_instance = self.dafoam_instance
         D               = self.scaling_factors
         W               = self.weights
-        y_fom_ref           = self.fom_ref_state
-        # Determine if our basis is constant, or an input value
-        if self.pod_modes_is_csdl_var:
-            phi      = input_vals['pod_modes']
-        else:
-            phi      = self.pod_modes
-        y_rom = output_vals['dafoam_rom_states']
-        y_fom = y_fom_ref + D*(phi@y_rom)
+        y_fom_ref       = self.fom_ref_state
+        phi             = input_vals['pod_modes'] if pod_modes_is_csdl_var else self.pod_modes
+        y_rom           = output_vals['dafoam_rom_states']
+        y_fom           = y_fom_ref + D*(phi@y_rom)
+        n_points        = dafoam_instance.solver.getNLocalPoints()
 
-        n_points = dafoam_instance.solver.getNLocalPoints()
-        points0  = np.zeros(n_points*3)
+        # Initialize mesh array and write to file
+        points0         = np.zeros(n_points*3)
         dafoam_instance.solver.getOFMeshPoints(points0)
         dafoam_instance.solver.writeMeshPoints(points0, self.solution_counter)
+
+        # Write primitives
         dafoam_instance.solver.writeAdjointFields('sol', self.solution_counter, y_fom)
         self.solution_counter += 1
         
@@ -897,27 +913,33 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
         if mode == 'fwd':
             raise NotImplementedError('forward mode has not been implemented for DAFoamROM')
 
-        if 'dafoam_rom_states' in d_residuals:
-             # get the reverse mode AD seed from d_residuals and expand to FOM size
-            seed_r = d_residuals['dafoam_rom_states']
-            seed   = W*(phi@seed_r)
- 
-            # loop over all inputs keys and compute the matrix-vector products accordingly
-            input_dict = dafoam_instance.getOption("inputInfo")
-            for input_name in list(input_vals.keys()):
-                input_type = input_dict[input_name]["type"]
-                jac_input = input_vals[input_name].copy()
-                product = np.zeros_like(jac_input)
-                dafoam_instance.solverAD.calcJacTVecProduct(
-                    input_name,
-                    input_type,
-                    jac_input,
-                    "aero_residuals",
-                    "residual",
-                    seed,
-                    product,
-                )
-                d_inputs[input_name] += product
+        elif mode == 'rev':
+            if 'dafoam_rom_states' in d_residuals:
+                # get the reverse mode AD seed from d_residuals and expand to FOM size
+                seed_r = d_residuals['dafoam_rom_states']
+                seed   = W*(phi@seed_r)
+    
+                # loop over all inputs keys and compute the matrix-vector products accordingly
+                input_dict = dafoam_instance.getOption("inputInfo")
+                for input_name in list(input_vals.keys()):
+                    # (Taking care of the DAFoam inputs here)
+                    if input_name in input_dict:
+                        input_type = input_dict[input_name]["type"]
+                        jac_input = input_vals[input_name].copy()
+                        product = np.zeros_like(jac_input)
+                        dafoam_instance.solverAD.calcJacTVecProduct(
+                            input_name,
+                            input_type,
+                            jac_input,
+                            "aero_residuals",
+                            "residual",
+                            seed,
+                            product,
+                        )
+                        d_inputs[input_name] += product
+        
+        else:
+            raise ValueError(f'"{mode}" not recognized. Only support "fwd" and "rev" modes')
 
 
     # region _compute_reduced_jacobian
