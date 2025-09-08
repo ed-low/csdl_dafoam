@@ -505,7 +505,7 @@ class DAFoamFunctions(csdl.CustomExplicitOperation):
                             seed,
                             product,
                         )
-                        d_inputs['dafoam_solver_states'] += product
+                        d_inputs['dafoam_solver_states'] += product/dafoam_instance.getStateScalingFactors()
                     else:
                         input_type = input_dict[input_name]["type"]
                         jac_input = input_vals[input_name]
