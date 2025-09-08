@@ -388,6 +388,15 @@ class DAFoamSolver(csdl.experimental.CustomImplicitOperation):
         ksp.setTolerances(rtol=0.0, atol=aTolNew, divtol=None, max_it=None)
 
 
+    # region evaluate_residuals
+    def evaluate_residuals(self, input_vals, output_vals, residual_vals):
+        dafoam_instance = self.dafoam_instance
+
+        dafoam_instance.set_solver_input(input_vals)
+        dafoam_instance.setStates(output_vals["dafoam_solver_states"])
+        residual_vals["dafoam_solver_states"] = dafoam_instance.getResiduals()
+
+
 
 # region DAFOAMFUNCTIONS
 class DAFoamFunctions(csdl.CustomExplicitOperation):
