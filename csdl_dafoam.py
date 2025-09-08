@@ -46,7 +46,7 @@ def instantiateDAFoam(options, comm, run_directory=None, mesh_options=None):
 
 # region DAFOAMSOLVER
 class DAFoamSolver(csdl.experimental.CustomImplicitOperation):
-    def __init__(self, dafoam_instance):
+    def __init__(self, dafoam_instance, disable_successful_primal_state_save=False):
         super().__init__()
 
         self.dafoam_instance    = dafoam_instance
@@ -69,7 +69,9 @@ class DAFoamSolver(csdl.experimental.CustomImplicitOperation):
             self.runColoring = True 
 
         # Saving last successful primal result (in case primal fails)
-        self.last_successful_primal_states = dafoam_instance.getStates()
+        self.disable_successful_primal_state_save = disable_successful_primal_state_save
+        if disable_successful_primal_state_save is False:
+            self.last_successful_primal_states = dafoam_instance.getStates()
         self.last_time_converged = True
 
 
@@ -112,7 +114,7 @@ class DAFoamSolver(csdl.experimental.CustomImplicitOperation):
         # Revert solver to last successful primal state (to help with convergence on next iteration)
         # (This helps when we had an unconverged run last - placing here instead of at end in unconverged
         #  scenario allows us to still used the unconverged results from the solver if necessary) 
-        if not self.last_time_converged:
+        if self.last_time_converged is False and self.disable_successful_primal_state_save is False:
             if dafoam_instance.rank == 0:
                 print('Initializing DAFoam solver with last converged primal state')  
             dafoam_instance.setStates(self.last_successful_primal_states)
@@ -144,9 +146,11 @@ class DAFoamSolver(csdl.experimental.CustomImplicitOperation):
         else:
             if dafoam_instance.rank == 0:
                 print('Primal solution converged!')
-                print('Caching successful primal state...')
+                if self.disable_successful_primal_state_save is False:
+                    print('Caching successful primal state...')
             output_vals['dafoam_solver_states'] = states
-            self.last_successful_primal_states  = states
+            if self.disable_successful_primal_state_save is False:
+                self.last_successful_primal_states  = states
             self.last_time_converged            = True
 
         # We also need to just calculate the residual for the AD mode to initialize vars like URes
