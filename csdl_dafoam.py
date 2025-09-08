@@ -437,12 +437,17 @@ class DAFoamFunctions(csdl.CustomExplicitOperation):
         states = input_vals['dafoam_solver_states']
 
         # Update solver states only if no NaNs exist
-        has_nan_or_inf = has_global_nan_or_inf(states, comm)
+        for k, value in input_vals.items():
+            has_nan_or_inf = has_global_nan_or_inf(value, comm)
+            if has_nan_or_inf:
+                break
+
         if not has_nan_or_inf:
+            dafoam_instance.set_solver_input(input_vals)
             dafoam_instance.setStates(states)
         else:
             if rank == 0:
-                print('DAFoamFunctions.compute: Detected NaN(s) in input_vals. Skipping DAFoam setStates')
+                print(f'DAFoamFunctions.compute: Detected NaN(s) in input_vals[{k}]. Skipping DAFoam setStates and set_solver_input')
 
         # Read daOptions to get outputs, and assign them to respective outputs.
         # Assign NaN if NaN existed in state
