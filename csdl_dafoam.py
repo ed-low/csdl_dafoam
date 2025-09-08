@@ -939,14 +939,14 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
         n_points        = dafoam_instance.solver.getNLocalPoints()
 
         # Initialize mesh array and write to file
+        write_number    = round(1e-4*self.solution_counter, 4)
         points0         = np.zeros(n_points*3)
         dafoam_instance.solver.getOFMeshPoints(points0)
-        dafoam_instance.solver.writeMeshPoints(points0, self.solution_counter)
+        dafoam_instance.solver.writeMeshPoints(points0, write_number)
 
         # Write primitives
-        dafoam_instance.solver.writeAdjointFields('sol', self.solution_counter, y_fom)
+        dafoam_instance.solver.writeAdjointFields('sol', write_number, y_fom)
         self.solution_counter += 1
-        
 
     # region compute_jacvec_product
     def compute_jacvec_product(self, input_vals, output_vals, d_inputs, d_outputs, d_residuals, mode):
