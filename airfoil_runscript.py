@@ -324,7 +324,7 @@ dafoam_solver           = DAFoamSolver(dafoam_instance)
 dafoam_solver_states    = dafoam_solver.evaluate(dafoam_input_variables_group)
 
 # DAFoamFunctions Explicit component setup and evaluation
-dafoam_functions = DAFoamFunctions(dafoam_instance)
+dafoam_functions        = DAFoamFunctions(dafoam_instance)
 dafoam_function_outputs = dafoam_functions.evaluate(dafoam_solver_states, 
                                                     dafoam_input_variables_group)
 
@@ -398,6 +398,25 @@ recorder.stop()
 # region SIM
 # ===============================
 sim = csdl.experimental.PySimulator(recorder)
+
+from csdl_test_functions import test_jacvec_product
+np.random.seed(0)
+
+test_component = dafoam_functions
+
+inputs  = {k: vv.value for k, vv in test_component.input_dict.items()}
+v       = {k: np.random.rand(*vv.value.shape)*vv.value for k, vv in test_component.output_dict.items()}
+w       = {k: np.random.rand(*vv.value.shape)*vv.value for k, vv in test_component.input_dict.items()}
+# w       = {k: np.zeros_like(vv.value) for k, vv in test_component.input_dict.items()}
+
+print(f'Inputs: {inputs}')
+print(f'v: {v}')
+print(f'w: {w}')
+test_jacvec_product(test_component, inputs, v, w)
+test_jacvec_product(test_component, inputs, v, {k:-wv for k,wv in w.items()})
+
+input('Press ENTER to continue...')
+
 
 # Can set design variables here and run sim to test
 # sim[root_twist]  = 3*3.14159/180
