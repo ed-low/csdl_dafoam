@@ -400,9 +400,12 @@ class DAFoamSolver(csdl.experimental.CustomImplicitOperation):
 
 # region DAFOAMFUNCTIONS
 class DAFoamFunctions(csdl.CustomExplicitOperation):
-    def __init__(self, dafoam_instance):
+    def __init__(self, dafoam_instance, disable_jacvec_normalization=False):
         super().__init__()
         self.dafoam_instance = dafoam_instance
+
+        # Option to turn off jacvec normalization. This may be useful when linking with ROM component.
+        self.disable_jacvec_normalization = disable_jacvec_normalization
 
 
     # region evaluate
@@ -509,7 +512,10 @@ class DAFoamFunctions(csdl.CustomExplicitOperation):
                             seed,
                             product,
                         )
-                        d_inputs['dafoam_solver_states'] += product/dafoam_instance.getStateScalingFactors()
+                        if self.disable_jacvec_normalization:
+                            d_inputs['dafoam_solver_states'] += product/dafoam_instance.getStateScalingFactors()
+                        else:
+                            d_inputs['dafoam_solver_states'] += product
                     else:
                         input_type = input_dict[input_name]["type"]
                         jac_input = input_vals[input_name]
