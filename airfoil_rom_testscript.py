@@ -553,7 +553,7 @@ dafoam_fom_states    =  scaling_factors*y_reference + scaling_factors*csdl.matve
 
 
 # DAFoamFunctions Explicit component setup and evaluation
-dafoam_functions        = DAFoamFunctions(dafoam_instance)
+dafoam_functions        = DAFoamFunctions(dafoam_instance, disable_jacvec_normalization=True)
 dafoam_function_outputs = dafoam_functions.evaluate(dafoam_fom_states, 
                                                     dafoam_input_variables_group)
 
