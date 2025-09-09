@@ -376,7 +376,7 @@ y_training = local_data['snapshots_local']
 #       For now, we'll assume that this is serial and that everything is here.
 
 
-
+# region ROM Mode computation
 # Scaling mode assignment
 if scaling_mode == 0:   # No scaling
     scaling_factors = np.ones((dafoam_instance.getNLocalAdjointStates(), ))
@@ -445,9 +445,6 @@ else:
     print(f"{num_modes} captures {energy_fraction[num_modes - 1]*100}% of the total energy")
 
 pod_modes          = u[:, :num_modes]/np.sqrt(weights)[:, None]
-coefficient_matrix = (s[:, None]*vh)[:num_modes, :]
-snapshot_configs   = global_metadata["snapshot_configurations"]
-desired_config     = csdl.concatenate((percent_change_in_thickness_dof, normalized_percent_camber_change_dof))
 
 
 # This was just a test to see the FOM residuals
@@ -499,15 +496,13 @@ dafoam_rom           = DAFoamROM(dafoam_instance,
                                  pod_modes=pod_modes, 
                                  tolerance=1e-8, 
                                  fom_ref_state=scaling_factors*y_reference, 
-                                 max_iters=100, 
+                                 max_iters=50, 
                                  scaling_factors=scaling_factors, 
                                  weights=weights, 
-                                 update_jac_frequency=10,
-                                 num_initial_jac_updates=1,
-                                 coefficient_matrix=coefficient_matrix,
-                                 snapshot_configurations=snapshot_configs)
+                                 update_jac_frequency=5,
+                                 num_initial_jac_updates=1)
 
-dafoam_rom_states    = dafoam_rom.evaluate(dafoam_input_variables_group)#, design_variable_configuration=desired_config)
+dafoam_rom_states    = dafoam_rom.evaluate(dafoam_input_variables_group)
 
 dafoam_fom_states    =  scaling_factors*y_reference + scaling_factors*csdl.matvec(pod_modes, dafoam_rom_states)
 
