@@ -982,7 +982,7 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
                             seed,
                             product,
                         )
-                        d_inputs[input_name] = product
+                        d_inputs[input_name] += product
         
         else:
             raise ValueError(f'"{mode}" not recognized. Only support "fwd" and "rev" modes')
