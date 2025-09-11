@@ -13,7 +13,7 @@ def test_jacvec_product(component, input_vals, v, w, eps=1e-6, atol=1e-6, rtol=1
     input_vals : dict
         Dictionary of input arrays (keys must match component input names).
     v : dict
-        Direction vector for outputs (same structure as output_or_residual_vals).
+        Direction vector for outputs.
     w : dict
         Direction vector for inputs (same structure as input_vals).
     eps : float
@@ -43,21 +43,7 @@ def test_jacvec_product(component, input_vals, v, w, eps=1e-6, atol=1e-6, rtol=1
     else:
         TypeError('the supplied component doesn''t seem to be a CSDL Implicit or Explicit component')
 
-
-    # --- Compute J^T v (adjoint mode) ---
-    # Initialize our product to zeros (this is our J^T v)
-    JT_v    = {name: np.zeros_like(val) for name, val in input_vals.items()}
-
-    if component_type == 'explicit':   
-        component.compute_jacvec_product(input_vals, output_vals, JT_v, v, 'rev')
-
-    else:
-        d_outputs   = {name: np.zeros_like(val) for name, val in residual_vals.items()}
-        component.compute_jacvec_product(input_vals, output_vals, JT_v, d_outputs, v, 'rev')
-
-    lhs = sum(np.vdot(w[name], JT_v[name]) for name in input_vals)
-
-
+    
     # --- Compute J w (forward mode, via finite diff) ---
     #  perturb input in the w-direction
     perturbed_input_vals = {k: np.copy(vv) for k, vv in input_vals.items()}
@@ -86,6 +72,21 @@ def test_jacvec_product(component, input_vals, v, w, eps=1e-6, atol=1e-6, rtol=1
             plt.show()
 
     rhs = sum(np.vdot(v[name], J_w[name]) for name in v)
+
+
+    # --- Compute J^T v (adjoint mode) ---
+    # Initialize our product to zeros (this is our J^T v)
+    JT_v    = {name: np.zeros_like(val) for name, val in input_vals.items()}
+
+    if component_type == 'explicit':   
+        component.compute_jacvec_product(input_vals, output_vals, JT_v, v, 'rev')
+
+    else:
+        d_outputs   = {name: np.zeros_like(val) for name, val in residual_vals.items()}
+        component.compute_jacvec_product(input_vals, output_vals, JT_v, d_outputs, v, 'rev')
+
+    lhs = sum(np.vdot(w[name], JT_v[name]) for name in input_vals)
+
 
     # --- Compare ---
     err = (lhs - rhs) / (rhs)
