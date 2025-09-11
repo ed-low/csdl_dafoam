@@ -142,7 +142,7 @@ def test_idempotence(component, input_vals):
     else:
         TypeError('the supplied component doesn''t seem to be a CSDL Implicit or Explicit component')
 
-    if component_type == 'implicit':
+    if component_type == 'implicit' and hasattr(component, 'evaluate_residuals'):
         print("Testing evaluate_residuals idempotence...")
         residual_vals_1 = {k: np.zeros_like(vv) for k, vv in component.output_dict.items()}
         residual_vals_2 = {k: np.zeros_like(vv) for k, vv in component.output_dict.items()}
@@ -150,13 +150,23 @@ def test_idempotence(component, input_vals):
         component.evaluate_residuals(input_vals, output_vals_2, residual_vals_1)
         component.evaluate_residuals(input_vals, output_vals_2, residual_vals_2)
 
-    # Get epsilon for arrays
-    key1 = list(output_vals_1.keys())[0]
-    print(f'{output_vals_1[key1]}')
-    if np.issubdtype(output_vals_1[key1].dtype, np.floating):
-        eps = np.finfo(output_vals_1[key1].dtype).eps
+        can_evaluate_residuals = True
+
     else:
-        print("Epsilon is not defined for non-floating types. Using eps = 1e-8")
+        can_evaluate_residuals = False
+        print('No evalaute_residual method found for this implicit component. Skipping residual idempotence test.')
+
+    # Get epsilon for arrays (This assumes all outputs share same dtype)
+    key1 = list(output_vals_1.keys())[0]
+    val = output_vals_1[key1]
+
+    # Ensure the value is treated as a NumPy array/scalar
+    val_arr = np.asarray(val)
+
+    if np.issubdtype(val_arr.dtype, np.floating):
+        eps = np.finfo(val_arr.dtype).eps
+    else:
+        print("Epsilon is not defined for non-floating types. Using eps = 1e-9")
         eps = 1e-9
 
     # We'll make the tolerance a few orders of magnitude greater than epsilon
@@ -193,7 +203,7 @@ def test_idempotence(component, input_vals):
 
         is_idempotent = True
 
-        if component_type == 'implicit':
+        if can_evaluate_residuals:
             # Residual error metrics
             r_diff_norm            = np.linalg.norm(residual_vals_2[key] - residual_vals_1[key])
             r_diff_norm_normalized = np.linalg.norm(residual_vals_2[key] - residual_vals_1[key])/np.linalg.norm(residual_vals_1[key])
@@ -215,9 +225,9 @@ def test_idempotence(component, input_vals):
             is_idempotent = True
 
     if is_idempotent_global:
-        print(f"For given tolerance, {tolerance}, this component apears to be idempotent")
+        print(f"For given tolerance, {tolerance}, this component *appears* to be idempotent.")
     else:
-        print(f"For given tolerance, {tolerance}, this component does NOT apear to be idempotent!")
+        print(f"For given tolerance, {tolerance}, this component does NOT *appear* to be idempotent!")
 
     print('----------------------------------------')
 
