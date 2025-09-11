@@ -102,7 +102,7 @@ def test_jacvec_product(component, input_vals, v, w, eps=1e-6, atol=1e-6, rtol=1
 
 
 # region TEST_IDEMPOTENCE
-def test_idempotence(component, input_vals):
+def test_idempotence(component, input_vals, tolerance=None):
     """
     Generic test for idempotence a CSDL component. That is, will a repeated call of the
     compute, or solve_residual_equations and evaluate residuals yield the same outputs and/or residuals?
@@ -113,6 +113,9 @@ def test_idempotence(component, input_vals):
         Must implement compute and compute_jacvec_product.
     input_vals : dict
         Dictionary of input arrays (keys must match component input names).
+    tolerance : float
+        A maximum tolerance which serves as the threshold for determining if two solutions are similar.
+        If the maximum difference between two solutions is below this value, then we say component is idempotent.
 
     Returns
     -------
@@ -156,21 +159,23 @@ def test_idempotence(component, input_vals):
         can_evaluate_residuals = False
         print('No evalaute_residual method found for this implicit component. Skipping residual idempotence test.')
 
-    # Get epsilon for arrays (This assumes all outputs share same dtype)
-    key1 = list(output_vals_1.keys())[0]
-    val = output_vals_1[key1]
+    # Automatically get tolerance based on dtype if none provided
+    if tolerance is None:
+        # Get epsilon for arrays (This assumes all outputs share same dtype)
+        key1 = list(output_vals_1.keys())[0]
+        val = output_vals_1[key1]
 
-    # Ensure the value is treated as a NumPy array/scalar
-    val_arr = np.asarray(val)
+        # Ensure the value is treated as a NumPy array/scalar
+        val_arr = np.asarray(val)
 
-    if np.issubdtype(val_arr.dtype, np.floating):
-        eps = np.finfo(val_arr.dtype).eps
-    else:
-        print("Epsilon is not defined for non-floating types. Using eps = 1e-9")
-        eps = 1e-9
+        if np.issubdtype(val_arr.dtype, np.floating):
+            eps = np.finfo(val_arr.dtype).eps
+        else:
+            print("Epsilon is not defined for non-floating types. Using eps = 1e-9")
+            eps = 1e-9
 
-    # We'll make the tolerance a few orders of magnitude greater than epsilon
-    tolerance = 1000*eps
+        # We'll make the tolerance a few orders of magnitude greater than epsilon
+        tolerance = 1000*eps
 
     # Summary
     is_idempotent        = True
