@@ -46,16 +46,16 @@ def instantiateDAFoam(options, comm, run_directory=None, mesh_options=None):
 
 # region DAFOAMSOLVER
 class DAFoamSolver(csdl.experimental.CustomImplicitOperation):
-    def __init__(self, dafoam_instance, disable_successful_primal_state_save=False):
+    def __init__(self, dafoam_instance, disable_successful_primal_state_save=False, always_use_same_ic=False):
         super().__init__()
 
         self.dafoam_instance    = dafoam_instance
         self.solution_counter   = 1
 
-        # initialize the dRdWT matrix-free matrix in DASolver
+        # Initialize the dRdWT matrix-free matrix in DASolver
         dafoam_instance.solverAD.initializedRdWTMatrixFree()
 
-        # create the adjoint vector
+        # Create the adjoint vector
         self.n_local_state_elements = dafoam_instance.getNLocalAdjointStates()
         self.psi = PETSc.Vec().create(comm=dafoam_instance.comm)
         self.psi.setSizes((self.n_local_state_elements, PETSc.DECIDE), bsize=1)
@@ -68,12 +68,16 @@ class DAFoamSolver(csdl.experimental.CustomImplicitOperation):
         else:
             self.runColoring = True 
 
-        # Saving last successful primal result (in case primal fails)
+        # Handle saving of last successful primal result (can help in cases where primal fails to converge)
         self.disable_successful_primal_state_save = disable_successful_primal_state_save
-        if disable_successful_primal_state_save is False:
-            self.last_successful_primal_states = dafoam_instance.getStates()
+        if disable_successful_primal_state_save is False or always_use_same_ic:
+            self.saved_states = dafoam_instance.getStates()
         self.last_time_converged = True
 
+        # Use the same initial condition for all primal solves
+        # (May be useful for checking apply_inverse_jacobian)
+        self.always_use_same_ic = always_use_same_ic
+        
 
     # region evaluate
     def evaluate(self, dafoam_input_variables_group:csdl.VariableGroup):
@@ -114,10 +118,10 @@ class DAFoamSolver(csdl.experimental.CustomImplicitOperation):
         # Revert solver to last successful primal state (to help with convergence on next iteration)
         # (This helps when we had an unconverged run last - placing here instead of at end in unconverged
         #  scenario allows us to still used the unconverged results from the solver if necessary) 
-        if self.last_time_converged is False and self.disable_successful_primal_state_save is False:
+        if (self.last_time_converged is False and self.disable_successful_primal_state_save is False) or self.always_use_same_ic:
             if dafoam_instance.rank == 0:
-                print('Initializing DAFoam solver with last converged primal state')  
-            dafoam_instance.setStates(self.last_successful_primal_states)
+                print('Initializing DAFoam solver with last saved primal state')  
+            dafoam_instance.setStates(self.saved_states)
 
         # Run primal
         dafoam_instance()
@@ -146,11 +150,13 @@ class DAFoamSolver(csdl.experimental.CustomImplicitOperation):
         else:
             if dafoam_instance.rank == 0:
                 print('Primal solution converged!')
-                if self.disable_successful_primal_state_save is False:
+                if self.disable_successful_primal_state_save is False and self.always_use_same_ic is False:
                     print('Caching successful primal state...')
+
             output_vals['dafoam_solver_states'] = states
-            if self.disable_successful_primal_state_save is False:
-                self.last_successful_primal_states  = states
+
+            if self.disable_successful_primal_state_save is False and self.always_use_same_ic is False:
+                self.saved_states               = states
             self.last_time_converged            = True
 
         # We also need to just calculate the residual for the AD mode to initialize vars like URes
@@ -642,7 +648,6 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
         self.update_jac_frequency   = update_jac_frequency if update_jac_frequency > 0 else np.nan
         self.num_initial_jac_updates= num_initial_jac_updates
         self.reduced_jacobian       = None
-        self.solution_counter       = 1
         self.n_local_state_elements = dafoam_instance.getNLocalAdjointStates()
         self.n_local_cells          = dafoam_instance.solver.getNLocalCells()
 
