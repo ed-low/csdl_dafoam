@@ -1,5 +1,7 @@
 import numpy as np
+import matplotlib.pyplot as plt
 
+# region TEST_JACVEC_PRODUCT
 def test_jacvec_product(component, input_vals, v, w, eps=1e-6, atol=1e-6, rtol=1e-6):
     """
     Generic test for compute_jacvec_product in a CSDL component. Tests via finite differenece
@@ -63,7 +65,7 @@ def test_jacvec_product(component, input_vals, v, w, eps=1e-6, atol=1e-6, rtol=1
         component.evaluate_residuals(perturbed_input_vals, perturbed_output_vals, perturbed_residual_vals)
         J_w = {name: (perturbed_residual_vals[name] - residual_vals[name]) / eps for name in residual_vals.keys()}
 
-        import matplotlib.pyplot as plt
+        
         for k, vv in perturbed_residual_vals.items():
             plt.figure()
             plt.plot(perturbed_residual_vals[k], label=f'perturbed {k} residual')
@@ -96,3 +98,145 @@ def test_jacvec_product(component, input_vals, v, w, eps=1e-6, atol=1e-6, rtol=1
     print(f"Relative error: {err:.3e}")
 
     return err
+
+
+
+# region TEST_IDEMPOTENCE
+def test_idempotence(component, input_vals):
+    """
+    Generic test for idempotence a CSDL component. That is, will a repeated call of the
+    compute, or solve_residual_equations and evaluate residuals yield the same outputs and/or residuals?
+
+    Parameters
+    ----------
+    component : CSDL component (explicit or implicit)
+        Must implement compute and compute_jacvec_product.
+    input_vals : dict
+        Dictionary of input arrays (keys must match component input names).
+
+    Returns
+    -------
+    bool
+        Whether or not component is idempotent
+    """
+
+    # Initialize outputs
+    output_vals_1    = {k: np.zeros_like(vv) for k, vv in component.output_dict.items()}
+    output_vals_2    = {k: np.zeros_like(vv) for k, vv in component.output_dict.items()}
+    
+    # --- Compute residuals/outputs at base state --
+    if hasattr(component, 'solve_residual_equations'):
+        print("Testing solve_residual_equations idempotence...")
+        component.solve_residual_equations(input_vals, output_vals_1)
+        component.solve_residual_equations(input_vals, output_vals_2)
+        component_type = 'implicit'
+        component_representation = "R(x, y) = 0"
+
+    elif hasattr(component, 'compute'):
+        print("Testing compute idempotence...")
+        component.compute(input_vals, output_vals_1)
+        component.compute(input_vals, output_vals_2)
+        component_type = 'explicit'
+        component_representation = "F(x) = y"
+
+    else:
+        TypeError('the supplied component doesn''t seem to be a CSDL Implicit or Explicit component')
+
+    if component_type == 'implicit':
+        print("Testing evaluate_residuals idempotence...")
+        residual_vals_1 = {k: np.zeros_like(vv) for k, vv in component.output_dict.items()}
+        residual_vals_2 = {k: np.zeros_like(vv) for k, vv in component.output_dict.items()}
+
+        component.evaluate_residuals(input_vals, output_vals_2, residual_vals_1)
+        component.evaluate_residuals(input_vals, output_vals_2, residual_vals_2)
+
+    # Get epsilon for arrays
+    key1 = list(output_vals_1.keys())[0]
+    print(f'{output_vals_1[key1]}')
+    if np.issubdtype(output_vals_1[key1].dtype, np.floating):
+        eps = np.finfo(output_vals_1[key1].dtype).eps
+    else:
+        print("Epsilon is not defined for non-floating types. Using eps = 1e-8")
+        eps = 1e-9
+
+    # We'll make the tolerance a few orders of magnitude greater than epsilon
+    tolerance = 1000*eps
+
+    # Summary
+    is_idempotent        = True
+    is_idempotent_global = True
+    print('----------------------------------------')
+    print('IDEMPOTENCE TEST SUMMARY')
+    print('')
+    print(f'Component type: {component_type}, {component_representation}')
+    print(f"Inputs: {', '.join(input_vals.keys())}")
+    print(f"Outputs: {', '.join(output_vals_1.keys())}")
+
+    for key in output_vals_1:
+        # Output error metrics
+        y_diff_norm            = np.linalg.norm(output_vals_2[key] - output_vals_1[key])
+        y_diff_norm_normalized = np.linalg.norm(output_vals_2[key] - output_vals_1[key])/np.linalg.norm(output_vals_1[key])
+        max_y_diff             = np.max(np.abs(output_vals_2[key] - output_vals_1[key]))
+        if max_y_diff > tolerance:
+            is_idempotent        = False
+            is_idempotent_global = False
+
+        if is_idempotent:
+            tag = "Satisfies tolerance"
+        else:
+            tag = "***Larger than tolerance!***"
+
+        print(f'Output idempotence for {key}:')
+        print('\t{:<30} : {:.4E}'.format('norm(y2 - y1)', y_diff_norm))
+        print('\t{:<30} : {:.4E}'.format('norm(y2 - y1)/norm(y1)', y_diff_norm_normalized))
+        print('\t{:<30} : {:.4E} {}'.format('max(|y2 - y1|)', max_y_diff, tag))
+
+        is_idempotent = True
+
+        if component_type == 'implicit':
+            # Residual error metrics
+            r_diff_norm            = np.linalg.norm(residual_vals_2[key] - residual_vals_1[key])
+            r_diff_norm_normalized = np.linalg.norm(residual_vals_2[key] - residual_vals_1[key])/np.linalg.norm(residual_vals_1[key])
+            max_r_diff             = np.max(np.abs(residual_vals_2[key] - residual_vals_1[key]))
+            if max_r_diff > tolerance:
+                is_idempotent        = False
+                is_idempotent_global = False
+
+            if is_idempotent:
+                tag = "Satisfies tolerance"
+            else:
+                tag = "***Larger than tolerance!***"
+
+            print(f'Residual idempotence for {key}:')
+            print('\t{:<30} : {:.4E}'.format('norm(r2 - r1)', np.linalg.norm(residual_vals_2[key] - residual_vals_1[key])))
+            print('\t{:<30} : {:.4E}'.format('norm(r2 - r1)/norm(r1)', np.linalg.norm(residual_vals_2[key] - residual_vals_1[key])/np.linalg.norm(residual_vals_1[key])))
+            print('\t{:<30} : {:.4E} {}'.format('max(|r2 - r1|)', max_r_diff, tag))
+
+            is_idempotent = True
+
+    if is_idempotent_global:
+        print(f"For given tolerance, {tolerance}, this component apears to be idempotent")
+    else:
+        print(f"For given tolerance, {tolerance}, this component does NOT apear to be idempotent!")
+
+    print('----------------------------------------')
+
+    return is_idempotent_global
+    
+    # # Plots
+    # for key in output_vals_1.keys():
+    #     plt.figure()
+    #     plt.title(f'Output idempotence test, Component type: {component_type}, key: {key}')
+    #     plt.plot(output_vals_1[key], label="Outputs 1")
+    #     plt.plot(output_vals_2[key], label="Outputs 2")
+    #     plt.legend()
+    #     plt.show(block=False)
+
+    # if component_type == 'implicit':
+    #     for key in residual_vals_1.keys():
+    #         plt.figure()
+    #         plt.title(f'Residual idempotence test, Component type: {component_type}, key: {key}')
+    #         plt.plot(residual_vals_1[key], label="Residuals 1")
+    #         plt.plot(residual_vals_2[key], label="Residuals 2")
+    #         plt.legend()
+    #         plt.show(block=False)
