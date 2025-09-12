@@ -2,7 +2,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 # region TEST_JACVEC_PRODUCT
-def test_jacvec_product(component, input_vals, v, w, eps=1e-6, atol=1e-6, rtol=1e-6):
+def test_jacvec_product(component, input_vals, v, w, eps=1e-6):
     """
     Generic test for compute_jacvec_product in a CSDL component. Tests via finite differenece
     w^T J^T v = v^T J w
@@ -11,7 +11,8 @@ def test_jacvec_product(component, input_vals, v, w, eps=1e-6, atol=1e-6, rtol=1
     Parameters
     ----------
     component : CSDL component (explicit or implicit)
-        Must implement compute and compute_jacvec_product.
+        For explicit: Must have compute and compute_jacvec_product.
+        For implicit: Must have solve_residual_equations, evaluate_residuals, and compute_jacvec_product.
     input_vals : dict
         Dictionary of input arrays (keys must match component input names).
     v : dict
@@ -20,11 +21,13 @@ def test_jacvec_product(component, input_vals, v, w, eps=1e-6, atol=1e-6, rtol=1
         Direction vector for inputs (same structure as input_vals).
     eps : float
         Step size for finite differences.
-    atol, rtol : float
-        Absolute and relative tolerances for comparison.
 
     Returns
     -------
+    float
+        Left hand side value.
+    float
+        Right hand side value.
     float
         Relative error between the two scalar evaluations.
     """
@@ -44,7 +47,6 @@ def test_jacvec_product(component, input_vals, v, w, eps=1e-6, atol=1e-6, rtol=1
 
     else:
         TypeError('the supplied component doesn''t seem to be a CSDL Implicit or Explicit component')
-
     
     # --- Compute J w (forward mode, via finite diff) ---
     #  perturb input in the w-direction
@@ -52,7 +54,6 @@ def test_jacvec_product(component, input_vals, v, w, eps=1e-6, atol=1e-6, rtol=1
     for in_name in input_vals:
         perturbed_input_vals[in_name] += eps*w[in_name]
 
-    rhs = 0.0
     if component_type == 'explicit':
         perturbed_output_vals = {k: np.zeros_like(vv) for k, vv in output_vals.items()}
         component.compute(perturbed_input_vals, perturbed_output_vals)
@@ -60,21 +61,10 @@ def test_jacvec_product(component, input_vals, v, w, eps=1e-6, atol=1e-6, rtol=1
 
     else:
         perturbed_residual_vals = {k: np.zeros_like(vv) for k, vv in residual_vals.items()}
-        perturbed_output_vals   = {k: np.zeros_like(vv) for k, vv in output_vals.items()}
-        component.solve_residual_equations(perturbed_input_vals, perturbed_output_vals)
-        component.evaluate_residuals(perturbed_input_vals, perturbed_output_vals, perturbed_residual_vals)
+        component.evaluate_residuals(perturbed_input_vals, output_vals, perturbed_residual_vals)
         J_w = {name: (perturbed_residual_vals[name] - residual_vals[name]) / eps for name in residual_vals.keys()}
 
-        
-        for k, vv in perturbed_residual_vals.items():
-            plt.figure()
-            plt.plot(perturbed_residual_vals[k], label=f'perturbed {k} residual')
-            plt.plot(residual_vals[k], label=f'{k} residual')
-            plt.legend()
-            plt.show()
-
     rhs = sum(np.vdot(v[name], J_w[name]) for name in v)
-
 
     # --- Compute J^T v (adjoint mode) ---
     # Initialize our product to zeros (this is our J^T v)
@@ -89,15 +79,14 @@ def test_jacvec_product(component, input_vals, v, w, eps=1e-6, atol=1e-6, rtol=1
 
     lhs = sum(np.vdot(w[name], JT_v[name]) for name in input_vals)
 
-
     # --- Compare ---
-    err = (lhs - rhs) / (rhs)
+    err = np.abs(lhs - rhs) / (rhs)
 
     print(f"LHS (w^T J^T v): {lhs}")
     print(f"RHS (v^T J w): {rhs}")
     print(f"Relative error: {err:.3e}")
 
-    return err
+    return lhs, rhs, err
 
 
 
