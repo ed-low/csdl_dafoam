@@ -320,11 +320,11 @@ dafoam_input_variables_group = compute_dafoam_input_variables(dafoam_instance,
                                                               x_vol_dafoam)
 
 # DAFoamSolver Implicit component setup and evaluation
-dafoam_solver           = DAFoamSolver(dafoam_instance)
+dafoam_solver           = DAFoamSolver(dafoam_instance, always_use_same_ic=True)
 dafoam_solver_states    = dafoam_solver.evaluate(dafoam_input_variables_group)
 
 # DAFoamFunctions Explicit component setup and evaluation
-dafoam_functions        = DAFoamFunctions(dafoam_instance)
+dafoam_functions        = DAFoamFunctions(dafoam_instance, disable_jacvec_normalization=True)
 dafoam_function_outputs = dafoam_functions.evaluate(dafoam_solver_states, 
                                                     dafoam_input_variables_group)
 
@@ -336,7 +336,7 @@ dafoam_function_outputs = dafoam_functions.evaluate(dafoam_solver_states,
 # 3: Minimize CD wrt angle-of-attack, wing shape (thickness/camber ffd), constrained by CL=0.5
 # 4: Minimize CD wrt angle-of-attack, wing shape (thickness/camber ffd) and wing twists, constrained by CL=0.5
 # 5: Maximize CL/CD wrt angle-of-attack and wing shape
-optimization_case = 2
+optimization_case = 1
 
 
 if optimization_case == 1:
@@ -399,21 +399,46 @@ recorder.stop()
 # ===============================
 sim = csdl.experimental.PySimulator(recorder)
 
-from csdl_test_functions import test_jacvec_product
+from csdl_test_functions import test_jacvec_product, test_idempotence, test_inverse_jacobian
 np.random.seed(0)
 
-test_component = dafoam_functions
+test_component = dafoam_solver
 
 inputs  = {k: vv.value for k, vv in test_component.input_dict.items()}
 v       = {k: np.random.rand(*vv.value.shape)*vv.value for k, vv in test_component.output_dict.items()}
 w       = {k: np.random.rand(*vv.value.shape)*vv.value for k, vv in test_component.input_dict.items()}
-# w       = {k: np.zeros_like(vv.value) for k, vv in test_component.input_dict.items()}
 
 print(f'Inputs: {inputs}')
 print(f'v: {v}')
 print(f'w: {w}')
-test_jacvec_product(test_component, inputs, v, w)
-test_jacvec_product(test_component, inputs, v, {k:-wv for k,wv in w.items()})
+
+# test_idempotence(test_component, inputs)
+# input('Press ENTER to continue...')
+
+# test_idempotence(test_component, inputs)
+# input('Press ENTER to continue...')
+
+# test_inverse_jacobian(test_component, inputs, v, eps=1e-4)
+# import shutil
+# shutil.rmtree(dafoam_directory + "0.0001")
+# test_inverse_jacobian(test_component, inputs, {name: 2*vv for name, vv in v.items()}, eps=1e-4)
+
+
+eps_test_vals = [1e-3, 1e-4, 1e-5, 1e-6, 1e-7, 1e-8, 1e-9, 1e-10, 1e-11, 1e-12]
+err = np.zeros_like(eps_test_vals)
+i = 0
+for eps in eps_test_vals:
+    lhs, rhs, err[i] = test_jacvec_product(test_component, inputs, v, w, eps=eps)
+    i += 1
+
+# plt.rcParams['text.usetex'] = True
+plt.figure()
+plt.loglog(eps_test_vals, err)
+plt.title('jacvec_product vs FD (w^T J^T v = v^T J w)')
+plt.xlabel('Stepsize, \epsilon')
+plt.ylabel('Error, |\frac{lhs - rhs}{rhs}|')
+plt.show()
+test_jacvec_product(test_component, inputs, v, {k:-wv for k,wv in w.items()}, eps=1e-6)
 
 input('Press ENTER to continue...')
 
