@@ -50,14 +50,15 @@ def test_jacvec_product(component, input_vals, v, w, eps=1e-6, mode='rev'):
     
     if mode == 'fwd':
         raise NotImplementedError('forward mode has not been implemented for test_jacvec_product')
-        
+
     if mode == 'rev':
-        # --- Compute J w (forward mode, via finite diff) ---
-        #  perturb input in the w-direction
+        # --- Compute J w (via finite diff) ---
+        # Perturb input in the w-direction
         perturbed_input_vals = {k: np.copy(vv) for k, vv in input_vals.items()}
         for in_name in input_vals:
             perturbed_input_vals[in_name] += eps*w[in_name]
 
+        # Compute perturbed outputs/residuals
         if component_type == 'explicit':
             perturbed_output_vals = {k: np.zeros_like(vv) for k, vv in output_vals.items()}
             component.compute(perturbed_input_vals, perturbed_output_vals)
@@ -68,6 +69,7 @@ def test_jacvec_product(component, input_vals, v, w, eps=1e-6, mode='rev'):
             component.evaluate_residuals(perturbed_input_vals, output_vals, perturbed_residual_vals)
             J_w = {name: (perturbed_residual_vals[name] - residual_vals[name]) / eps for name in residual_vals.keys()}
 
+        # Assemble RHS
         rhs = sum(np.vdot(v[name], J_w[name]) for name in v)
 
         # --- Compute J^T v (adjoint mode) ---
@@ -81,16 +83,99 @@ def test_jacvec_product(component, input_vals, v, w, eps=1e-6, mode='rev'):
             d_outputs   = {name: np.zeros_like(val) for name, val in residual_vals.items()}
             component.compute_jacvec_product(input_vals, output_vals, JT_v, d_outputs, v, 'rev')
 
+        # Assemble LHS
         lhs = sum(np.vdot(w[name], JT_v[name]) for name in input_vals)
 
     else:
         raise ValueError(f'"{mode}" not recognized. Only support "fwd" and "rev" modes') 
 
     # --- Compare ---
-    err = np.abs(lhs - rhs) / (rhs)
+    err = np.abs((lhs - rhs) / (rhs))
 
     print(f"LHS (w^T J^T v): {lhs}")
     print(f"RHS (v^T J w): {rhs}")
+    print(f"Relative error: {err:.3e}")
+
+    return lhs, rhs, err
+
+
+
+# region TEST_INVERSE_JACIBIAN
+def test_inverse_jacobian(component, input_vals, v, eps=1e-6, mode='rev'):
+    """
+    Generic test for apply_inverse_jacobian in a CSDL implicit component. Tests via finite difference
+    v^T v = (J^-T v)^T (J v)
+    where J = dR/dy
+    J^-T v is computed via apply_inverse_jacobian and (J v) is computed via finite difference
+
+    Parameters
+    ----------
+    component : CSDL component (explicit or implicit)
+        For explicit: Must have compute and compute_jacvec_product.
+        For implicit: Must have solve_residual_equations, evaluate_residuals, and compute_jacvec_product.
+    input_vals : dict
+        Dictionary of input arrays around which we'll center the evaluation (keys must match component input names).
+    v : dict
+        Direction vector for residuals.
+    eps : float
+        Step size for finite differences.
+
+    Returns
+    -------
+    float
+        Left hand side value.
+    float
+        Right hand side value.
+    float
+        Relative error between the two scalar evaluations.
+    """
+
+    # --- Compute residuals/outputs at base state --
+    residual_vals  = {k: np.zeros_like(vv) for k, vv in component.output_dict.items()}
+    output_vals    = {k: np.zeros_like(vv) for k, vv in component.output_dict.items()}
+    component.solve_residual_equations(input_vals, output_vals)
+    component.evaluate_residuals(input_vals, output_vals, residual_vals)
+
+    if mode == 'fwd':
+        raise NotImplementedError('forward mode has not been implemented for test_jacvec_product')
+
+    if mode == 'rev':
+        # --- Compute J w (via finite diff) ---
+        # Perturb input in the w-direction
+        perturbed_output_vals = {k: np.copy(vv) for k, vv in output_vals.items()}
+        for key in output_vals:
+            perturbed_output_vals[key] += eps*v[key]
+
+        # Compute perturbed residuals
+        perturbed_residual_vals = {k: np.zeros_like(vv) for k, vv in residual_vals.items()}
+        component.evaluate_residuals(input_vals, perturbed_output_vals, perturbed_residual_vals)
+        J_v = {name: (perturbed_residual_vals[name] - residual_vals[name]) / eps for name in residual_vals.keys()}
+
+        # --- Compute J^-T v (adjoint mode) ---
+        # Initialize our product to zeros (this is our J^-T v)
+        JinvT_v    = {name: np.zeros_like(val) for name, val in residual_vals.items()}
+        
+        component.apply_inverse_jacobian(input_vals, output_vals, v, JinvT_v, 'rev')
+
+        vols = component.dafoam_instance.getStateWeights()
+        def inner(a, b):
+            if vols is None:
+                return np.vdot(a, b)
+            else:
+                return np.vdot(vols * a, b)
+
+        lhs = sum(inner(v[name], v[name]) for name in v)
+        rhs = sum(inner(JinvT_v[name], J_v[name]) for name in J_v)
+
+        # # --- Compute LHS and RHS ---
+        # lhs = sum(np.vdot(v[name], v[name]) for name in v)
+        # rhs = sum(np.vdot(JinvT_v[name], J_v[name]) for name in JinvT_v)
+
+    # --- Compare ---
+    err = np.abs(lhs - rhs) / (rhs)
+
+    print(f"LHS (v^T v): {lhs}")
+    print(f"RHS ((J^-T v)^T (J v)): {rhs}")
     print(f"Relative error: {err:.3e}")
 
     return lhs, rhs, err
