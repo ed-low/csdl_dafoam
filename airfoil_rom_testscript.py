@@ -323,6 +323,8 @@ flight_conditions_group.altitude_m          = csdl.Variable(value=global_metadat
 # Atmospheric condition variables
 ambient_conditions_group = sam.compute_ambient_conditions_group(flight_conditions_group.altitude_m)
 
+
+
 # DAFoam input variable generation
 # Generate our DAFoam CSDL input variable group 
 # (this will add airspeed_m_s to the flight conditions group if not already present)
@@ -416,14 +418,8 @@ if weight_mode is None:
     weights = np.ones_like(y_reference)
 
 elif weight_mode == 'cell':
-    # Vector weights
-    weights_v = np.empty(3*cell_volumes.size)
-    weights_v[0::3] = cell_volumes
-    weights_v[1::3] = cell_volumes
-    weights_v[2::3] = cell_volumes
-    # Bandaid solution to get face areas for now
-    face_areas = dafoam_instance.getStateScalingFactors()[6*dafoam_instance.solver.getNLocalCells():]
-    weights    = np.concatenate((weights_v, np.tile(cell_volumes, 3), face_areas), axis=None)
+    weights = dafoam_instance.getStateWeights()
+
 
 
 # Scale and zero-mean our data
