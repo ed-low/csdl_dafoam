@@ -324,19 +324,26 @@ if surface_mesh_projection_file_path.is_file():
 else:
     if rank == 0:
         print('No projected surface mesh file found.')
-        with Timer('projecting on surface mesh'):
-            projected_surf_mesh_dafoam = geometry.project(
-                x_surf_dafoam_initial, 
-                grid_search_density_parameter = 1,      # 1     (ORIGINAL)
-                projection_tolerance          = 1e-1, #1.e-3,  # 1.e-3 (ORIGINAL)
-                grid_search_density_cutoff    = 10,     # 20    (ORIGINAL) 50
-                force_reprojection            = False,
-                plot                          = False    # UCSD_LAB
-            )
+        try:
+            with Timer('projecting on surface mesh'):
+                projected_surf_mesh_dafoam = geometry.project(
+                    x_surf_dafoam_initial, 
+                    grid_search_density_parameter = 1,      # 1     (ORIGINAL)
+                    projection_tolerance          = 1e-3,   #1.e-3m (ORIGINAL)
+                    grid_search_density_cutoff    = 10,     # 20    (ORIGINAL) 50
+                    force_reprojection            = False,
+                    plot                          = False    # UCSD_LAB
+                )
 
-        print('Writing surface mesh projection pickle...')
-        write_simple_pickle(projected_surf_mesh_dafoam, surface_mesh_projection_file_path)
-        print('Done!')
+            print('Writing surface mesh projection pickle...')
+            write_simple_pickle(projected_surf_mesh_dafoam, surface_mesh_projection_file_path)
+            print('Done!')
+
+        # Added this exception because I was getting an ungraceful MPI termination
+        except Exception as e:
+            import traceback
+            print(f"[Rank 0 ERROR] Projection/pickle step failed:\n{traceback.format_exc()}", flush=True)
+            comm.Abort(1) # Abort MPI processes instead of letting them hang
 
     comm.Barrier()
     if rank != 0:
