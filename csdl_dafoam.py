@@ -912,7 +912,7 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
         else:
             raise ValueError(f'"{mode}" not recognized. Only support "fwd" and "rev" modes')
 
-        # Write solution to file
+        # Components for writing solution to file
         dafoam_instance = self.dafoam_instance
         D               = self.scaling_factors
         W               = self.weights
@@ -1084,3 +1084,358 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
         dx = x_new - x_old
         df = f_new - f_old
         J += np.outer((df - np.dot(J, dx)), dx)/np.dot(dx, dx)
+
+
+
+
+
+# region DAFOAMROM2
+class DAFoamROM2(csdl.experimental.CustomImplicitOperation):
+    def __init__(self, 
+                 dafoam_instance,
+                 pod_modes:np.array         =None,
+                 fom_ref_state:np.array     =None, 
+                 tolerance                  =1e-6, 
+                 max_iters:int              =100, 
+                 update_jac_frequency:int   =10,
+                 num_initial_jac_updates:int=1, 
+                 weights:np.array           =None,
+                 scaling_factors:np.array   =None):
+
+        super().__init__()
+        self.dafoam_instance        = dafoam_instance
+        self.tolerance              = tolerance
+        self.max_iters              = max_iters
+        self.solution_counter       = 1
+        self.update_jac_frequency   = update_jac_frequency if update_jac_frequency > 0 else np.nan
+        self.num_initial_jac_updates= num_initial_jac_updates
+        self.reduced_jacobian       = None
+        self.n_local_state_elements = dafoam_instance.getNLocalAdjointStates()
+        self.n_local_cells          = dafoam_instance.solver.getNLocalCells()
+
+        # Do some checks here to assign default values if none passed. Alert user if none are passed.
+        if weights is None:
+            print('No weights passed to DAFoamROM. Assuming no weighting used in POD mode computation...')
+            self.weights = np.ones((dafoam_instance.getNLocalAdjointStates(), ))
+        else:
+            self.weights = weights
+
+        if scaling_factors is None:
+            print('No weights passed to DAFoamROM. Assuming no scaling factor used in POD mode computation...')
+            self.scaling_factors = np.ones((dafoam_instance.getNLocalAdjointStates(), ))
+        else:
+            self.scaling_factors = scaling_factors
+
+        if fom_ref_state is None:
+            print('No FOM reference state passed to DAFoamROM. Assuming no mean/reference subtraction used in POD mode computation...')
+            self.fom_ref_state = np.ones((dafoam_instance.getNLocalAdjointStates(), ))
+        else:
+            self.fom_ref_state = fom_ref_state
+
+        if pod_modes is None:
+            print('No POD modes passed to DAFoamROM. Expecting POD modes as CSDL variable for the evaluate method...')
+        else:
+            print('POD modes passed to DAFoamROM. Assuming constant/global POD modes unless modes are passed to the evaluate method...')
+        
+        self.pod_modes = pod_modes
+
+        
+    # region evaluate
+    def evaluate(self, dafoam_input_variables_group:csdl.VariableGroup, pod_modes:csdl.Variable=None, design_variable_configuration:csdl.Variable=None):
+        
+        # Read daOptions to set proper inputs
+        inputDict = self.dafoam_instance.getOption("inputInfo")
+        for inputName in inputDict.keys():
+            if "solver" in inputDict[inputName]["components"]:
+                self.declare_input(inputName, getattr(dafoam_input_variables_group, inputName))
+
+        # Set our basis as an input variable if not already set to a constant
+        if pod_modes is not None:
+            if self.pod_modes is None:
+                print('POD modes passed to DAFoamROM evalute method. Neglecting constant/global modes passed in initialization.')
+            self.declare_input('pod_modes', pod_modes)
+            num_modes = pod_modes.value.shape[1]
+            self.pod_modes_is_csdl_var = True
+        else:
+            if self.pod_modes is None:
+                TypeError('No POD modes assigned to ROM. Please pass a constant POD mode set during initialization, or a POD mode set in the evaluate section.')
+            else:
+                num_modes = self.pod_modes.shape[1]
+                self.pod_modes_is_csdl_var = False
+        
+        # Set outputs
+        dafoam_rom_states = self.create_output('dafoam_rom_states', (num_modes,))
+
+        return dafoam_rom_states
+
+
+    # region solve_residual_equations
+    def solve_residual_equations(self, input_vals, output_vals):
+        from scipy.optimize import root, least_squares
+
+        dafoam_instance       = self.dafoam_instance
+
+        # Solver parameters/options (not all have been exposed as options yet. Tweak here if necessary.)
+        max_iters                       = self.max_iters
+        update_jac_frequency            = self.update_jac_frequency
+        num_initial_jac_updates         = self.num_initial_jac_updates
+        tolerance                       = self.tolerance
+        line_search_minimum_reduction   = 1e-4  # Minimum search distance for line search (Where full step = 1)
+        line_search_shrink_factor       = 0.5   # The factor by which the line search reduces its search
+        trigger_jac_recompute_threshold = 3     # Number of sequential line search failures necessary to trigger jacobian recompute
+       
+        # Check if we're working with the pod modes as a constant or as a variable
+        pod_modes_is_csdl_var = self.pod_modes_is_csdl_var
+
+        # Some important quanitites
+        y_fom_ref  = self.fom_ref_state
+        W          = self.weights
+        D          = self.scaling_factors
+        phi        = input_vals['pod_modes'] if pod_modes_is_csdl_var else self.pod_modes
+        num_modes  = phi.shape[1]
+        
+        # MPI stuff
+        # TODO: will have to make this all MPI compatible eventually
+        rank = dafoam_instance.rank
+
+        # Make sure solver is updated with the most recent input values
+        dafoam_instance.set_solver_input(input_vals)
+
+        # We also need to just calculate the residual for the AD mode to initialize vars like URes
+        # We do not print the residual for AD, though
+        # NOTE: This was taken from DAFoamSolver.solve_residual_equation
+        dafoam_instance.solverAD.calcPrimalResidualStatistics("calc")
+        
+        # Initialize our ROM/FOM states and ROM/FOM residuals
+        y_rom = np.zeros((num_modes, ))
+        y_fom, r_fom, r_rom = self._rom_states_to_res_and_fom(phi, y_rom, W, D)
+        r_rom_norm = np.linalg.norm(r_rom)
+
+        # Initializing loop counters and flags
+        trigger_jac_recompute_counter   = 0
+        trigger_jac_recompute           = False
+        last_accepted                   = True
+        converged                       = False
+
+        root_or_ls = 'root'
+        if root_or_ls == 'root':
+            def _reduced_residual(y_rom_fun):
+                y_fom, r_fom, r_rom_fun = self._rom_states_to_res_and_fom(phi, y_rom_fun, W, D)
+
+                J_rom = self._compute_reduced_jacobian(phi, y_fom, y_rom_fun, W, D, mode='fd', fd_eps=1e-6)
+                return r_rom_fun, J_rom
+
+            opts = {"disp": True,
+                    "maxiter": 100,
+                    "ftol": 1e-8,
+                    }
+            result = root(_reduced_residual, y_rom, method='lm', options=opts, jac=True)
+
+        else:
+            def _reduced_residual(y_rom_fun):
+                y_fom, r_fom, r_rom_fun = self._rom_states_to_res_and_fom(phi, y_rom_fun, W, D)
+                return r_rom_fun
+
+            def _reduced_jacobian(y_rom_fun):
+                J_rom = self._compute_reduced_jacobian(phi, y_fom, y_rom_fun, W, D, mode='fd', fd_eps=1e-6)
+                return J_rom
+
+            result = least_squares(_reduced_residual, y_rom, method='lm', verbose = 1)#, jac=_reduced_jacobian, verbose=1)
+
+        print(result)
+        y_rom     = result.x
+        converged = result.success
+
+        # Return NaN array as output if failed (for the OpenSQP optimizer), otherwise return rom states
+        if converged:
+            print('\n\n Specified tolerance reached!')
+            # Update reduced jacobain to most recent state
+            print('Updating Jacobian to most recent state value...')
+            J_rom = self._compute_reduced_jacobian(phi, y_fom, y_rom, W, D, mode='fd')
+            self.reduced_jacobian = J_rom
+
+            output_vals['dafoam_rom_states'] = y_rom
+
+        else:
+            print('Warning: ROM iteration limit reached!')
+            output_vals['dafoam_rom_states'] = np.full((num_modes, ), np.nan)
+
+
+    # region apply_inverse_jacobian
+    def apply_inverse_jacobian(self, input_vals, output_vals, d_outputs, d_residuals, mode):
+        # Can't do forward mode
+        if mode == 'fwd':
+            raise NotImplementedError('forward mode has not been implemented for DAFoamROM')
+        
+        elif mode == 'rev':
+            J_romT = self.reduced_jacobian.T
+            v      = d_outputs['dafoam_rom_states']
+            d_residuals['dafoam_rom_states'] = np.linalg.solve(J_romT, v)
+
+        else:
+            raise ValueError(f'"{mode}" not recognized. Only support "fwd" and "rev" modes')
+
+        # Components for writing solution to file
+        dafoam_instance = self.dafoam_instance
+        D               = self.scaling_factors
+        W               = self.weights
+        y_fom_ref       = self.fom_ref_state
+        phi             = input_vals['pod_modes'] if self.pod_modes_is_csdl_var else self.pod_modes
+        y_rom           = output_vals['dafoam_rom_states']
+        y_fom           = y_fom_ref + D*(phi@y_rom)
+        n_points        = dafoam_instance.solver.getNLocalPoints()
+
+        # Initialize mesh array and write to file
+        write_number    = round(1e-4*self.solution_counter, 4)
+        points0         = np.zeros(n_points*3)
+        dafoam_instance.solver.getOFMeshPoints(points0)
+        dafoam_instance.solver.writeMeshPoints(points0, write_number)
+
+        # Write primitives
+        dafoam_instance.solver.writeAdjointFields('sol', write_number, y_fom)
+        self.solution_counter += 1
+
+
+    # region compute_jacvec_product
+    def compute_jacvec_product(self, input_vals, output_vals, d_inputs, d_outputs, d_residuals, mode):
+        dafoam_instance = self.dafoam_instance
+        comm            = dafoam_instance.comm
+        rank            = dafoam_instance.rank
+
+        D         = self.scaling_factors
+        W         = self.weights
+        phi       = self.pod_modes
+        y_fom_ref = self.fom_ref_state
+
+        dafoam_scaling_factors = dafoam_instance.getStateScalingFactors()
+
+        # assign the states in outputs to the OpenFOAM flow fields
+        # NOTE: this is not quite necessary because setStates have been called before in the solve_nonlinear
+        # here we call it just be on the safe side
+        # Check if states contain any NaN values (NaNs would be passed from optimizer)
+        y_rom = output_vals['dafoam_rom_states']
+        y_fom = y_fom_ref + D*(phi@y_rom)
+
+        # Update solver states only if no NaNs exist
+        if not has_global_nan_or_inf(y_fom, comm):
+            dafoam_instance.setStates(y_fom)
+        else:
+            if rank == 0:
+                print('DAFoamSolver.compute_jacvec_product: Detected NaN(s) in input_vals. Skipping DAFoam setStates')
+
+        # Can't do forward mode
+        if mode == 'fwd':
+            raise NotImplementedError('forward mode has not been implemented for DAFoamROM')
+
+        elif mode == 'rev':
+            if 'dafoam_rom_states' in d_residuals:
+                # get the reverse mode AD seed from d_residuals and expand to FOM size
+                seed_r = d_residuals['dafoam_rom_states']
+                seed   = W*(phi@seed_r)
+    
+                # loop over all inputs keys and compute the matrix-vector products accordingly
+                input_dict = dafoam_instance.getOption("inputInfo")
+                for input_name in list(input_vals.keys()):
+                    # (Taking care of the DAFoam inputs here)
+                    if input_name in input_dict:
+                        input_type = input_dict[input_name]["type"]
+                        jac_input  = input_vals[input_name].copy()
+                        product    = np.zeros_like(jac_input)
+                        dafoam_instance.solverAD.calcJacTVecProduct(
+                            input_name,
+                            input_type,
+                            jac_input,
+                            "aero_residuals",
+                            "residual",
+                            seed,
+                            product,
+                        )
+                        d_inputs[input_name] += product
+                        print(f"product shape: {product.shape}")
+        
+        else:
+            raise ValueError(f'"{mode}" not recognized. Only support "fwd" and "rev" modes')
+
+
+    
+    # region _compute_residuals
+    # This is just a helper function for convenience
+    def _compute_residuals(self, phi, y_fom, W, D):
+        dafoam_instance = self.dafoam_instance
+
+        dafoam_instance.setStates(y_fom)
+        r_fom = dafoam_instance.getResiduals()
+        r_rom = phi.T@(W*r_fom)
+
+        return r_fom, r_rom
+
+    
+    # region _rom_states_to_res_and_fom
+    def _rom_states_to_res_and_fom(self, phi, y_rom, W, D):
+        dafoam_instance = self.dafoam_instance
+        y_fom_ref       = self.fom_ref_state
+
+        y_fom = y_fom_ref + D*(phi@y_rom)
+        r_fom, r_rom = self._compute_residuals(phi, y_fom, W, D)
+
+        return y_fom, r_fom, r_rom
+
+
+    # region _compute_reduced_jacobian
+    def _compute_reduced_jacobian(self, phi, y_fom, y_rom, W, D, mode='fom_jTvp', fd_eps=1e-6):
+        dafoam_instance = self.dafoam_instance
+        num_modes       = phi.shape[1]
+
+        if mode == 'fom_jTvp': # Computing using DAFoamSolver's calcJacTVecProduct column by column and projecting
+            J_romT_W_phi           = np.zeros_like(phi)
+            W_phi                  = W[:, None]*phi
+            dafoam_scaling_factors = dafoam_instance.getStateScalingFactors()
+
+            # Update solver for desired states
+            dafoam_instance.setStates(y_fom)
+            
+            # Loop over columns of phi
+            for i in range(num_modes):
+                seed    = np.ascontiguousarray(W_phi[:, i])
+                product = np.zeros_like(seed)
+                dafoam_instance.solverAD.calcJacTVecProduct(
+                    'dafoam_solver_states',
+                    "stateVar",
+                    y_fom,
+                    'aero_residuals',
+                    "residual",
+                    seed,
+                    product,
+                )
+
+                J_romT_W_phi[:, i] = product/dafoam_scaling_factors
+                
+            J_romT = phi.T@(D[:, None]*J_romT_W_phi)
+            J_rom   = J_romT.T
+
+            return J_rom
+
+        elif mode == 'fd': # Finite difference method in reduced space
+            J_rom  = np.zeros((num_modes, num_modes))
+            
+            # Get reduced residual
+            r_fom, r_rom0 = self._compute_residuals(phi, y_fom, W, D)
+
+            # Will choose this value if the stepsize gets too small
+            min_stepsize_magnitude = 1e-8
+
+            for j in range(num_modes):         
+                # Perturb the reduced coordinates by fd_eps (choose lower bound if too small)
+                delta_j    = max(np.abs(fd_eps*y_rom[j]), min_stepsize_magnitude)
+                y_fom_pert = y_fom + D*phi[:, j]*delta_j
+
+                # Get perturbed reduced residuals
+                r_rom_pert = self._compute_residuals(phi, y_fom_pert, W, D)[1]
+
+                # Add to respective reduced jacobian column
+                J_rom[:, j] = (r_rom_pert - r_rom0)/delta_j
+
+            # Reset states in DAFoam
+            dafoam_instance.setStates(y_fom) 
+
+            return J_rom

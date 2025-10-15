@@ -32,7 +32,7 @@ from modopt import PySLSQP, OpenSQP
 
 # IDWarp and DAFoam
 from csdl_idwarp import DAFoamMeshWarper
-from csdl_dafoam import instantiateDAFoam, DAFoamFunctions, DAFoamSolver, DAFoamROM, compute_dafoam_input_variables
+from csdl_dafoam import instantiateDAFoam, DAFoamFunctions, DAFoamSolver, DAFoamROM2, compute_dafoam_input_variables
 import standard_atmosphere_model as sam
 from pyofm import PYOFM
 
@@ -488,7 +488,7 @@ if show_training_plots:
 # dafoam_solver_states    = dafoam_solver.evaluate(dafoam_input_variables_group)
 
 # DAFoamSolver Implicit component setup and evaluation
-dafoam_rom           = DAFoamROM(dafoam_instance, 
+dafoam_rom           = DAFoamROM2(dafoam_instance, 
                                  pod_modes=pod_modes, 
                                  tolerance=1e-8, 
                                  fom_ref_state=scaling_factors*y_reference, 
