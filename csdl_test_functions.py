@@ -140,8 +140,8 @@ def test_inverse_jacobian(component, input_vals, v, eps=1e-6, mode='rev'):
         raise NotImplementedError('forward mode has not been implemented for test_jacvec_product')
 
     if mode == 'rev':
-        # --- Compute J w (via finite diff) ---
-        # Perturb input in the w-direction
+        # --- Compute J v (via finite diff) ---
+        # Perturb input in the v-direction
         perturbed_output_vals = {k: np.copy(vv) for k, vv in output_vals.items()}
         for key in output_vals:
             perturbed_output_vals[key] += eps*v[key]
@@ -157,7 +157,7 @@ def test_inverse_jacobian(component, input_vals, v, eps=1e-6, mode='rev'):
         
         component.apply_inverse_jacobian(input_vals, output_vals, v, JinvT_v, 'rev')
 
-        vols = component.dafoam_instance.getStateWeights()
+        vols = None #component.dafoam_instance.getStateWeights()
         def inner(a, b):
             if vols is None:
                 return np.vdot(a, b)

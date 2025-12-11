@@ -999,7 +999,7 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
         num_modes       = phi.shape[1]
 
         if mode == 'fom_jTvp': # Computing using DAFoamSolver's calcJacTVecProduct column by column and projecting
-            J_romT_W_phi           = np.zeros_like(phi)
+            J_fomT_W_phi           = np.zeros_like(phi)
             W_phi                  = W[:, None]*phi
             dafoam_scaling_factors = dafoam_instance.getStateScalingFactors()
 
@@ -1020,10 +1020,10 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
                     product,
                 )
 
-                J_romT_W_phi[:, i] = product/dafoam_scaling_factors
+                J_fomT_W_phi[:, i] = product/dafoam_scaling_factors
                 
-            J_romT = phi.T@(D[:, None]*J_romT_W_phi)
-            J_rom   = J_romT.T
+            J_romT = phi.T@(D[:, None]*J_fomT_W_phi)
+            J_rom  = J_romT.T
 
             return J_rom
 

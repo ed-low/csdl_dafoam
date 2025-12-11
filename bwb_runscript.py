@@ -4,7 +4,6 @@
 import numpy as np
 import sys
 import os
-import time
 import pickle
 from pathlib import Path
 
@@ -28,13 +27,12 @@ import standard_atmosphere_model as sam
 # BWB specific
 from bwb_helper_functions import setup_geometry, read_geometry_pickle, write_geometry_pickle, gather_array_to_rank0, read_simple_pickle, write_simple_pickle
 
+from helper_functions import Timer, hash_array_tol, quiet_barrier, compute_vertex_normals, average_normals_at_duplicate_points
+
 # Plotting
-from vedo import Points, show
+from vedo import Points, Arrows, Mesh, show
 import matplotlib.pyplot as plt
 from check_headless import is_headless
-
-# Hashing (for file name generation)
-import hashlib
 
 #---- DEBUGGING TOOLS ----
 import faulthandler
@@ -55,26 +53,49 @@ geometry_directory        =  os.path.join(os.getcwd(), 'bwb_geometry/')
 stp_file_name             = 'bwbv2_no_wingtip_coarse_refined_flat.stp'
 geometry_pickle_file_name = 'bwb_stored_refit.pickle'
 
+# Mesh
+average_normals_at_edges  = True # if true, this will average the normals of the shared point between two surfaces (might be useful for some cases)
+
 # MPI and timing
 comm           = MPI.COMM_WORLD
-TIMING_ENABLED = True  # True if we want timing printed for the CSDL operations
+timing_enabled = True  # True if we want timing printed for the CSDL operations
 
 # DAFoam
-dafoam_directory = os.path.join(os.getcwd(), 'openfoam_175k_bwb/')
+dafoam_directory    = os.path.join(os.getcwd(), 'openfoam_739k_bwb_symmetry/')
+dafoamPrintInterval = 1 # This doesn't actually seem to affect anything...
 
 # Initial/reference values for DAFoam (best to use base conditions)
-U0        = 238.0         # used for normalizing CD and CL
-p0        = 101325.0
-T0        = 300.0
+# These correspond to M=0.75 @ 30k feet
+U0        = 227.3805         # used for normalizing CD and CL
+p0        = 30089.6
+T0        = 228.714
 nuTilda0  = 4.5e-5
 CL_target = 0.5
 aoa0      = 0
 A0        = 518           # Projected area of entire BWB. Used for normalizing CD and CL
 rho0      = p0 / T0 / 287 # used for normalizing CD and CL
 
+# wall_list = ['wall_wing_cap',
+#             'wall_wing',
+#             'wall_transition',
+#             'wall_body']
+# #
+#    'wall_wing_cap_edge',
+#    'wall_trailing_surf_wing',
+#    'wall_trailing_surf_transition',
+#    'wall_trailing_surf_body', 
+# wall_list = ["wall"]
+wall_list = ['wall_body_lower',
+             'wall_body_upper', 
+             'wall_wing_lower', 
+             'wall_transition_lower', 
+             'wall_wing_upper', 
+             'wall_transition_upper', 
+             'wall_wing_cap']  
+
 # region Dafoam options
 da_options = {
-    "designSurfaces": ["wall"],
+    "designSurfaces": wall_list,
     "solverName": "DARhoSimpleCFoam",
     "primalMinResTol": 1.0e-8,
     "primalBC": {
@@ -84,11 +105,12 @@ da_options = {
         "nuTilda0": {"variable": "nuTilda", "patches": ["inout"], "value": [nuTilda0]},
         "useWallFunction": True,
     },
+    "primalVarBounds": {"pMin": 5000, "rhoMin": 0.05},
     "function": {
         "drag": {
             "type": "force",
             "source": "patchToFace",
-            "patches": ["wall"],
+            "patches": wall_list,
             "directionMode": "parallelToFlow",
             "patchVelocityInputName": "patch_velocity",
             "scale": 1.0, #1.0 / (0.5 * U0 * U0 * A0 * rho0),
@@ -96,7 +118,7 @@ da_options = {
         "lift": {
             "type": "force",
             "source": "patchToFace",
-            "patches": ["wall"],
+            "patches": wall_list,
             "directionMode": "normalToFlow",
             "patchVelocityInputName": "patch_velocity",
             "scale": 1.0, #1.0 / (0.5 * U0 * U0 * A0 * rho0),
@@ -104,7 +126,7 @@ da_options = {
     },
     "adjStateOrdering": "cell",
     "adjEqnOption": {"gmresRelTol": 1.0e-4, "pcFillLevel": 1, "jacMatReOrdering": "natural"},
-    # transonic preconditioner to speed up the adjoint convergence
+    # transonic preconditioner to speed up the ff convergence
     "transonicPCOption": 2,
     "adjPCLag": 5,
     # "adjEqnOption": {"gmresRelTol": 1.0e-6, "pcFillLevel": 1, "jacMatReOrdering": "rcm", "useNonZeroInitGuess": False},
@@ -156,50 +178,6 @@ mesh_options = {
 
 
 # ===============================
-# region HELPER FUNCTIONS
-# ===============================
-# TIMER
-from contextlib import contextmanager
-# Use this to print the timings for certain lines
-timings = {}  # Optional: for logging total times
-
-@contextmanager
-def Timer(name):
-    if TIMING_ENABLED:
-        print(f'Rank {rank}: {name}...', flush=True)
-        start = time.time()
-        yield
-        elapsed = time.time() - start
-        print(f'Rank {rank}: {name} elapsed time: {elapsed:.3f} s')
-        timings[name] = elapsed
-    else:
-        yield
-
-
-# HASHER (for generating filenames)
-import hashlib
-def hash_array_tol(arr: np.ndarray, tol: float = 1e-8, length: int = 16) -> str:
-    """
-    Generate a tolerance-aware short hash of a NumPy array.
-
-    Parameters:
-        arr (np.ndarray): Input array to hash.
-        tol (float): Tolerance for rounding (default: 1e-8).
-        length (int): Number of hex characters to return from the hash (default: 16).
-
-    Returns:
-        str: A truncated SHA-256 hash of the rounded array.
-    """
-    # Round the array to the given tolerance
-    rounded = np.round(arr / tol) * tol
-    # Hash the byte representation of the rounded array
-    byte_repr = rounded.astype(np.float64).tobytes()
-    full_hash = hashlib.sha256(byte_repr).hexdigest()
-    return full_hash[:length]
-
-
-
-# ===============================
 # region SETUP
 # ===============================
 # MPI information
@@ -209,18 +187,19 @@ rank_str  = f"{rank:0{len(str(comm_size-1))}d}" # string with zero-padded rank i
 
 
 # region DAFoam instance
-dafoam_instance             = instantiateDAFoam(da_options, comm, dafoam_directory, mesh_options)
-x_surf_dafoam_initial_mpi   = dafoam_instance.getSurfaceCoordinates()
-x_vol_dafoam_initial_mpi    = dafoam_instance.xv0
+dafoam_instance               = instantiateDAFoam(da_options, comm, dafoam_directory, mesh_options)
+dafoam_instance.printInterval = dafoamPrintInterval
+x_surf_dafoam_initial_local   = dafoam_instance.getSurfaceCoordinates()
+x_vol_dafoam_initial_local    = dafoam_instance.xv0
 
-local_n_surf  = x_surf_dafoam_initial_mpi.shape[0]
-local_n_vol   = x_vol_dafoam_initial_mpi.shape[0]
+local_n_surf  = x_surf_dafoam_initial_local.shape[0]
+local_n_vol   = x_vol_dafoam_initial_local.shape[0]
 
 # Gathering surface mesh to rank 0 (need to do this to avoid 'no-element' ranks in the projection
 # and geometry evaluation functions)
 (x_surf_dafoam_initial, 
 x_surf_dafoam_initial_size,
-x_surf_dafoam_initial_indices) = gather_array_to_rank0(x_surf_dafoam_initial_mpi, comm)
+x_surf_dafoam_initial_indices) = gather_array_to_rank0(x_surf_dafoam_initial_local, comm)
 
 # Get hash for surface mesh projection file read/write (broadcast to other ranks)
 if rank == 0:
@@ -230,12 +209,10 @@ else:
 
 x_surf_hash = comm.bcast(x_surf_hash, root=0)
 
-
 # region File paths
 geometry_pickle_file_path         = Path(geometry_directory)/geometry_pickle_file_name
 stp_file_path                     = Path(geometry_directory)/stp_file_name
 surface_mesh_projection_file_path = Path(dafoam_directory)/f'projected_surface_mesh_{x_surf_hash}.pickle'
-
 
 
 # ===============================
@@ -256,13 +233,13 @@ recorder.start()
 
 #region Geometry setup I
 if geometry_pickle_file_path.is_file():
-    with Timer(f'reading geometry'):
+    with Timer(f'reading geometry', rank, timing_enabled):
         geometry = read_geometry_pickle(geometry_pickle_file_path)
         
 else:
     if rank == 0:
         print('No geometry pickle file found.')
-        with Timer('importing geometry'):
+        with Timer('importing geometry', rank, timing_enabled):
             geometry = lsdo_geo.import_geometry(stp_file_path,
                                                 parallelize=False)
 
@@ -274,7 +251,7 @@ else:
         wing_l_transition_indices   = [10,11]
         wing_l_indices              = [12,13,14,15] 
 
-        with Timer('declaring geometry components'):
+        with Timer('declaring geometry components', rank, timing_enabled):
             left_wing_transition    = geometry.declare_component(wing_l_transition_indices)
             left_wing               = geometry.declare_component(wing_l_indices)
             right_wing_transition   = geometry.declare_component(wing_r_transition_indices)
@@ -285,33 +262,106 @@ else:
         wing_parameterization   = 15
         num_v                   = left_wing.functions[wing_l_indices[0]].coefficients.shape[1]
         
-        with Timer('BSplineSpace'):
+        with Timer('BSplineSpace', rank, timing_enabled):
             wing_refit_bspline      = lfs.BSplineSpace(num_parametric_dimensions=2, degree=1, coefficients_shape=(wing_parameterization, num_v))
 
-        with Timer('left wing refit'):
+        with Timer('left wing refit', rank, timing_enabled):
             left_wing_function_set  = left_wing.refit(wing_refit_bspline, grid_resolution=(100,1000))
 
-        with Timer('right wing refit'):
+        with Timer('right wing refit', rank, timing_enabled):
             right_wing_function_set = right_wing.refit(wing_refit_bspline, grid_resolution=(100,1000))
 
-        with Timer('allocating left wing functions'):
+        with Timer('allocating left wing functions', rank, timing_enabled):
             for i, function in left_wing_function_set.functions.items():
                 geometry.functions[i]   = function
                 left_wing.functions[i]  = function
 
-        with Timer('allocating right wing functions'):
+        with Timer('allocating right wing functions', rank, timing_enabled):
             for i, function in right_wing_function_set.functions.items():
                 geometry.functions[i]   = function
                 right_wing.functions[i] = function
 
-        with Timer('pickling geometry'):
+        with Timer('pickling geometry', rank, timing_enabled):
             write_geometry_pickle(geometry, geometry_pickle_file_path)
     
     # Wait for root rank to finish writing
-    comm.Barrier()
+    quiet_barrier(comm)
     if rank != 0:
-        with Timer(f'reading geometry'):
+        with Timer(f'reading geometry', rank, timing_enabled):
             geometry = read_geometry_pickle(geometry_pickle_file_path)   
+
+
+# if rank == 0:
+#     with Timer('exporting geometry stp', rank, timing_enabled):
+#             export_geo2step('refit_geometry.stp', geometry)
+
+
+points  = x_surf_dafoam_initial
+normals_local, face_normals_local, face_centers_local = compute_vertex_normals(dafoam_instance, outward_ref=None)
+
+# print(f'Rank {rank} normals: {normals_local}')
+# print(f'Rank {rank} face_normals: {face_normals_local}')
+# print(f'Rank {rank} face_centers: {face_centers_local}')
+
+normals      = gather_array_to_rank0(-normals_local, comm)[0]
+face_normals = gather_array_to_rank0(-face_normals_local, comm)[0]
+face_centers = gather_array_to_rank0(face_centers_local, comm)[0]
+
+
+if rank == 0 and not is_headless():
+    if average_normals_at_edges:
+        normals = average_normals_at_duplicate_points(x_surf_dafoam_initial, normals)
+
+    # surface   = Mesh('/media/edward/DATA/Edward/AFRL_project/csdl_project/folder_geo/geometry/bwbv2_no_wingtip_coarse_refined_flat2.stl')
+    # distances = Points(points).distance_to(surface,invert=True, signed=True)
+    geo_plot  = geometry.plot(show=False)
+    scatter   = Points(points, r=2, c='green')
+    arrows    = Arrows(points, points + 0.2*normals, c='red', s=0.5)
+
+    # Plot duplicate points
+    uniq, idx, counts  = np.unique(x_surf_dafoam_initial, axis=0, return_index=True, return_counts=True)
+    duplicate_points   = uniq[counts > 1]
+    scatter_duplicates = Points(duplicate_points, r=2, c='yellow')
+
+
+
+    scatter_face   = Points(face_centers, r=2, c='blue')
+    arrows_face    = Arrows(face_centers, face_centers + 0.2*face_normals, c='orange', s=0.5)
+    show(geo_plot, scatter, arrows, scatter_duplicates, scatter_face, arrows_face, axes=1)
+    # # Create figure
+    # fig = plt.figure(figsize=(10, 8))
+    # ax = fig.add_subplot(111, projection='3d')
+
+    # # Plot points
+    # ax.scatter(points[:,0], points[:,1], points[:,2], color='red', s=5, alpha=0.6, label='Points')
+
+    # # Plot normals
+    # scale = 0.1  # adjust depending on mesh size
+    # ax.quiver(points[:,0], points[:,1], points[:,2],
+    #         normals[:,0], normals[:,1], normals[:,2],
+    #         length=scale, color='blue', normalize=True, label='Normals')
+
+    # # Set equal aspect ratio
+    # all_pts = points
+    # x_limits = (all_pts[:,0].min(), all_pts[:,0].max())
+    # y_limits = (all_pts[:,1].min(), all_pts[:,1].max())
+    # z_limits = (all_pts[:,2].min(), all_pts[:,2].max())
+    # max_range = max(x_limits[1]-x_limits[0], y_limits[1]-y_limits[0], z_limits[1]-z_limits[0]) / 2.0
+    # mid_x = np.mean(x_limits)
+    # mid_y = np.mean(y_limits)
+    # mid_z = np.mean(z_limits)
+    # ax.set_xlim(mid_x - max_range, mid_x + max_range)
+    # ax.set_ylim(mid_y - max_range, mid_y + max_range)
+    # ax.set_zlim(mid_z - max_range, mid_z + max_range)
+
+    # ax.set_xlabel('X')
+    # ax.set_ylabel('Y')
+    # ax.set_zlabel('Z')
+    # ax.set_title('Surface Points and Normals')
+    # plt.show()
+
+quiet_barrier(comm)
+#=============================
 
 
 # region Surface mesh projection
@@ -325,15 +375,69 @@ else:
     if rank == 0:
         print('No projected surface mesh file found.')
         try:
-            with Timer('projecting on surface mesh'):
+            # # ORIGINAL CODE
+            with Timer('projecting on surface mesh', rank, timing_enabled):
+                # n_surf = x_surf_dafoam_initial.shape[0]
+                # projected_surf_mesh_dafoam = []
+                # for i in range(n_surf):
+                #     print(f'{i}/{n_surf}: p {x_surf_dafoam_initial[i, :]}, n {normals[i, :]}')
+                #     projected_i = geometry.project(
+                #         x_surf_dafoam_initial[i, :], 
+                #         grid_search_density_parameter = 1 ,      # 1 
+                #         projection_tolerance          = 1e-3,   # 1.e-3m 
+                #         grid_search_density_cutoff    = 100,    # 20
+                #         force_reprojection            = False,
+                #         plot                          = False,
+                #         direction                     = normals[i, :]
+                #     )
+                #     print(f'projected {projected_i}')
+                #     projected_surf_mesh_dafoam.extend(projected_i)
+
+                problem_point_index = np.argmin(np.linalg.norm(x_surf_dafoam_initial - [23.68170823699935, 9.363806102035095, 0.9857894201215491], axis=1))
+                # x_surf_dafoam_initial[problem_point_index] -= [1e-6, 0, 0]
+
+                projected_surf_mesh_dafoam = geometry.project(
+                    x_surf_dafoam_initial[problem_point_index], 
+                    grid_search_density_parameter = 1,      # 1 
+                    projection_tolerance          = 1e-3,   # 1.e-3m 
+                    grid_search_density_cutoff    = 100,    # 20
+                    force_reprojection            = False,
+                    plot                          = True,
+                    direction                     = normals[problem_point_index],
+                    num_workers                   = 48
+                )
+
                 projected_surf_mesh_dafoam = geometry.project(
                     x_surf_dafoam_initial, 
-                    grid_search_density_parameter = 1,      # 1     (ORIGINAL)
-                    projection_tolerance          = 1e-3,   #1.e-3m (ORIGINAL)
-                    grid_search_density_cutoff    = 10,     # 20    (ORIGINAL) 50
+                    grid_search_density_parameter = 1,      # 1 
+                    projection_tolerance          = 1e-3,   # 1.e-3m 
+                    grid_search_density_cutoff    = 150,    # 20
                     force_reprojection            = False,
-                    plot                          = False    # UCSD_LAB
+                    plot                          = True,
+                    direction                     = normals,
+                    num_workers                   = 48
                 )
+
+            # # Debugging/timing
+            # import cProfile
+            # import pstats
+            # with cProfile.Profile() as pr:
+            #     projected_surf_mesh_dafoam = geometry.project(
+            #         x_surf_dafoam_initial, 
+            #         grid_search_density_parameter = 1,      # 1    
+            #         projection_tolerance          = 1e-2,   # 1.e-3m
+            #         grid_search_density_cutoff    = 1,     # 20
+            #         force_reprojection            = False,
+            #         plot                          = True,
+            #         # direction                     = [0, 0, 1],
+            #         num_workers                   = 4
+            #     )
+            # # Summarize top time-consuming functions
+            # stats = pstats.Stats(pr)
+            # stats.strip_dirs().sort_stats(pstats.SortKey.TIME).print_stats(30)
+
+            # print(projected_surf_mesh_dafoam)
+            # input('Press ENTER to continue')
 
             print('Writing surface mesh projection pickle...')
             write_simple_pickle(projected_surf_mesh_dafoam, surface_mesh_projection_file_path)
@@ -345,12 +449,13 @@ else:
             print(f"[Rank 0 ERROR] Projection/pickle step failed:\n{traceback.format_exc()}", flush=True)
             comm.Abort(1) # Abort MPI processes instead of letting them hang
 
-    comm.Barrier()
+    quiet_barrier(comm)
+
     if rank != 0:
         projected_surf_mesh_dafoam = read_simple_pickle(surface_mesh_projection_file_path)
 
 print(f'Rank {rank_str} done reading projected surface mesh!')
-comm.Barrier()
+quiet_barrier(comm)
 
 
 # region Design variables
@@ -404,15 +509,15 @@ geometry_values_dict = {
 
 
 # region Geometry setup II
-with Timer(f'setting up geometry'):
+with Timer(f'setting up geometry', rank, timing_enabled):
     # Had to "serialize" this because I was getting race conditions in cache I/O
     for r in range(comm_size):
-        comm.Barrier()
+        quiet_barrier(comm)
         if rank == r:
             geometry = setup_geometry(geometry, geometry_values_dict)
-        comm.Barrier()
+        quiet_barrier(comm)
 
-with Timer(f'evaluating geometry component'):
+with Timer(f'evaluating geometry component', rank, timing_enabled):
     x_surf_dafoam_full = geometry.evaluate(projected_surf_mesh_dafoam, plot=False)
 
 # region Surface mesh distribution
@@ -420,14 +525,25 @@ i0, i1          = x_surf_dafoam_initial_indices[rank]
 
 # Flight condition variables
 flight_conditions_group                     = csdl.VariableGroup()
-flight_conditions_group.mach_number         = csdl.Variable(value=0.6, name="mach_number")
+flight_conditions_group.mach_number         = csdl.Variable(value=0.75, name="mach_number")
 flight_conditions_group.angle_of_attack_deg = csdl.Variable(value=aoa0, name="angle_of_attack")
-flight_conditions_group.altitude_m          = csdl.Variable(value=0., name="altitude (m)")
+flight_conditions_group.altitude_m          = csdl.Variable(value=9144., name="altitude (m)")
 flight_conditions_group.airspeed_m_s        = csdl.Variable(value=U0, name="airspeed (m/s)")
 
 # Atmospheric condition variables
 ambient_conditions_group = sam.compute_ambient_conditions_group(flight_conditions_group.altitude_m)
 
+# reynolds_number    = ambient_conditions_group.rho_kg_m3*flight_conditions_group.airspeed_m_s*10/ambient_conditions_group.mu_kg_m_s
+# if rank == 0:
+#     print(f'Reynolds number: {reynolds_number.value}')
+#     print(f'Density (kg/m^3): {ambient_conditions_group.rho_kg_m3.value}')
+#     print(f'Speed (m/s): {flight_conditions_group.airspeed_m_s.value}')
+#     print(f'Dynamic viscosity (kg/m/s): {ambient_conditions_group.mu_kg_m_s.value}')
+#     input('Press ENTER to continue...')    
+# else:
+#     None
+
+# comm.Barrier()
 
 with csdl.experimental.mpi.enter_mpi_region(rank, comm) as mpi_region:
 
@@ -438,6 +554,7 @@ with csdl.experimental.mpi.enter_mpi_region(rank, comm) as mpi_region:
     idwarp_model    = DAFoamMeshWarper(dafoam_instance)
     x_vol_dafoam    = idwarp_model.evaluate(x_surf_dafoam)
 
+    # Need to split up angle-of-attack (and any other CSDL variables which DAFoam takes the derivative with respect to)
     flight_conditions_group.angle_of_attack_deg = mpi_region.split_custom(flight_conditions_group.angle_of_attack_deg, split_func = lambda x:x)
     
     # DAFoam input variable generation
@@ -646,7 +763,8 @@ prob        = CSDLAlphaProblem(problem_name=f'{problem_name}_rank{rank_str}', si
 # OpenSQP optimizer setup
 open_sqp_options = {'maxiter': 40,
                     'readable_outputs': ['x'],
-                    'recording': True}
+                    'recording': True,
+                    'ls_max_step': 1.0}
 optimizer   = OpenSQP(prob, **open_sqp_options)
 optimizer.solve()
 optimizer.print_results()

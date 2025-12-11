@@ -8,6 +8,7 @@ optimization_case_results/
 ASO_2DAF_send/
 airfoil_test_*_outputs/
 bwb_test_*_outputs/
+storage/
 
 # Misc files
 *.txt
