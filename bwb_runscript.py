@@ -60,6 +60,11 @@ average_normals_at_edges  = True # if true, this will average the normals of the
 comm           = MPI.COMM_WORLD
 timing_enabled = True  # True if we want timing printed for the CSDL operations
 
+# Plotting
+show_plots        = True
+interactive_plots = False
+
+
 # DAFoam
 dafoam_directory    = os.path.join(os.getcwd(), 'openfoam_739k_bwb_symmetry/')
 dafoamPrintInterval = 1 # This doesn't actually seem to affect anything...
@@ -215,6 +220,7 @@ stp_file_path                     = Path(geometry_directory)/stp_file_name
 surface_mesh_projection_file_path = Path(dafoam_directory)/f'projected_surface_mesh_{x_surf_hash}.pickle'
 
 
+
 # ===============================
 # region CSDL RECORDER
 # ===============================
@@ -291,29 +297,21 @@ else:
             geometry = read_geometry_pickle(geometry_pickle_file_path)   
 
 
-# if rank == 0:
-#     with Timer('exporting geometry stp', rank, timing_enabled):
-#             export_geo2step('refit_geometry.stp', geometry)
-
-
+# region Surface normal computation
 points  = x_surf_dafoam_initial
 normals_local, face_normals_local, face_centers_local = compute_vertex_normals(dafoam_instance, outward_ref=None)
-
-# print(f'Rank {rank} normals: {normals_local}')
-# print(f'Rank {rank} face_normals: {face_normals_local}')
-# print(f'Rank {rank} face_centers: {face_centers_local}')
 
 normals      = gather_array_to_rank0(-normals_local, comm)[0]
 face_normals = gather_array_to_rank0(-face_normals_local, comm)[0]
 face_centers = gather_array_to_rank0(face_centers_local, comm)[0]
 
-
-if rank == 0 and not is_headless():
+# Edge normal handling
+if rank == 0:
     if average_normals_at_edges:
         normals = average_normals_at_duplicate_points(x_surf_dafoam_initial, normals)
 
-    # surface   = Mesh('/media/edward/DATA/Edward/AFRL_project/csdl_project/folder_geo/geometry/bwbv2_no_wingtip_coarse_refined_flat2.stl')
-    # distances = Points(points).distance_to(surface,invert=True, signed=True)
+# Plot the initial points and normals over the geometry for reference
+if rank == 0 and show_plots and not is_headless():
     geo_plot  = geometry.plot(show=False)
     scatter   = Points(points, r=2, c='green')
     arrows    = Arrows(points, points + 0.2*normals, c='red', s=0.5)
@@ -323,45 +321,11 @@ if rank == 0 and not is_headless():
     duplicate_points   = uniq[counts > 1]
     scatter_duplicates = Points(duplicate_points, r=2, c='yellow')
 
-
-
     scatter_face   = Points(face_centers, r=2, c='blue')
     arrows_face    = Arrows(face_centers, face_centers + 0.2*face_normals, c='orange', s=0.5)
-    show(geo_plot, scatter, arrows, scatter_duplicates, scatter_face, arrows_face, axes=1)
-    # # Create figure
-    # fig = plt.figure(figsize=(10, 8))
-    # ax = fig.add_subplot(111, projection='3d')
-
-    # # Plot points
-    # ax.scatter(points[:,0], points[:,1], points[:,2], color='red', s=5, alpha=0.6, label='Points')
-
-    # # Plot normals
-    # scale = 0.1  # adjust depending on mesh size
-    # ax.quiver(points[:,0], points[:,1], points[:,2],
-    #         normals[:,0], normals[:,1], normals[:,2],
-    #         length=scale, color='blue', normalize=True, label='Normals')
-
-    # # Set equal aspect ratio
-    # all_pts = points
-    # x_limits = (all_pts[:,0].min(), all_pts[:,0].max())
-    # y_limits = (all_pts[:,1].min(), all_pts[:,1].max())
-    # z_limits = (all_pts[:,2].min(), all_pts[:,2].max())
-    # max_range = max(x_limits[1]-x_limits[0], y_limits[1]-y_limits[0], z_limits[1]-z_limits[0]) / 2.0
-    # mid_x = np.mean(x_limits)
-    # mid_y = np.mean(y_limits)
-    # mid_z = np.mean(z_limits)
-    # ax.set_xlim(mid_x - max_range, mid_x + max_range)
-    # ax.set_ylim(mid_y - max_range, mid_y + max_range)
-    # ax.set_zlim(mid_z - max_range, mid_z + max_range)
-
-    # ax.set_xlabel('X')
-    # ax.set_ylabel('Y')
-    # ax.set_zlabel('Z')
-    # ax.set_title('Surface Points and Normals')
-    # plt.show()
+    show(geo_plot, scatter, arrows, scatter_duplicates, scatter_face, arrows_face, axes=1, interactive=interactive_plots)
 
 quiet_barrier(comm)
-#=============================
 
 
 # region Surface mesh projection
@@ -377,35 +341,6 @@ else:
         try:
             # # ORIGINAL CODE
             with Timer('projecting on surface mesh', rank, timing_enabled):
-                # n_surf = x_surf_dafoam_initial.shape[0]
-                # projected_surf_mesh_dafoam = []
-                # for i in range(n_surf):
-                #     print(f'{i}/{n_surf}: p {x_surf_dafoam_initial[i, :]}, n {normals[i, :]}')
-                #     projected_i = geometry.project(
-                #         x_surf_dafoam_initial[i, :], 
-                #         grid_search_density_parameter = 1 ,      # 1 
-                #         projection_tolerance          = 1e-3,   # 1.e-3m 
-                #         grid_search_density_cutoff    = 100,    # 20
-                #         force_reprojection            = False,
-                #         plot                          = False,
-                #         direction                     = normals[i, :]
-                #     )
-                #     print(f'projected {projected_i}')
-                #     projected_surf_mesh_dafoam.extend(projected_i)
-
-                problem_point_index = np.argmin(np.linalg.norm(x_surf_dafoam_initial - [23.68170823699935, 9.363806102035095, 0.9857894201215491], axis=1))
-                # x_surf_dafoam_initial[problem_point_index] -= [1e-6, 0, 0]
-
-                projected_surf_mesh_dafoam = geometry.project(
-                    x_surf_dafoam_initial[problem_point_index], 
-                    grid_search_density_parameter = 1,      # 1 
-                    projection_tolerance          = 1e-3,   # 1.e-3m 
-                    grid_search_density_cutoff    = 100,    # 20
-                    force_reprojection            = False,
-                    plot                          = True,
-                    direction                     = normals[problem_point_index],
-                    num_workers                   = 48
-                )
 
                 projected_surf_mesh_dafoam = geometry.project(
                     x_surf_dafoam_initial, 
@@ -413,31 +348,11 @@ else:
                     projection_tolerance          = 1e-3,   # 1.e-3m 
                     grid_search_density_cutoff    = 150,    # 20
                     force_reprojection            = False,
-                    plot                          = True,
+                    plot                          = show_plots and not is_headless(),
+                    interactive                   = interactive_plots,                     
                     direction                     = normals,
                     num_workers                   = 48
                 )
-
-            # # Debugging/timing
-            # import cProfile
-            # import pstats
-            # with cProfile.Profile() as pr:
-            #     projected_surf_mesh_dafoam = geometry.project(
-            #         x_surf_dafoam_initial, 
-            #         grid_search_density_parameter = 1,      # 1    
-            #         projection_tolerance          = 1e-2,   # 1.e-3m
-            #         grid_search_density_cutoff    = 1,     # 20
-            #         force_reprojection            = False,
-            #         plot                          = True,
-            #         # direction                     = [0, 0, 1],
-            #         num_workers                   = 4
-            #     )
-            # # Summarize top time-consuming functions
-            # stats = pstats.Stats(pr)
-            # stats.strip_dirs().sort_stats(pstats.SortKey.TIME).print_stats(30)
-
-            # print(projected_surf_mesh_dafoam)
-            # input('Press ENTER to continue')
 
             print('Writing surface mesh projection pickle...')
             write_simple_pickle(projected_surf_mesh_dafoam, surface_mesh_projection_file_path)
