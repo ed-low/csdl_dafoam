@@ -71,6 +71,7 @@ TIMING_ENABLED = True  # True if we want timing printed for the CSDL operations
 
 # DAFoam
 dafoam_directory = os.path.join(os.getcwd(), 'openfoam_airfoil/')
+dafoamPrintInterval = 100
 
 # Initial/reference values for DAFoam (best to use base conditions)
 U0        = 238.0         # used for normalizing CD and CL
@@ -147,7 +148,11 @@ da_options = {
             "patches": ["inout"],
             "components": ["solver", "function"],
         },
-    }
+    },
+    "writeAdjointFields": False,
+    "debug": True,
+    "printDAOptions": True,
+    "printInterval": dafoamPrintInterval
 }
 
 # region Mesh options
