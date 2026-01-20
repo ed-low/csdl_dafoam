@@ -64,8 +64,12 @@ def gather_array_to_rank0(x_local: np.ndarray, comm: MPI.Comm = MPI.COMM_WORLD):
     sizes = np.zeros(size, dtype=np.int32)
     comm.Allgather([local_npts, MPI.INT], [sizes, MPI.INT])
 
-    dim = x_local.shape[1]
-    counts = sizes * dim
+    if x_local.ndim > 1:
+        dim = x_local.shape[1]
+        counts = sizes * dim
+    else:
+        dim = -1
+        counts = sizes
     displacements = np.insert(np.cumsum(counts), 0, 0)[:-1]
 
     # Compute start/stop indices for slicing back full array
@@ -82,7 +86,10 @@ def gather_array_to_rank0(x_local: np.ndarray, comm: MPI.Comm = MPI.COMM_WORLD):
     comm.Gatherv(sendbuf, (recvbuf, counts, displacements, MPI.DOUBLE), root=0)
 
     if rank == 0:
-        x_full = recvbuf.reshape((-1, dim))
+        if dim == -1:
+            x_full = recvbuf.reshape((-1))
+        else:
+            x_full = recvbuf.reshape((-1, dim))
         return x_full, sizes, index_ranges
     else:
         return None, sizes, index_ranges
