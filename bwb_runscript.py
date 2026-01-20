@@ -2,9 +2,7 @@
 # region PACKAGES
 # ===============================
 import numpy as np
-import sys
 import os
-import pickle
 from pathlib import Path
 
 # MPI
@@ -61,13 +59,13 @@ comm           = MPI.COMM_WORLD
 timing_enabled = True  # True if we want timing printed for the CSDL operations
 
 # Plotting
-show_plots        = True
+show_plots        = False
 interactive_plots = False
 
 
 # DAFoam
 dafoam_directory    = os.path.join(os.getcwd(), 'openfoam_739k_bwb_symmetry/')
-dafoamPrintInterval = 1 # This doesn't actually seem to affect anything...
+dafoamPrintInterval = 100
 
 # Initial/reference values for DAFoam (best to use base conditions)
 # These correspond to M=0.75 @ 30k feet
@@ -134,9 +132,6 @@ da_options = {
     # transonic preconditioner to speed up the ff convergence
     "transonicPCOption": 2,
     "adjPCLag": 5,
-    # "adjEqnOption": {"gmresRelTol": 1.0e-6, "pcFillLevel": 1, "jacMatReOrdering": "rcm", "useNonZeroInitGuess": False},
-    # # transonic preconditioner to speed up the adjoint convergence
-    # "transonicPCOption": 1,
     "normalizeStates": {
         "U": U0,
         "p": p0,
@@ -170,7 +165,11 @@ da_options = {
             "patches": ["inout"],
             "components": ["solver", "function"],
         },
-    }
+    },
+    "writeAdjointFields": False,
+    "debug": True,
+    "printDAOptions": True,
+    "printInterval": dafoamPrintInterval,
 }
 
 # region Mesh options
@@ -219,6 +218,29 @@ geometry_pickle_file_path         = Path(geometry_directory)/geometry_pickle_fil
 stp_file_path                     = Path(geometry_directory)/stp_file_name
 surface_mesh_projection_file_path = Path(dafoam_directory)/f'projected_surface_mesh_{x_surf_hash}.pickle'
 
+# local_value = dafoam_instance.getNLocalAdjointStates()
+# total_value = comm.allreduce(local_value, op=MPI.SUM)
+# quiet_barrier(comm)
+# if rank ==0:
+#     print(total_value)
+#     input('Press ENTER to continue')
+# quiet_barrier(comm)
+
+
+# import time
+# start = time.process_time()
+# dafoam_instance.getResiduals()
+# processor_time = time.process_time() - start
+
+# total_processor_time   = comm.allreduce(processor_time, op=MPI.SUM)
+# average_processor_time = total_processor_time/comm_size
+
+# quiet_barrier(comm)
+# if rank == 0:
+#     print(f'Total processor time: {total_processor_time}')
+#     print(f'Average processor time: {average_processor_time}')
+#     input('Press ENTER to continue...')
+# quiet_barrier(comm)
 
 
 # ===============================
@@ -502,7 +524,7 @@ with csdl.experimental.mpi.enter_mpi_region(rank, comm) as mpi_region:
 # 5: Maximize CL/CD wrt angle-of-attack and wing shape
 # 6: Maximize CL/CD wrt angle-of-attack, wing shape (thickness/camber ffd) and wing twists
 # 7: Maximize CL/CD wrt angle-of-attack, wing shape (camber ffd) and wing twists
-optimization_case = 7
+optimization_case = 5
 
 
 if optimization_case == 1:
@@ -679,7 +701,11 @@ prob        = CSDLAlphaProblem(problem_name=f'{problem_name}_rank{rank_str}', si
 open_sqp_options = {'maxiter': 40,
                     'readable_outputs': ['x'],
                     'recording': True,
-                    'ls_max_step': 1.0}
+                    'ls_max_step': 0.05}
+if rank == 0:
+    print("OpenSQP options:")
+    print(f"{open_sqp_options}")
+
 optimizer   = OpenSQP(prob, **open_sqp_options)
 optimizer.solve()
 optimizer.print_results()
