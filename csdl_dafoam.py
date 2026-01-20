@@ -1439,3 +1439,732 @@ class DAFoamROM2(csdl.experimental.CustomImplicitOperation):
             dafoam_instance.setStates(y_fom) 
 
             return J_rom
+        
+
+
+
+
+import matplotlib.pyplot as plt
+# region DAFOAMROM3
+class DAFoamROM3(csdl.experimental.CustomImplicitOperation):
+    def __init__(self, 
+                 dafoam_instance,
+                 pod_modes:np.array         =None,
+                 fom_ref_state:np.array     =None, 
+                 tolerance                  =1e-6, 
+                 max_iters:int              =100, 
+                 update_jac_frequency:int   =10,
+                 num_initial_jac_updates:int=1, 
+                 weights:np.array           =None,
+                 scaling_factors:np.array   =None,
+                 rom_type:str               ='galerkin',
+                 root_method:str            ='lm'):
+
+        super().__init__()
+        self.dafoam_instance        = dafoam_instance
+        self.tolerance              = tolerance
+        self.max_iters              = max_iters
+        self.solution_counter       = 1
+        self.update_jac_frequency   = update_jac_frequency if update_jac_frequency > 0 else np.nan
+        self.num_initial_jac_updates= num_initial_jac_updates
+        self.reduced_jacobian       = None
+        self.n_local_state_elements = dafoam_instance.getNLocalAdjointStates()
+        self.n_local_cells          = dafoam_instance.solver.getNLocalCells()
+
+        # Do some checks here to assign default values if none passed. Alert user if none are passed.
+        if weights is None:
+            print('No weights passed to DAFoamROM. Assuming no weighting used in POD mode computation...')
+            self.weights = np.ones((dafoam_instance.getNLocalAdjointStates(), ))
+        else:
+            self.weights = weights
+
+        if scaling_factors is None:
+            print('No weights passed to DAFoamROM. Assuming no scaling factor used in POD mode computation...')
+            self.scaling_factors = np.ones((dafoam_instance.getNLocalAdjointStates(), ))
+        else:
+            self.scaling_factors = scaling_factors
+
+        if fom_ref_state is None:
+            print('No FOM reference state passed to DAFoamROM. Assuming no mean/reference subtraction used in POD mode computation...')
+            self.fom_ref_state = np.ones((dafoam_instance.getNLocalAdjointStates(), ))
+        else:
+            self.fom_ref_state = fom_ref_state
+        
+        self.fom_ref_residual  = self._compute_fom_residuals(fom_ref_state)
+
+        if pod_modes is None:
+            print('No POD modes passed to DAFoamROM. Expecting POD modes as CSDL variable for the evaluate method...')
+        else:
+            print('POD modes passed to DAFoamROM. Assuming constant/global POD modes unless modes are passed to the evaluate method...')
+        
+        self.pod_modes   = pod_modes
+
+        self.rom_type    = rom_type
+        self.root_method = root_method
+        self.counter     = 0
+
+        
+    # region evaluate
+    def evaluate(self, dafoam_input_variables_group:csdl.VariableGroup, pod_modes:csdl.Variable=None, design_variable_configuration:csdl.Variable=None):
+        
+        # Read daOptions to set proper inputs
+        inputDict = self.dafoam_instance.getOption("inputInfo")
+        for inputName in inputDict.keys():
+            if "solver" in inputDict[inputName]["components"]:
+                self.declare_input(inputName, getattr(dafoam_input_variables_group, inputName))
+
+        # Set our basis as an input variable if not already set to a constant
+        if pod_modes is not None:
+            if self.pod_modes is None:
+                print('POD modes passed to DAFoamROM evalute method. Neglecting constant/global modes passed in initialization.')
+            self.declare_input('pod_modes', pod_modes)
+            num_modes = pod_modes.value.shape[1]
+            self.pod_modes_is_csdl_var = True
+        else:
+            if self.pod_modes is None:
+                TypeError('No POD modes assigned to ROM. Please pass a constant POD mode set during initialization, or a POD mode set in the evaluate section.')
+            else: # Constant POD mode case
+                num_modes = self.pod_modes.shape[1]
+                self.pod_modes_is_csdl_var = False
+                
+                # Check to make sure the POD modes are orthogonal under given weights
+                print('Checking weighted inner product of supplied constant POD modes')
+                weighted_inner_product = self.pod_modes.T @ (self.weights[:, None] * self.pod_modes)
+                I                      = np.eye(weighted_inner_product.shape[0])
+                fro_error              = np.linalg.norm(weighted_inner_product - I, ord='fro')
+                max_entry_error        = np.max(np.abs(weighted_inner_product - I))
+
+                print(f'Frobenius error: {fro_error}')
+                print(f'Max entry error: {max_entry_error}')
+
+                if fro_error > 1e-6:
+                    print(f'WARNING: high error detected (fro_error, {fro_error} > 1e-6)')         
+        
+        # Set outputs
+        dafoam_rom_states = self.create_output('dafoam_rom_states', (num_modes,))
+
+        return dafoam_rom_states
+
+
+    # region solve_residual_equations
+    def solve_residual_equations(self, input_vals, output_vals):
+        from scipy.optimize import root, least_squares
+
+        dafoam_instance = self.dafoam_instance
+
+        # Solver parameters/options (not all have been exposed as options yet. Tweak here if necessary.)
+        root_method     = self.root_method
+       
+        # Check if we're working with the pod modes as a constant or as a variable
+        pod_modes_is_csdl_var = self.pod_modes_is_csdl_var
+
+        # Some important quanitites
+        y_fom_ref  = self.fom_ref_state
+        W          = self.weights
+        D          = self.scaling_factors
+        phi        = input_vals['pod_modes'] if pod_modes_is_csdl_var else self.pod_modes
+        num_modes  = phi.shape[1]
+        
+        # MPI stuff
+        # TODO: will have to make this all MPI compatible eventually
+        rank = dafoam_instance.rank
+
+        # Make sure solver is updated with the most recent input values
+        dafoam_instance.set_solver_input(input_vals)
+
+        # We also need to just calculate the residual for the AD mode to initialize vars like URes
+        # We do not print the residual for AD, though
+        # NOTE: This was taken from DAFoamSolver.solve_residual_equation
+        dafoam_instance.solverAD.calcPrimalResidualStatistics("calc")
+        
+        # Initialize our ROM/FOM states and ROM/FOM residuals
+        y_rom = np.zeros((num_modes, ))
+        self.r_rom_old = y_rom.copy()
+
+        result = root(lambda x: self._compute_rom_residual_and_jacobian(x, phi, W, D), y_rom, method=root_method, jac=True)
+
+        print(result)
+        y_rom     = result.x
+        converged = result.success
+
+        self.counter = -1
+
+        # Return NaN array as output if failed (for the OpenSQP optimizer), otherwise return rom states
+        if converged:
+            print('\n\n Specified tolerance reached!')
+            # Update reduced jacobain to most recent state
+            print('Updating Jacobian to most recent state value...')
+            J_rom = self._compute_rom_residual_and_jacobian(y_rom, phi, W, D)[1]
+            self.reduced_jacobian = J_rom
+
+            output_vals['dafoam_rom_states'] = y_rom
+
+        else:
+            print('Warning: ROM iteration limit reached!')
+            output_vals['dafoam_rom_states'] = np.full((num_modes, ), np.nan)
+
+
+    # region _estimate_jac_mat_product
+    def _estimate_jac_mat_product(self, M, y_fom):
+        
+        JM              = np.zeros_like(M)
+        r_fom_current   = self._compute_fom_residuals(y_fom)
+
+        eps_machine = np.finfo(float).eps
+        min_eps         = 1e-8
+        
+        for i_column in range(M.shape[1]):
+            eps             = max(np.sqrt(eps_machine)*(1 + np.linalg.norm(M[:, i_column])), min_eps)
+            r_fom_perturb   = self._compute_fom_residuals(y_fom + eps * M[:, i_column])
+
+            JM[:, i_column] = (r_fom_perturb - r_fom_current)/eps
+        
+        return JM
+
+
+    # region _compute_fom_residuals
+    def _compute_fom_residuals(self, y_fom):
+        dafoam_instance = self.dafoam_instance
+        
+        # Save current state so we can revert to it later
+        hold_states = dafoam_instance.getStates()
+
+        # Set states and get residuals
+        dafoam_instance.setStates(y_fom)
+        r_fom = dafoam_instance.getResiduals()
+
+        # Revert to original states
+        dafoam_instance.setStates(hold_states)
+
+        return r_fom
+    
+
+    # region _compute_rom_residual_and_jacobian
+    def _compute_rom_residual_and_jacobian(self, y_rom, phi, W, D, compute_jacobian=True):
+        dafoam_instance = self.dafoam_instance
+        rom_type  = self.rom_type
+        y_fom_ref = self.fom_ref_state
+
+        y_fom     = y_fom_ref + D * (phi @ y_rom)
+        r_fom     = self._compute_fom_residuals(y_fom)
+        r_fom_ref = self.fom_ref_residual
+
+        if rom_type.lower() == 'galerkin':
+            psi   = phi
+
+        elif rom_type.lower() == 'petrov-galerkin':
+            psi   = self._estimate_jac_mat_product(phi, y_fom)
+        
+        r_rom = psi.T @ (W * r_fom)
+
+        width = 10
+        
+        print(f"Step {self.counter}")
+        for i, vec in enumerate([y_rom, r_rom], start=1):
+            row = " ".join(f"{x:{width}.3e}" for x in vec)
+            print(f"{row}")
+
+        print(f'r_(k+1) - r_k/r_k: {(np.linalg.norm(r_rom) - np.linalg.norm(self.r_rom_old))/np.linalg.norm(self.r_rom_old)}')
+
+        
+        self.r_rom_old = r_rom
+        self.counter += 1
+
+        if compute_jacobian:
+            J_rom = psi.T @ (W[:, None] * self._estimate_jac_mat_product(D[:, None] * phi, y_fom))
+            print(f'JTr/r: {np.linalg.norm(J_rom.T@r_rom)/np.linalg.norm(r_rom)}')
+            return r_rom, J_rom
+        else:
+            return r_rom
+
+
+
+
+
+
+
+
+
+
+import matplotlib.pyplot as plt
+# region DAFOAMROM4
+class DAFoamROM4(csdl.experimental.CustomImplicitOperation):
+    def __init__(self, 
+                 dafoam_instance,
+                 pod_modes:np.array         =None,
+                 fom_ref_state:np.array     =None, 
+                 tolerance                  =1e-6, 
+                 max_iters:int              =100, 
+                 update_jac_frequency:int   =10,
+                 num_initial_jac_updates:int=1, 
+                 weights:np.array           =None,
+                 rom_type:str               ='petrov-galerkin',
+                 root_method:str            ='lm',
+                 scaling_factors:np.array   =None):
+
+        super().__init__()
+        self.dafoam_instance        = dafoam_instance
+        self.tolerance              = tolerance
+        self.max_iters              = max_iters
+        self.solution_counter       = 1
+        self.update_jac_frequency   = update_jac_frequency if update_jac_frequency > 0 else np.nan
+        self.num_initial_jac_updates= num_initial_jac_updates
+        self.reduced_jacobian       = None
+        self.n_local_state_elements = dafoam_instance.getNLocalAdjointStates()
+        self.n_local_cells          = dafoam_instance.solver.getNLocalCells()
+
+        # Do some checks here to assign default values if none passed. Alert user if none are passed.
+        if weights is None:
+            print('No weights passed to DAFoamROM. Assuming no weighting used in POD mode computation...')
+            self.weights = np.ones((dafoam_instance.getNLocalAdjointStates(), ))
+        else:
+            self.weights = weights
+
+        if scaling_factors is None:
+            print('No weights passed to DAFoamROM. Assuming no scaling factor used in POD mode computation...')
+            self.scaling_factors = np.ones((dafoam_instance.getNLocalAdjointStates(), ))
+        else:
+            self.scaling_factors = scaling_factors
+
+        if fom_ref_state is None:
+            print('No FOM reference state passed to DAFoamROM. Assuming no mean/reference subtraction used in POD mode computation...')
+            self.fom_ref_state = np.ones((dafoam_instance.getNLocalAdjointStates(), ))
+        else:
+            self.fom_ref_state = fom_ref_state
+        
+        self.fom_ref_residual  = self._compute_fom_residuals(fom_ref_state)
+
+        if pod_modes is None:
+            print('No POD modes passed to DAFoamROM. Expecting POD modes as CSDL variable for the evaluate method...')
+        else:
+            print('POD modes passed to DAFoamROM. Assuming constant/global POD modes unless modes are passed to the evaluate method...')
+        
+        self.pod_modes   = pod_modes
+
+        self.rom_type    = rom_type
+        self.root_method = root_method
+        self.counter     = 0
+
+        
+    # region evaluate
+    def evaluate(self, dafoam_input_variables_group:csdl.VariableGroup, pod_modes:csdl.Variable=None, design_variable_configuration:csdl.Variable=None):
+        
+        # Read daOptions to set proper inputs
+        inputDict = self.dafoam_instance.getOption("inputInfo")
+        for inputName in inputDict.keys():
+            if "solver" in inputDict[inputName]["components"]:
+                self.declare_input(inputName, getattr(dafoam_input_variables_group, inputName))
+
+        # Set our basis as an input variable if not already set to a constant
+        if pod_modes is not None:
+            if self.pod_modes is None:
+                print('POD modes passed to DAFoamROM evalute method. Neglecting constant/global modes passed in initialization.')
+            self.declare_input('pod_modes', pod_modes)
+            num_modes = pod_modes.value.shape[1]
+            self.pod_modes_is_csdl_var = True
+        else:
+            if self.pod_modes is None:
+                TypeError('No POD modes assigned to ROM. Please pass a constant POD mode set during initialization, or a POD mode set in the evaluate section.')
+            else: # Constant POD mode case
+                num_modes = self.pod_modes.shape[1]
+                self.pod_modes_is_csdl_var = False
+                
+                # Check to make sure the POD modes are orthogonal under given weights
+                print('Checking weighted inner product of supplied constant POD modes')
+                weighted_inner_product = self.pod_modes.T @ (self.weights[:, None] * self.pod_modes)
+                I                      = np.eye(weighted_inner_product.shape[0])
+                fro_error              = np.linalg.norm(weighted_inner_product - I, ord='fro')
+                max_entry_error        = np.max(np.abs(weighted_inner_product - I))
+
+                print(f'Frobenius error: {fro_error}')
+                print(f'Max entry error: {max_entry_error}')
+
+                if fro_error > 1e-6:
+                    print(f'WARNING: high error detected (fro_error, {fro_error} > 1e-6)')         
+        
+        # Set outputs
+        dafoam_rom_states = self.create_output('dafoam_rom_states', (num_modes,))
+
+        return dafoam_rom_states
+
+
+    # region solve_residual_equations
+    def solve_residual_equations(self, input_vals, output_vals):
+        from scipy.optimize import root, least_squares
+
+        dafoam_instance = self.dafoam_instance
+
+        # Solver parameters/options (not all have been exposed as options yet. Tweak here if necessary.)
+        root_method     = self.root_method
+       
+        # Check if we're working with the pod modes as a constant or as a variable
+        pod_modes_is_csdl_var = self.pod_modes_is_csdl_var
+
+        # Some important quanitites
+        y_fom_ref  = self.fom_ref_state
+        W          = self.weights
+        phi        = input_vals['pod_modes'] if pod_modes_is_csdl_var else self.pod_modes
+        num_modes  = phi.shape[1]
+        
+        # MPI stuff
+        # TODO: will have to make this all MPI compatible eventually
+        rank = dafoam_instance.rank
+
+        # Make sure solver is updated with the most recent input values
+        dafoam_instance.set_solver_input(input_vals)
+
+        # We also need to just calculate the residual for the AD mode to initialize vars like URes
+        # We do not print the residual for AD, though
+        # NOTE: This was taken from DAFoamSolver.solve_residual_equation
+        dafoam_instance.solverAD.calcPrimalResidualStatistics("calc")
+        
+        # Initialize our ROM/FOM states and ROM/FOM residuals
+        y_rom = np.zeros((num_modes, ))
+        self.r_rom_old = y_rom.copy()
+        # phi_eff = D[:, None] * phi
+        # phi_hat = phi_eff.copy()
+        # for j in range(num_modes):
+        #     print(np.dot(phi_eff[:,j], W * phi_eff[:,j]))
+        #     s_j     = np.sqrt(np.dot(phi_eff[:,j], W * phi_eff[:,j]))
+        #     phi_hat[:, j] /= s_j
+        # print(phi_hat.shape)
+        # print(phi_hat.T @ (W[:, None] * phi_hat))
+        result  = root(lambda x: self._compute_rom_residual_and_jacobian(x, phi, W), y_rom, method=root_method, jac=True)
+
+        print(result)
+        y_rom     = result.x
+        converged = result.success
+
+        self.counter = -1
+
+        # Return NaN array as output if failed (for the OpenSQP optimizer), otherwise return rom states
+        if converged:
+            print('\n\n Specified tolerance reached!')
+            # Update reduced jacobain to most recent state
+            print('Updating Jacobian to most recent state value...')
+            J_rom = self._compute_rom_residual_and_jacobian(y_rom, phi, W)[1]
+            self.reduced_jacobian = J_rom
+
+            output_vals['dafoam_rom_states'] = y_rom
+
+        else:
+            print('Warning: ROM iteration limit reached!')
+            output_vals['dafoam_rom_states'] = np.full((num_modes, ), np.nan)
+
+
+    # region _estimate_jac_mat_product
+    def _estimate_jac_mat_product(self, M, y_fom):
+        
+        JM              = np.zeros_like(M)
+        r_fom_current   = self._compute_fom_residuals(y_fom)
+
+        eps_machine = np.finfo(float).eps
+        min_eps         = 1e-8
+        
+        for i_column in range(M.shape[1]):
+            eps             = max(np.sqrt(eps_machine)*(1 + np.linalg.norm(M[:, i_column])), min_eps)
+            r_fom_perturb   = self._compute_fom_residuals(y_fom + eps * M[:, i_column])
+
+            JM[:, i_column] = (r_fom_perturb - r_fom_current)/eps
+        
+        return JM
+
+
+    # region _compute_fom_residuals
+    def _compute_fom_residuals(self, y_fom):
+        dafoam_instance = self.dafoam_instance
+        
+        # Save current state so we can revert to it later
+        hold_states = dafoam_instance.getStates()
+
+        # Set states and get residuals
+        dafoam_instance.setStates(y_fom)
+        r_fom = dafoam_instance.getResiduals()
+
+        # Revert to original states
+        dafoam_instance.setStates(hold_states)
+
+        return r_fom
+    
+
+    # region _compute_rom_residual_and_jacobian
+    def _compute_rom_residual_and_jacobian(self, y_rom, phi, W, compute_jacobian=True):
+        dafoam_instance = self.dafoam_instance
+        rom_type  = self.rom_type
+        y_fom_ref = self.fom_ref_state
+
+        y_fom     = y_fom_ref + self.scaling_factors * (phi @ y_rom)
+        r_fom     = self._compute_fom_residuals(y_fom)
+        r_fom_ref = self.fom_ref_residual
+
+        if rom_type.lower() == 'galerkin':
+            psi   = phi
+
+        elif rom_type.lower() == 'petrov-galerkin':
+            psi   = self._estimate_jac_mat_product(phi, y_fom)
+        
+        r_rom = psi.T @ (W * r_fom)
+
+        width = 10
+        
+        print(f"Step {self.counter}")
+        for i, vec in enumerate([y_rom, r_rom], start=1):
+            row = " ".join(f"{x:{width}.3e}" for x in vec)
+            print(f"{row}")
+
+        print(f'r_(k+1) - r_k/r_k: {(np.linalg.norm(r_rom) - np.linalg.norm(self.r_rom_old))/np.linalg.norm(self.r_rom_old)}')
+
+        
+        self.r_rom_old = r_rom
+        self.counter += 1
+
+        if compute_jacobian:
+            J_rom = psi.T @ (W[:, None] * psi)
+            print(f'JTr/r: {np.linalg.norm(J_rom.T@r_rom)/np.linalg.norm(r_rom)}')
+            return r_rom, J_rom
+        else:
+            return r_rom
+        
+
+
+
+
+
+import matplotlib.pyplot as plt
+# region DAFOAMROM4MPI
+class DAFoamROM4MPI(csdl.experimental.CustomImplicitOperation):
+    def __init__(self, 
+                 dafoam_instance,
+                 pod_modes:np.array         =None,
+                 fom_ref_state:np.array     =None, 
+                 tolerance                  =1e-6, 
+                 max_iters:int              =100, 
+                 update_jac_frequency:int   =10,
+                 num_initial_jac_updates:int=1, 
+                 weights:np.array           =None,
+                 rom_type:str               ='petrov-galerkin',
+                 root_method:str            ='lm',
+                 scaling_factors:np.array   =None):
+
+        super().__init__()
+        self.dafoam_instance        = dafoam_instance
+        self.tolerance              = tolerance
+        self.max_iters              = max_iters
+        self.solution_counter       = 1
+        self.update_jac_frequency   = update_jac_frequency if update_jac_frequency > 0 else np.nan
+        self.num_initial_jac_updates= num_initial_jac_updates
+        self.reduced_jacobian       = None
+        self.n_local_state_elements = dafoam_instance.getNLocalAdjointStates()
+        self.n_local_cells          = dafoam_instance.solver.getNLocalCells()
+
+        # Do some checks here to assign default values if none passed. Alert user if none are passed.
+        if weights is None:
+            print('No weights passed to DAFoamROM. Assuming no weighting used in POD mode computation...')
+            self.weights = np.ones((dafoam_instance.getNLocalAdjointStates(), ))
+        else:
+            self.weights = weights
+
+        if scaling_factors is None:
+            print('No weights passed to DAFoamROM. Assuming no scaling factor used in POD mode computation...')
+            self.scaling_factors = np.ones((dafoam_instance.getNLocalAdjointStates(), ))
+        else:
+            self.scaling_factors = scaling_factors
+
+        if fom_ref_state is None:
+            print('No FOM reference state passed to DAFoamROM. Assuming no mean/reference subtraction used in POD mode computation...')
+            self.fom_ref_state = np.ones((dafoam_instance.getNLocalAdjointStates(), ))
+        else:
+            self.fom_ref_state = fom_ref_state
+        
+        self.fom_ref_residual  = self._compute_fom_residuals(fom_ref_state)
+
+        if pod_modes is None:
+            print('No POD modes passed to DAFoamROM. Expecting POD modes as CSDL variable for the evaluate method...')
+        else:
+            print('POD modes passed to DAFoamROM. Assuming constant/global POD modes unless modes are passed to the evaluate method...')
+        
+        self.pod_modes   = pod_modes
+
+        self.rom_type    = rom_type
+        self.root_method = root_method
+        self.counter     = 0
+
+        
+    # region evaluate
+    def evaluate(self, dafoam_input_variables_group:csdl.VariableGroup, pod_modes:csdl.Variable=None, design_variable_configuration:csdl.Variable=None):
+        
+        # Read daOptions to set proper inputs
+        inputDict = self.dafoam_instance.getOption("inputInfo")
+        for inputName in inputDict.keys():
+            if "solver" in inputDict[inputName]["components"]:
+                self.declare_input(inputName, getattr(dafoam_input_variables_group, inputName))
+
+        # Set our basis as an input variable if not already set to a constant
+        if pod_modes is not None:
+            if self.pod_modes is None:
+                print('POD modes passed to DAFoamROM evalute method. Neglecting constant/global modes passed in initialization.')
+            self.declare_input('pod_modes', pod_modes)
+            num_modes = pod_modes.value.shape[1]
+            self.pod_modes_is_csdl_var = True
+        else:
+            if self.pod_modes is None:
+                TypeError('No POD modes assigned to ROM. Please pass a constant POD mode set during initialization, or a POD mode set in the evaluate section.')
+            else: # Constant POD mode case
+                num_modes = self.pod_modes.shape[1]
+                self.pod_modes_is_csdl_var = False
+                
+                # Check to make sure the POD modes are orthogonal under given weights
+                print('Checking weighted inner product of supplied constant POD modes')
+                weighted_inner_product = self.pod_modes.T @ (self.weights[:, None] * self.pod_modes)
+                I                      = np.eye(weighted_inner_product.shape[0])
+                fro_error              = np.linalg.norm(weighted_inner_product - I, ord='fro')
+                max_entry_error        = np.max(np.abs(weighted_inner_product - I))
+
+                print(f'Frobenius error: {fro_error}')
+                print(f'Max entry error: {max_entry_error}')
+
+                if fro_error > 1e-6:
+                    print(f'WARNING: high error detected (fro_error, {fro_error} > 1e-6)')         
+        
+        # Set outputs
+        dafoam_rom_states = self.create_output('dafoam_rom_states', (num_modes,))
+
+        return dafoam_rom_states
+
+
+    # region solve_residual_equations
+    def solve_residual_equations(self, input_vals, output_vals):
+        from scipy.optimize import root, least_squares
+
+        dafoam_instance = self.dafoam_instance
+
+        # Solver parameters/options (not all have been exposed as options yet. Tweak here if necessary.)
+        root_method     = self.root_method
+       
+        # Check if we're working with the pod modes as a constant or as a variable
+        pod_modes_is_csdl_var = self.pod_modes_is_csdl_var
+
+        # Some important quanitites
+        y_fom_ref  = self.fom_ref_state
+        W          = self.weights
+        phi        = input_vals['pod_modes'] if pod_modes_is_csdl_var else self.pod_modes
+        num_modes  = phi.shape[1]
+        
+        # MPI stuff
+        # TODO: will have to make this all MPI compatible eventually
+        rank = dafoam_instance.rank
+
+        # Make sure solver is updated with the most recent input values
+        dafoam_instance.set_solver_input(input_vals)
+
+        # We also need to just calculate the residual for the AD mode to initialize vars like URes
+        # We do not print the residual for AD, though
+        # NOTE: This was taken from DAFoamSolver.solve_residual_equation
+        dafoam_instance.solverAD.calcPrimalResidualStatistics("calc")
+        
+        # Initialize our ROM/FOM states and ROM/FOM residuals
+        y_rom = np.zeros((num_modes, ))
+        self.r_rom_old = y_rom.copy()
+        # phi_eff = D[:, None] * phi
+        # phi_hat = phi_eff.copy()
+        # for j in range(num_modes):
+        #     print(np.dot(phi_eff[:,j], W * phi_eff[:,j]))
+        #     s_j     = np.sqrt(np.dot(phi_eff[:,j], W * phi_eff[:,j]))
+        #     phi_hat[:, j] /= s_j
+        # print(phi_hat.shape)
+        # print(phi_hat.T @ (W[:, None] * phi_hat))
+        result  = root(lambda x: self._compute_rom_residual_and_jacobian(x, phi, W), y_rom, method=root_method, jac=True)
+
+        print(result)
+        y_rom     = result.x
+        converged = result.success
+
+        self.counter = -1
+
+        # Return NaN array as output if failed (for the OpenSQP optimizer), otherwise return rom states
+        if converged:
+            print('\n\n Specified tolerance reached!')
+            # Update reduced jacobain to most recent state
+            print('Updating Jacobian to most recent state value...')
+            J_rom = self._compute_rom_residual_and_jacobian(y_rom, phi, W)[1]
+            self.reduced_jacobian = J_rom
+
+            output_vals['dafoam_rom_states'] = y_rom
+
+        else:
+            print('Warning: ROM iteration limit reached!')
+            output_vals['dafoam_rom_states'] = np.full((num_modes, ), np.nan)
+
+
+    # region _estimate_jac_mat_product
+    def _estimate_jac_mat_product(self, M, y_fom):
+        
+        JM              = np.zeros_like(M)
+        r_fom_current   = self._compute_fom_residuals(y_fom)
+
+        eps_machine = np.finfo(float).eps
+        min_eps         = 1e-8
+        
+        for i_column in range(M.shape[1]):
+            eps             = max(np.sqrt(eps_machine)*(1 + np.linalg.norm(M[:, i_column])), min_eps)
+            r_fom_perturb   = self._compute_fom_residuals(y_fom + eps * M[:, i_column])
+
+            JM[:, i_column] = (r_fom_perturb - r_fom_current)/eps
+        
+        return JM
+
+
+    # region _compute_fom_residuals
+    def _compute_fom_residuals(self, y_fom):
+        dafoam_instance = self.dafoam_instance
+        
+        # Save current state so we can revert to it later
+        hold_states = dafoam_instance.getStates()
+
+        # Set states and get residuals
+        dafoam_instance.setStates(y_fom)
+        r_fom = dafoam_instance.getResiduals()
+
+        # Revert to original states
+        dafoam_instance.setStates(hold_states)
+
+        return r_fom
+    
+
+    # region _compute_rom_residual_and_jacobian
+    def _compute_rom_residual_and_jacobian(self, y_rom, phi, W, compute_jacobian=True):
+        dafoam_instance = self.dafoam_instance
+        rom_type  = self.rom_type
+        y_fom_ref = self.fom_ref_state
+
+        y_fom     = y_fom_ref + self.scaling_factors * (phi @ y_rom)
+        r_fom     = self._compute_fom_residuals(y_fom)
+        r_fom_ref = self.fom_ref_residual
+
+        if rom_type.lower() == 'galerkin':
+            psi   = phi
+
+        elif rom_type.lower() == 'petrov-galerkin':
+            psi   = self._estimate_jac_mat_product(phi, y_fom)
+        
+        r_rom = psi.T @ (W * r_fom)
+
+        width = 10
+        
+        print(f"Step {self.counter}")
+        for i, vec in enumerate([y_rom, r_rom], start=1):
+            row = " ".join(f"{x:{width}.3e}" for x in vec)
+            print(f"{row}")
+
+        print(f'r_(k+1) - r_k/r_k: {(np.linalg.norm(r_rom) - np.linalg.norm(self.r_rom_old))/np.linalg.norm(self.r_rom_old)}')
+
+        
+        self.r_rom_old = r_rom
+        self.counter += 1
+
+        if compute_jacobian:
+            J_rom = psi.T @ (W[:, None] * psi)
+            print(f'JTr/r: {np.linalg.norm(J_rom.T@r_rom)/np.linalg.norm(r_rom)}')
+            return r_rom, J_rom
+        else:
+            return r_rom
