@@ -15,6 +15,8 @@ def write_snapshot(
     grassmann_configuration=None,
     snapshot_parameter_labels=None,
     grassmann_parameter_labels=None,
+    vertex_coordinates:PETSc.Vec=None,
+    centroid_coordinates:PETSc.Vec=None,
     converged=True,
     reference_snapshot=False,
     comm=MPI.COMM_WORLD,
@@ -48,9 +50,19 @@ def write_snapshot(
     rank = comm.Get_rank()
 
     # PETSc vector distribution info
-    start, end = states.getOwnershipRange()
-    local_states = states.getArray()
-    global_size = states.getSize()
+    START_state, END_state = states.getOwnershipRange()
+    local_states           = states.getArray()
+    GLOBAL_SIZE_states     = states.getSize()
+
+    START_vert, END_vert = vertex_coordinates.getOwnershipRange()
+    local_vert_coords    = vertex_coordinates.getArray()
+    GLOBAL_SIZE_vert     = vertex_coordinates.getSize()
+
+    START_centroid, END_centroid = centroid_coordinates.getOwnershipRange()
+    local_centroid_coords        = centroid_coordinates.getArray()
+    GLOBAL_SIZE_centroid         = centroid_coordinates.getSize()
+
+
 
     # Open file in parallel mode
     with h5py.File(filename, "a", driver="mpio", comm=comm) as f:
@@ -58,11 +70,16 @@ def write_snapshot(
         if not reference_snapshot and "snapshots" not in f:
             if rank == 0 and snapshot_configurations is None:
                 raise ValueError("snapshot_configurations required on first write")
+            
             n_snapshots = snapshot_configurations.shape[0] if snapshot_configurations is not None else snapshot_index + 1
+            
+            f.create_dataset("snapshots",             (GLOBAL_SIZE_states,   n_snapshots), dtype="f8")
+            f.create_dataset("vertex_coordinates",    (GLOBAL_SIZE_vert,     n_snapshots), dtype="f8")
+            f.create_dataset("centroid_coordinates",  (GLOBAL_SIZE_centroid, n_snapshots), dtype="f8")
+            f.create_dataset("converged",             (n_snapshots,), dtype="bool")
+            f.create_dataset("last_written_snapshot", (), dtype="i8")
+           
             if rank == 0:
-                f.create_dataset("snapshots", (global_size, n_snapshots), dtype="f8")
-                f.create_dataset("converged", (n_snapshots,), dtype="bool")
-                f.create_dataset("last_written_snapshot", (), dtype="i8")
                 f["last_written_snapshot"][()] = -1
             comm.Barrier()
 
@@ -70,34 +87,57 @@ def write_snapshot(
         if reference_snapshot:
             # Create reference snapshot dataset if it does not exist
             if "reference_snapshot" not in f:
-                f.create_dataset("reference_snapshot", (global_size,), dtype="f8")
+                f.create_dataset("reference_snapshot", (GLOBAL_SIZE_states,), dtype="f8")
             # Write the reference snapshot
-            f["reference_snapshot"][start:end] = local_states
+            f["reference_snapshot"][START_state:END_state] = local_states
+
+            if "reference_vertex_coordinates" not in f:
+                f.create_dataset("reference_vertex_coordinates", (GLOBAL_SIZE_vert,), dtype="f8")
+            # Write the reference coordinates
+            f["reference_vertex_coordinates"][START_vert:END_vert] = local_vert_coords
+
+            if "reference_centroid_coordinates" not in f:
+                f.create_dataset("reference_centroid_coordinates", (GLOBAL_SIZE_centroid,), dtype="f8")
+            # Write the reference coordinates
+            f["reference_centroid_coordinates"][START_centroid:END_centroid] = local_centroid_coords
 
             if "reference_converged" not in f:
                 f.create_dataset("reference_converged", data=converged, dtype="bool")
         else:
             # Normal snapshot written to main dataset
             dset = f["snapshots"]
-            dset[start:end, snapshot_index] = local_states
+            dset[START_state:END_state, snapshot_index] = local_states
+
+            if local_vert_coords is not None:
+                dset_vert_coords = f["vertex_coordinates"]
+                dset_vert_coords[START_vert:END_vert, snapshot_index] = local_vert_coords
+
+            if local_centroid_coords is not None:
+                dset_centroid_coords = f["centroid_coordinates"]
+                dset_centroid_coords[START_centroid:END_centroid, snapshot_index] = local_centroid_coords
 
             # Metadata updates
             if rank == 0:
                 f["converged"][snapshot_index] = converged
                 f["last_written_snapshot"][()] = snapshot_index
 
-        # --- Write other metadata only once ---
-        if rank == 0:
-            if snapshot_configurations is not None and "snapshot_configurations" not in f:
-                f.create_dataset("snapshot_configurations", data=snapshot_configurations)
-            if grassmann_configuration is not None and "grassmann_configuration" not in f:
-                f.create_dataset("grassmann_configuration", data=grassmann_configuration)
+        # --- Write other metadata ---
+        if snapshot_configurations is not None and "snapshot_configurations" not in f:
+            f.create_dataset("snapshot_configurations", data=snapshot_configurations)
+        if grassmann_configuration is not None and "grassmann_configuration" not in f:
+            f.create_dataset("grassmann_configuration", data=grassmann_configuration)
 
-            dt = h5py.string_dtype(encoding="utf-8")
-            if snapshot_parameter_labels is not None and "snapshot_parameter_labels" not in f:
-                f.create_dataset("snapshot_parameter_labels", data=np.array(snapshot_parameter_labels, dtype=dt))
-            if grassmann_parameter_labels is not None and "grassmann_parameter_labels" not in f:
-                f.create_dataset("grassmann_parameter_labels", data=np.array(grassmann_parameter_labels, dtype=dt))
+        if snapshot_parameter_labels is not None and "snapshot_parameter_labels" not in f:
+            max_string_len = max(len(s) for s in snapshot_parameter_labels)
+            dt = f"S{max_string_len}"
+            snapshot_labels_array = np.array(snapshot_parameter_labels, dtype=dt)
+            f.create_dataset("snapshot_parameter_labels", data=np.array(snapshot_labels_array, dtype=dt))
+
+        if grassmann_parameter_labels is not None and "grassmann_parameter_labels" not in f:
+            max_string_len = max(len(s) for s in grassmann_parameter_labels)
+            dt = f"S{max_string_len}"
+            grassmann_labels_array = np.array(grassmann_parameter_labels, dtype=dt)
+            f.create_dataset("grassmann_parameter_labels", data=np.array(grassmann_labels_array, dtype=dt))
 
 
 
@@ -133,11 +173,16 @@ def read_snapshots(
             - "grassmann_parameter_labels" : list[str] or None
     """
     comm = dafoam_instance.comm
-    rank = comm.Get_rank()
 
-    # Use a PETSc Vec to determine partitioning (consistent with DAFoam)
+    # Use  PETSc Vecs to determine partitioning (consistent with DAFoam)
     petsc_states = dafoam_instance.array2Vec(dafoam_instance.getStates())  # or however you obtain PETSc Vec
-    start, end   = petsc_states.getOwnershipRange()                              # global indices for this rank
+    START_state, END_state   = petsc_states.getOwnershipRange()            # global indices for this rank
+
+    petsc_vert_coords = dafoam_instance.array2Vec(dafoam_instance.xv.ravel())  
+    START_vert, END_vert   = petsc_vert_coords.getOwnershipRange()
+
+    petsc_centroid_coords = dafoam_instance.array2Vec(dafoam_instance.getCellCentroids()) 
+    START_centroid, END_centroid   = petsc_centroid_coords.getOwnershipRange()
 
     local_data = {}
     global_metadata = {}
@@ -146,43 +191,59 @@ def read_snapshots(
         # --- Parallel read: snapshots ---
         if "snapshots" in f:
             dset        = f["snapshots"]
-            n_snapshots = dset.shape[1]
-            local_data["snapshots_local"] = dset[start:end, :]
+            local_data["snapshots"] = dset[START_state:END_state, :]
 
         # --- Parallel read: reference snapshot ---
         if "reference_snapshot" in f:
             ref = f["reference_snapshot"]
-            local_data["reference_snapshot_local"] = ref[start:end]
+            local_data["reference_snapshot"] = ref[START_state:END_state]
         else:
-            local_data["reference_snapshot_local"] = None
+            local_data["reference_snapshot"] = None
 
-        # --- Serial read: metadata (rank 0 only) ---
-        if rank == 0:
-            if "converged" in f:
-                global_metadata["converged"] = f["converged"][:]
-            if "last_written_snapshot" in f:
-                global_metadata["last_written_snapshot"] = f["last_written_snapshot"][()]
-            if "snapshot_configurations" in f:
-                global_metadata["snapshot_configurations"] = f["snapshot_configurations"][:]
-            else:
-                global_metadata["snapshot_configurations"] = None
-            if "grassmann_configuration" in f:
-                global_metadata["grassmann_configuration"] = f["grassmann_configuration"][:]
-            else:
-                global_metadata["grassmann_configuration"] = None
-            if "snapshot_parameter_labels" in f:
-                global_metadata["snapshot_parameter_labels"] = f["snapshot_parameter_labels"][:].astype(str).tolist()
-            else:
-                global_metadata["snapshot_parameter_labels"] = None
-            if "grassmann_parameter_labels" in f:
-                global_metadata["grassmann_parameter_labels"] = f["grassmann_parameter_labels"][:].astype(str).tolist()
-            else:
-                global_metadata["grassmann_parameter_labels"] = None
+        # --- Parallel read: vertex coordinates ---
+        if "vertex_coordinates" in f:
+            ref = f["vertex_coordinates"]
+            local_data["vertex_coordinates"] = ref[START_vert:END_vert]
         else:
-            global_metadata = None
+            local_data["vertex_coordinates"] = None
 
-        # Broadcast metadata so all ranks have it
-        global_metadata = comm.bcast(global_metadata, root=0)
+        # --- Parallel read: volume coordinates (old vertex coordinates name)---
+        if "volume_coordinates" in f:
+            ref = f["volume_coordinates"]
+            local_data["volume_coordinates"] = ref[START_vert:END_vert]
+        else:
+            local_data["volume_coordinates"] = None
+
+        # --- Parallel read: centroid coordinates ---
+        if "centroid_coordinates" in f:
+            ref = f["centroid_coordinates"]
+            local_data["centroid_coordinates"] = ref[START_centroid:END_centroid]
+        else:
+            local_data["centroid_coordinates"] = None
+
+        # # --- metadata ---
+        if "converged" in f:
+            global_metadata["converged"] = f["converged"][:]
+        if "reference_converged" in f:
+            global_metadata["reference_converged"] = f["reference_converged"]
+        if "last_written_snapshot" in f:
+            global_metadata["last_written_snapshot"] = f["last_written_snapshot"][()]
+        if "snapshot_configurations" in f:
+            global_metadata["snapshot_configurations"] = f["snapshot_configurations"][:]
+        else:
+            global_metadata["snapshot_configurations"] = None
+        if "grassmann_configuration" in f:
+            global_metadata["grassmann_configuration"] = f["grassmann_configuration"][:]
+        else:
+            global_metadata["grassmann_configuration"] = None
+        if "snapshot_parameter_labels" in f:
+            global_metadata["snapshot_parameter_labels"] = f["snapshot_parameter_labels"][:].astype(str).tolist()
+        else:
+            global_metadata["snapshot_parameter_labels"] = None
+        if "grassmann_parameter_labels" in f:
+            global_metadata["grassmann_parameter_labels"] = f["grassmann_parameter_labels"][:].astype(str).tolist()
+        else:
+            global_metadata["grassmann_parameter_labels"] = None
 
     return local_data, global_metadata
 
@@ -218,16 +279,18 @@ def build_xlimits(var_limits: Dict[Union[str, object], Iterable[float]]):
     cursor = 0
 
     for var_key, lim in var_limits.items():
-        lim = list(lim['range'])
-        if len(lim) != 2:
-            raise ValueError(f"{var_key}: limits must be [low, high], got {lim}")
+        var_name      = lim['name']
+        sample_limits = list(lim['range'])
+
+        if len(sample_limits) != 2:
+            raise ValueError(f"{var_key}: limits must be [low, high], got {sample_limits}")
 
         shp = _infer_shape_from_key(var_key)
         shapes[var_key] = shp
 
-        if shp == ():  # scalar
-            rows.append(lim)
-            labels.append((var_key, ()))
+        if shp == () or shp == 1:  # scalar
+            rows.append(sample_limits)
+            labels.append(var_name)
             slicer[var_key] = slice(cursor, cursor + 1)
             cursor += 1
         else:
@@ -235,8 +298,8 @@ def build_xlimits(var_limits: Dict[Union[str, object], Iterable[float]]):
             start = cursor
             for flat_idx in range(count):
                 idx = np.unravel_index(flat_idx, shp)
-                rows.append(lim)
-                labels.append((var_key, idx))
+                rows.append(sample_limits)
+                labels.append(f'{var_name}_{"_".join(map(str, idx))}')
                 cursor += 1
             slicer[var_key] = slice(start, start + count)
 
@@ -268,79 +331,6 @@ def reshape_samples(
 
 
 
-
-import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d import Axes3D  # registers 3D projection
-
-def get_cell_centroids(dafoam_instance):
-    """
-    Approximate cell centroids by averaging the coordinates of all points
-    belonging to a cell. Works for visualization.
-    """
-    # Mesh points (vertices)
-    points = dafoam_instance.xv  # shape (nPoints, 3)
-
-    # Face connectivity
-    faces = dafoam_instance.faces
-
-    # Owner/neighbour arrays
-    owners = dafoam_instance.owners
-    neighbours = dafoam_instance.neighbours
-
-    # Map: cell -> set of point indices
-    cell_points = {}
-    for face_id, pt_indices in enumerate(faces):
-        owner = owners[face_id]
-        cell_points.setdefault(owner, set()).update(pt_indices)
-
-        if face_id < len(neighbours):  # internal face
-            neighbour = neighbours[face_id]
-            cell_points.setdefault(neighbour, set()).update(pt_indices)
-
-    # Compute approximate centroids
-    centroids = np.zeros((len(cell_points), 3))
-    for cell_id, pts in cell_points.items():
-        coords = points[list(pts)]
-        centroids[cell_id] = coords.mean(axis=0)
-
-    return centroids
-
-
-def plot_mesh_field(centroids, field, cmap="viridis"):
-    """
-    Plot a scalar/vector field on mesh cell centroids.
-
-    Parameters
-    ----------
-    centroids : (nCells, 3) ndarray
-        Cell centroid coordinates
-    field : (nCells,) or (nCells,3) ndarray
-        Scalar field (color by value) or vector field (color by magnitude)
-    cmap : str
-        Matplotlib colormap
-    """
-    fig = plt.figure(figsize=(8, 6))
-    ax = fig.add_subplot(111, projection="3d")
-
-    # If vector field → compute magnitude
-    if field.ndim == 2 and field.shape[1] == 3:
-        field_vals = np.linalg.norm(field, axis=1)
-    else:
-        field_vals = field
-
-    sc = ax.scatter(
-        centroids[:, 0], centroids[:, 1], centroids[:, 2],
-        c=field_vals, cmap=cmap, s=8, alpha=0.8
-    )
-
-    fig.colorbar(sc, ax=ax, label="Field value")
-    ax.set_xlabel("x")
-    ax.set_ylabel("y")
-    ax.set_zlabel("z")
-    plt.tight_layout()
-    plt.show()
-
-
 import pandas as pd
 def print_sample_table(range_table, samples):
     """
@@ -355,8 +345,10 @@ def print_sample_table(range_table, samples):
         Each row is one sampled configuration. Columns are ordered as variables in
         the dictionary, flattening multi-dimensional variables.
     """
-    col_labels = []
-    start_col = 0
+    col_labels  = []
+    start_col   = 0
+
+    
 
     # Generate column labels for each variable
     for csdl_var, info in range_table.items():
@@ -367,7 +359,7 @@ def print_sample_table(range_table, samples):
         if n_cols == 1:
             labels = [name]
         else:
-            labels = [f"{name}_{i}" for i in range(n_cols)]
+            labels = [f'{name}_{"_".join(map(str, np.unravel_index(i, shape)))}' for i in range(np.prod(shape))]
 
         col_labels.extend(labels)
         start_col += n_cols
