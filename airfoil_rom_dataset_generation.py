@@ -476,11 +476,12 @@ for grassmann_index in range(len(grassmann_samples)):
         print('=============================================')
         print(f'Grassmann point {grassmann_index+1}/{num_grassmann_samples}, snapshot {snapshot_index+1}/{num_snapshot_samples}')
         print('=============================================\n')
-        sim.run()
         
         # Update all of the snapshot parameters for current configuration
         for key in snapshot_samples[snapshot_index].keys():
             sim[key] = snapshot_samples[snapshot_index][key]
+
+        sim.run()
 
         # Update PETSc vector to most recent solution
         dafoam_instance.arrayVal2Vec(dafoam_instance.getStates(), petsc_states)
