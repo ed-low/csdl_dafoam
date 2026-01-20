@@ -32,10 +32,11 @@ from modopt import PySLSQP, OpenSQP
 
 # IDWarp and DAFoam
 from csdl_idwarp import DAFoamMeshWarper
-from csdl_dafoam import instantiateDAFoam, DAFoamFunctions, DAFoamSolver, DAFoamROM2, compute_dafoam_input_variables
+from csdl_dafoam import instantiateDAFoam, DAFoamFunctions, DAFoamSolver, DAFoamROM, DAFoamROM2, DAFoamROM3, DAFoamROM4, compute_dafoam_input_variables
 import standard_atmosphere_model as sam
 from pyofm import PYOFM
 
+from helper_functions import *
 from rom_training_helper_functions import *
 
 # Plotting
@@ -160,50 +161,6 @@ mesh_options = {
 
 
 # ===============================
-# region HELPER FUNCTIONS
-# ===============================
-# TIMER
-from contextlib import contextmanager
-# Use this to print the timings for certain lines
-timings = {}  # Optional: for logging total times
-
-@contextmanager
-def Timer(name):
-    if TIMING_ENABLED:
-        print(f'Rank {rank}: {name}...', flush=True)
-        start = time.time()
-        yield
-        elapsed = time.time() - start
-        print(f'Rank {rank}: {name} elapsed time: {elapsed:.3f} s')
-        timings[name] = elapsed
-    else:
-        yield
-
-
-# HASHER (for generating filenames)
-import hashlib
-def hash_array_tol(arr: np.ndarray, tol: float = 1e-8, length: int = 16) -> str:
-    """
-    Generate a tolerance-aware short hash of a NumPy array.
-
-    Parameters:
-        arr (np.ndarray): Input array to hash.
-        tol (float): Tolerance for rounding (default: 1e-8).
-        length (int): Number of hex characters to return from the hash (default: 16).
-
-    Returns:
-        str: A truncated SHA-256 hash of the rounded array.
-    """
-    # Round the array to the given tolerance
-    rounded = np.round(arr / tol) * tol
-    # Hash the byte representation of the rounded array
-    byte_repr = rounded.astype(np.float64).tobytes()
-    full_hash = hashlib.sha256(byte_repr).hexdigest()
-    return full_hash[:length]
-
-
-
-# ===============================
 # region SETUP
 # ===============================
 # MPI information
@@ -304,16 +261,6 @@ x_surf_dafoam   = x_surf_dafoam.flatten()
 idwarp_model    = DAFoamMeshWarper(dafoam_instance)
 x_vol_dafoam    = idwarp_model.evaluate(x_surf_dafoam)
 
-
-# Generate PYOFM object, and read reference mesh cell volumes
-current_dir = os.getcwd()
-os.chdir(dafoam_directory)
-ofm = PYOFM(comm=dafoam_instance.comm)
-cell_volumes = np.zeros((dafoam_instance.solver.getNLocalCells(), ))
-ofm.readField('V', 'volScalarField', '0', cell_volumes)
-os.chdir(current_dir)
-
-
 # Flight condition variables
 flight_conditions_group                     = csdl.VariableGroup()
 flight_conditions_group.mach_number         = csdl.Variable(value=global_metadata['grassmann_configuration'][0], name="mach_number") #7.38907838e-01, name="mach_number")
@@ -351,18 +298,21 @@ target_energy = 0.999  # e.g. use 0.999 for 99.9%
 # 2: center by reference
 centering_mode = 1
 
-# Scaling factors for numerical stability
+# Scaling factors for training data 
 # Options:
 # 0: no scaling
 # 1: scale by normalization factors in da_options["normalizeStates"]
-# 2: scale by statistics (standard deviation of data)
+# 2: scale by reference values from grassmann point
+# 3: scale by statistics (standard deviation of data)
 scaling_mode = 2
 
 # Inner product weighting
 # Options:
 # None: no weights
 # "cell": weigh by cell volumes and face surface areas
-weight_mode  = 'cell'
+# "cell_and_scaling"
+# "compressible_inner_product"
+weight_mode  = 'compressible_inner_product'
 ignore_phi   = True
 
 # Load states 
@@ -373,20 +323,43 @@ ignore_phi   = True
 y_training = local_data['snapshots_local']
 
 
-
 # TODO: MPI business. Would need to gather everything to rank zero, compute POD, and then disperse.
 #       For now, we'll assume that this is serial and that everything is here.
 
 
 # region ROM Mode computation
 # Scaling mode assignment
+state_names, state_map = dafoam_instance.getStateVariableMap(True)
+
+# Create a dictionary for the states
+state_inds = {}
+for name in state_names:
+    state_idx = state_names.index(name)
+    state_inds[name] = state_map == state_idx
+
+
 if scaling_mode == 0:   # No scaling
     scaling_factors = np.ones((dafoam_instance.getNLocalAdjointStates(), ))
 
 elif scaling_mode == 1: # Scale by normalization factors set in da_options["normalizeStates"]
     scaling_factors = dafoam_instance.getStateScalingFactors()
 
-elif scaling_mode == 2: # Scale by statistics (standard deviation of data)
+elif scaling_mode == 2: # Scale by normalization factors set in da_options["normalizeStates"]
+    scaling_factors = np.ones((dafoam_instance.getNLocalAdjointStates(), ))
+
+    def apply_state_scaling(name, value):
+        idx = state_names.index(name)
+        scaling_factors[state_map == idx] = value
+
+    apply_state_scaling('U0',       ambient_conditions_group.a_m_s.value[0])
+    apply_state_scaling('U1',       ambient_conditions_group.a_m_s.value[0])
+    apply_state_scaling('U2',       ambient_conditions_group.a_m_s.value[0])
+    apply_state_scaling('p',        ambient_conditions_group.P_Pa.value[0])
+    apply_state_scaling('T',        ambient_conditions_group.T_K.value[0])
+    apply_state_scaling('nuTilda',  10000*ambient_conditions_group.nu_m2_s.value[0])
+    apply_state_scaling('phi',      1)
+
+elif scaling_mode == 3: # Scale by statistics (standard deviation of data)
     scaling_factors = np.std(y_training, axis=1)
 
     # To avoid division by zero/small value
@@ -414,20 +387,85 @@ else:
 
 
 # Weighting mode assignment
+n_cells = dafoam_instance.solver.getNLocalCells()
 if weight_mode is None:
     weights = np.ones_like(y_reference)
 
 elif weight_mode == 'cell':
     weights = dafoam_instance.getStateWeights()
 
+elif weight_mode == 'compressible_inner_product':
+    R       = 287 # Gas constant, air [J/kg/K]
+    gamma   = 1.4 # Specific heat ratio, air
+    c_v     = R / (gamma - 1)
+
+    n_cells = dafoam_instance.solver.getNLocalCells()
+    weights  = dafoam_instance.getStateWeights()
+    
+    if centering_mode == 0:
+        rho_ref = ambient_conditions_group.rho_kg_m3.value
+        sos_ref = ambient_conditions_group.a_m_s.value
+        T_ref   = ambient_conditions_group.T_K.value
+        mu_ref  = ambient_conditions_group.mu_kg_m_s.value
+        alpha_q = rho_ref * sos_ref * dafoam_instance.getStateWeights()[5*n_cells:]
+    else:
+        rho_ref = y_reference[3*n_cells:4*n_cells] / R / y_reference[4*n_cells:5*n_cells]
+        sos_ref = np.sqrt(gamma * R * y_reference[4*n_cells:5*n_cells])
+        T_ref   = y_reference[4*n_cells:5*n_cells]
+        print(rho_ref.shape)
 
 
-# Scale and zero-mean our data
-z = np.sqrt(weights)[:, None]*(y_training - y_reference[:, None])
+    # print(f'Velocity weight: {rho_ref}')
+    # print(f'Pressure weight: {1/(rho_ref * sos_ref**2)}')
+    # print(f'Temperature weight: {rho_ref * c_v/T_ref}')
+    # print(f'nuTilda weight: {mu_ref/rho_ref}')
+
+    weights[0:3*n_cells]         *= np.repeat(rho_ref, 3)
+    weights[3*n_cells:4*n_cells] *= 1/(rho_ref * sos_ref**2)
+    weights[4*n_cells:5*n_cells] *= (rho_ref * c_v / T_ref)
+    weights[5*n_cells:6*n_cells] *= 0 #(mu_ref / rho_ref)
+    weights[6*n_cells:]          *= 0 #alpha_q
+
+elif weight_mode == 'cell_and_scaling':
+    weights  = dafoam_instance.getStateWeights()
+    weights *= scaling_factors
+
+else:
+    raise TypeError(f'{weight_mode} not an implemented weighting method.')
 
 
-# Compute our svd and determine number of modes needed (if user specified), and compute POD modes
-u, s, vh  = np.linalg.svd(z, full_matrices=False)
+# Reference-centered data
+z = y_training - y_reference[:, None]
+
+# Method of snapshots (referenced https://willcox-research-group.github.io/rom-operator-inference-Python3/_modules/opinf/basis/_pod.html#method_of_snapshots)
+min_thresh = 1e-15
+n_states   = z.shape[0] 
+gramian    = z.T @ (weights[:, None] * z / n_states)
+
+eigvals, eigvecs = np.linalg.eigh(gramian)
+
+# Re-order (largest to smallest).
+eigvals = eigvals[::-1]
+eigvecs = eigvecs[:, ::-1]
+
+# By definition the Gramian is symmetric positive semi-definite.
+# If any eigenvalues are smaller than zero, they are only measuring
+# numerical error and can be truncated.
+positives = eigvals > max(min_thresh, abs(np.min(eigvals)))
+eigvecs   = eigvecs[:, positives]
+eigvals   = eigvals[positives]
+
+# Rescale and square root eigenvalues to get singular values.
+s           = np.sqrt(eigvals * n_states)
+pod_modes   = z @ (eigvecs / s)
+
+
+# # Scale and zero-mean our data
+# z = np.sqrt(weights)[:, None]*(y_training - y_reference[:, None])
+
+
+# # Compute our svd and determine number of modes needed (if user specified), and compute POD modes
+# u, s, vh  = np.linalg.svd(z, full_matrices=False)
 
 
 cumulative_energy = np.cumsum(s**2)
@@ -440,41 +478,57 @@ if num_modes == -1:
 else:
     print(f"{num_modes} captures {energy_fraction[num_modes - 1]*100}% of the total energy")
 
-pod_modes          = u[:, :num_modes]/np.sqrt(weights)[:, None]
+# eps            = 1e-20 # or e.g. 1e-12 relative threshold
+# inv_sqrt       = np.zeros_like(weights)
+# mask           = weights > eps
+# inv_sqrt[mask] = 1.0/np.sqrt(weights[mask])
+# pod_modes      = inv_sqrt[:, None]*u[:, :num_modes]
+
+pod_modes = pod_modes[:, :num_modes]
 
 
-# This was just a test to see the FOM residuals
-# dafoam_instance()
-# n_cells             = dafoam_instance.solver.getNLocalCells()
-# plt.figure(0)
-# for i in range(1,7): plt.axvline(n_cells*i, alpha=0.5, linestyle='--', color='gray')
-# plt.plot(dafoam_instance.getResiduals())
-# plt.show()
 
 # ----- Plotting section -----
-show_training_plots = False
+show_training_plots = True
 n_cells             = dafoam_instance.solver.getNLocalCells()
 
 if show_training_plots:
-    plt.figure(1)
-    for i in range(1,7): plt.axvline(n_cells*i, alpha=0.5, linestyle='--', color='gray')
-    plt.plot(scaling_factors[:, None]*y_training)
-    plt.plot(scaling_factors*y_reference, linestyle=':', label='reference state')
-    plt.legend()
-    plt.title('Raw training data')
+    # RAW DATA PLOT
+    fig, (ax1, ax2) = plt.subplots(1, 2)
+    for i in range(3,7): ax1.axvline(n_cells*i, alpha=0.5, linestyle='--', color='gray')
+    ax1.plot(scaling_factors[:, None]*y_training)
+    ax1.plot(scaling_factors*y_reference, linestyle=':', label='reference state')
+    ax1.legend()
 
-    plt.figure(2)
-    for i in range(1,7): plt.axvline(n_cells*i, alpha=0.5, linestyle='--', color='gray')
-    plt.plot(y_training)
-    plt.plot(y_reference, linestyle=':', label='reference state')
-    plt.legend()
-    plt.title('Scaled training data')
+    im = ax2.imshow(scaling_factors[:, None]*y_training, aspect=y_training.shape[1]/y_training.shape[0])
+    for i in range(3,7): ax2.axhline(n_cells*i, alpha=0.5, linestyle='--', color='gray')
+    fig.colorbar(im)
+    fig.suptitle('Raw training data')
 
-    plt.figure(3)
-    for i in range(1,7): plt.axvline(n_cells*i, alpha=0.5, linestyle='--', color='gray')
-    plt.plot(z)
-    plt.title('Scaled, centered training data')
+    # SCALED DATA PLOT
+    fig, (ax1, ax2) = plt.subplots(1, 2)
+    for i in range(3,7): ax1.axvline(n_cells*i, alpha=0.5, linestyle='--', color='gray')
+    ax1.plot(y_training)
+    ax1.plot(y_reference, linestyle=':', label='reference state')
+    ax1.legend()
 
+    im = ax2.imshow(y_training, aspect=y_training.shape[1]/y_training.shape[0])
+    for i in range(3,7): ax2.axhline(n_cells*i, alpha=0.5, linestyle='--', color='gray')
+    fig.colorbar(im)
+    fig.suptitle('Scaled training data')
+
+    # SCALED, CENTERED DATA PLOT
+    fig, (ax1, ax2) = plt.subplots(1, 2)
+    for i in range(3,7): ax1.axvline(n_cells*i, alpha=0.5, linestyle='--', color='gray')
+    ax1.plot(z)
+
+    clim = np.max(np.abs(z))
+    im = ax2.imshow(z, aspect=y_training.shape[1]/y_training.shape[0], cmap='seismic', vmin=-clim, vmax=clim)
+    for i in range(3,7): ax2.axhline(n_cells*i, alpha=0.5, linestyle='--', color='gray')
+    fig.colorbar(im)
+    fig.suptitle('Scaled, centered training data')
+
+    # POD MODE ENERGY PLOT
     plt.figure(4)
     plt.plot(energy_fraction)
     plt.axvline(num_modes, label=f'Target ({target_energy*100}%)', color='gray', alpha=0.5, linestyle='--')
@@ -482,13 +536,37 @@ if show_training_plots:
     plt.xlabel('Number of modes')
     plt.ylabel('Cumulative variance')
     plt.legend()
+    
+    # SCALING FACTOR PLOT
+    plt.figure(5)
+    for i in range(3,7): plt.axvline(n_cells*i, alpha=0.5, linestyle='--', color='gray')
+    plt.plot(scaling_factors)
+    plt.title('Data scaling factors')
+
+    # INNER PRODUCT WEIGHT PLOT
+    plt.figure(6)
+    for i in range(3,7): plt.axvline(n_cells*i, alpha=0.5, linestyle='--', color='gray')
+    plt.plot(weights)
+    plt.title('Inner product weights')
+
+    # POD MODE PLOT
+    fig, (ax1, ax2) = plt.subplots(1, 2)
+    for i in range(3,7): ax1.axvline(n_cells*i, alpha=0.5, linestyle='--', color='gray')
+    ax1.plot(pod_modes)
+
+    clim = np.max(np.abs(pod_modes))
+    im = ax2.imshow(pod_modes, aspect=pod_modes.shape[1]/pod_modes.shape[0], cmap='seismic', vmin=-clim, vmax=clim)
+    for i in range(3,7): ax2.axhline(n_cells*i, alpha=0.5, linestyle='--', color='gray')
+    fig.colorbar(im)
+    fig.suptitle('POD modes')
+
     plt.show()
 
-# dafoam_solver           = DAFoamSolver(dafoam_instance)
-# dafoam_solver_states    = dafoam_solver.evaluate(dafoam_input_variables_group)
+
+
 
 # DAFoamSolver Implicit component setup and evaluation
-dafoam_rom           = DAFoamROM2(dafoam_instance, 
+dafoam_rom           = DAFoamROM4(dafoam_instance, 
                                  pod_modes=pod_modes, 
                                  tolerance=1e-8, 
                                  fom_ref_state=scaling_factors*y_reference, 
