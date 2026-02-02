@@ -21,7 +21,7 @@ def instantiateDAFoam(options, comm, run_directory=None, mesh_options=None):
         current_directory = os.getcwd()
     # -------------------------------
 
-    if not run_directory:
+    if run_directory is None:
         run_directory = os.getcwd()
     else:
         os.chdir(run_directory)
