@@ -522,7 +522,7 @@ from rom_training_helper_functions import *
 
 # region Options and user setup
 # Storage options
-dataset_keyword       = 'bwb_training'
+dataset_keyword       = 'bwb_training_testing'
 storage_location      = Path(dafoam_directory)
 
 # Sampling options
@@ -600,169 +600,190 @@ snapshot_vars_and_limits = {
 }
 
 
+from rom_training_helper_functions import DAFoamCSDLDatasetGenerator
 
-# region Initialization
-# Generate PETSc vector for state storage (will use this for writing to file)
-petsc_states           = dafoam_instance.array2Vec(dafoam_instance.getStates())
-petsc_vert_coords      = dafoam_instance.array2Vec(x_vol_dafoam.value)
-petsc_centroid_coords  = dafoam_instance.array2Vec(dafoam_instance.getCellCentroids())
-
-# Make directory
-if rank == 0:
-    os.makedirs(storage_location/dataset_keyword, exist_ok = True)
-
-# Make dafoam_directory path a Path
-dafoam_directory = Path(dafoam_directory)
-
-quiet_barrier(comm)
+# print(dafoam_instance.getStateVariableMap()[0])
+data_generator = DAFoamCSDLDatasetGenerator(dafoam_instance=dafoam_instance, 
+                                            csdl_simulator=sim, 
+                                            primary_variables=grassmann_vars_and_limits, 
+                                            secondary_variables=snapshot_vars_and_limits, 
+                                            storage_location=storage_location, 
+                                            dataset_keyword=dataset_keyword,
+                                            num_primary_samples=num_grassmann_samples,
+                                            num_secondary_samples=num_snapshot_samples,
+                                            random_state_seed=random_state_seed,
+                                            h5_file_base_name="point")
 
 
-# Build limits for sampling
-xlimits_grassmann, labels_grassmann, slicer_grassmann, shapes_grassmann = build_xlimits(grassmann_vars_and_limits)
-xlimits_snapshot,  labels_snapshot,  slicer_snapshot,  shapes_snapshot  = build_xlimits(snapshot_vars_and_limits)
+data = data_generator.read_h5_file('/media/edward/DATA/Edward/AFRL_project/csdl_dafoam/openfoam_airfoil/testing_h5_training/point_0.h5', visualize_data=True)
+# print(data)
 
-# Create LHS samplers and sample
-lhs_grassmann         = LHS(xlimits=xlimits_grassmann, criterion='m', random_state=random_state_seed)
-grassmann_raw_samples = lhs_grassmann(num_grassmann_samples)
-grassmann_samples     = reshape_samples(grassmann_raw_samples, slicer_grassmann, shapes_grassmann)
-
-lhs_snapshot          = LHS(xlimits=xlimits_snapshot,  criterion='m', random_state=random_state_seed)
-snapshot_raw_samples  = lhs_snapshot(num_snapshot_samples)
-snapshot_samples      = reshape_samples(snapshot_raw_samples, slicer_snapshot, shapes_snapshot)
-
-print(labels_grassmann)
-print(labels_snapshot)
-
-# Print to console
-if rank == 0:
-    print_sample_table(grassmann_vars_and_limits, grassmann_raw_samples)
-    print_sample_table(snapshot_vars_and_limits, snapshot_raw_samples)
-
-quiet_barrier(comm)
+# data_generator.sample_variables()
+# data_generator.run_sweep()
 
 
-# region Begin sampling
-# Loop through each Grassmann point
-for grassmann_index in range(len(grassmann_samples)):
-    # TODO: (re)initialize solver with better initial condition for new grassmann point
+
+# # region Initialization
+# # Generate PETSc vector for state storage (will use this for writing to file)
+# petsc_states           = dafoam_instance.array2Vec(dafoam_instance.getStates())
+# petsc_vert_coords      = dafoam_instance.array2Vec(x_vol_dafoam.value)
+# petsc_centroid_coords  = dafoam_instance.array2Vec(dafoam_instance.getCellCentroids())
+
+# # Make directory
+# if rank == 0:
+#     os.makedirs(storage_location/dataset_keyword, exist_ok = True)
+
+# # Make dafoam_directory path a Path
+# dafoam_directory = Path(dafoam_directory)
+
+# quiet_barrier(comm)
+
+# # Build limits for sampling
+# xlimits_grassmann, labels_grassmann, slicer_grassmann, shapes_grassmann = build_xlimits(grassmann_vars_and_limits)
+# xlimits_snapshot,  labels_snapshot,  slicer_snapshot,  shapes_snapshot  = build_xlimits(snapshot_vars_and_limits)
+
+# # Create LHS samplers and sample
+# lhs_grassmann         = LHS(xlimits=xlimits_grassmann, criterion='m', random_state=random_state_seed)
+# grassmann_raw_samples = lhs_grassmann(num_grassmann_samples)
+# grassmann_samples     = reshape_samples(grassmann_raw_samples, slicer_grassmann, shapes_grassmann)
+
+# lhs_snapshot          = LHS(xlimits=xlimits_snapshot,  criterion='m', random_state=random_state_seed)
+# snapshot_raw_samples  = lhs_snapshot(num_snapshot_samples)
+# snapshot_samples      = reshape_samples(snapshot_raw_samples, slicer_snapshot, shapes_snapshot)
+
+# print(labels_grassmann)
+# print(labels_snapshot)
+
+# # Print to console
+# if rank == 0:
+#     print_sample_table(grassmann_vars_and_limits, grassmann_raw_samples)
+#     print_sample_table(snapshot_vars_and_limits, snapshot_raw_samples)
+
+# quiet_barrier(comm)
+
+
+# # region Begin sampling
+# # Loop through each Grassmann point
+# for grassmann_index in range(len(grassmann_samples)):
+#     # TODO: (re)initialize solver with better initial condition for new grassmann point
     
-    # Dataset file name (.h5 file)
-    file_name = storage_location/dataset_keyword/f'{dataset_keyword}_point{grassmann_index}.h5'
+#     # Dataset file name (.h5 file)
+#     file_name = storage_location/dataset_keyword/f'{dataset_keyword}_point{grassmann_index}.h5'
         
-    if rank == 0:
-        # Make a folder for the raw OpenFOAM save
-        raw_directory = storage_location/dataset_keyword/f'{dataset_keyword}_point{grassmann_index}_raw'
-        os.makedirs(raw_directory, exist_ok = True)
+#     if rank == 0:
+#         # Make a folder for the raw OpenFOAM save
+#         raw_directory = storage_location/dataset_keyword/f'{dataset_keyword}_point{grassmann_index}_raw'
+#         os.makedirs(raw_directory, exist_ok = True)
 
-        # Copy the constant folder to the raw directory
-        current_directory = Path.cwd()
-        os.chdir(dafoam_directory)
-        shutil.copytree('./constant', raw_directory/'constant')
-        os.chdir(current_directory)
+#         # Copy the constant folder to the raw directory
+#         current_directory = Path.cwd()
+#         os.chdir(dafoam_directory)
+#         shutil.copytree('./constant', raw_directory/'constant')
+#         os.chdir(current_directory)
 
-    # Update all of the grassmann parameters for current point
-    for key in grassmann_samples[grassmann_index].keys():
-            sim[key] = grassmann_samples[grassmann_index][key]
+#     # Update all of the grassmann parameters for current point
+#     for key in grassmann_samples[grassmann_index].keys():
+#             sim[key] = grassmann_samples[grassmann_index][key]
 
 
-    if rank == 0:
-        print('\n\n\n\n')
-        print('=============================================')
-        print(f'Grassmann point {grassmann_index+1}/{num_grassmann_samples}, reference snapshot')
-        print('=============================================\n')
+#     if rank == 0:
+#         print('\n\n\n\n')
+#         print('=============================================')
+#         print(f'Grassmann point {grassmann_index+1}/{num_grassmann_samples}, reference snapshot')
+#         print('=============================================\n')
 
-    # Compute the reference state for this point on the manifold
-    for key in snapshot_vars_and_limits.keys():
-        sim[key] = snapshot_vars_and_limits[key]['ref_value']*np.ones(key.shape)
+#     # Compute the reference state for this point on the manifold
+#     for key in snapshot_vars_and_limits.keys():
+#         sim[key] = snapshot_vars_and_limits[key]['ref_value']*np.ones(key.shape)
     
-    sim.run()
+#     sim.run()
 
-    # Update PETSc vector to most recent solution
-    dafoam_instance.arrayVal2Vec(dafoam_instance.getStates(), petsc_states)
-    dafoam_instance.arrayVal2Vec(sim[x_vol_dafoam], petsc_vert_coords)
-    dafoam_instance.arrayVal2Vec(dafoam_instance.getCellCentroids(), petsc_centroid_coords)
+#     # Update PETSc vector to most recent solution
+#     dafoam_instance.arrayVal2Vec(dafoam_instance.getStates(), petsc_states)
+#     dafoam_instance.arrayVal2Vec(sim[x_vol_dafoam], petsc_vert_coords)
+#     dafoam_instance.arrayVal2Vec(dafoam_instance.getCellCentroids(), petsc_centroid_coords)
 
-    write_snapshot(
-        file_name,
-        petsc_states,
-        snapshot_index=None,
-        snapshot_configurations=snapshot_raw_samples,
-        grassmann_configuration=grassmann_raw_samples[grassmann_index],
-        snapshot_parameter_labels=labels_snapshot,
-        grassmann_parameter_labels=labels_grassmann,
-        vertex_coordinates=petsc_vert_coords,
-        centroid_coordinates=petsc_centroid_coords,
-        converged=dafoam_solver.last_time_converged,
-        reference_snapshot=True,
-        comm=dafoam_instance.comm
-    )
-
-    # Move OpenFOAM solution to solution directory
-    current_directory = Path.cwd()
-    os.chdir(dafoam_directory)
+#     write_snapshot(
+#         file_name,
+#         petsc_states,
+#         snapshot_index=None,
+#         snapshot_configurations=snapshot_raw_samples,
+#         grassmann_configuration=grassmann_raw_samples[grassmann_index],
+#         snapshot_parameter_labels=labels_snapshot,
+#         grassmann_parameter_labels=labels_grassmann,
+#         vertex_coordinates=petsc_vert_coords,
+#         centroid_coordinates=petsc_centroid_coords,
+#         converged=dafoam_solver.last_time_converged,
+#         reference_snapshot=True,
+#         comm=dafoam_instance.comm
+#     )
     
-    dafoam_instance.renameSolution(9998)
+#     # Move OpenFOAM solution to solution directory
+#     current_directory = Path.cwd()
+#     os.chdir(dafoam_directory)
     
-    if rank == 0:
-        if comm_size > 1:
-            for i in range(comm_size):
-                shutil.move(dafoam_directory/f'processor{i}'/'0.9998', 
-                        raw_directory/f'processor{i}'/'-1')
-                shutil.copytree(dafoam_directory/f'processor{i}'/'constant', 
-                            raw_directory/f'processor{i}'/'constant')
-        else:
-            shutil.move(dafoam_directory/'0.9998', 
-                        raw_directory/f'-1')
-    os.chdir(current_directory)
+#     dafoam_instance.renameSolution(9998)
+    
+#     if rank == 0:
+#         if comm_size > 1:
+#             for i in range(comm_size):
+#                 shutil.move(dafoam_directory/f'processor{i}'/'0.9998', 
+#                         raw_directory/f'processor{i}'/'-1')
+#                 shutil.copytree(dafoam_directory/f'processor{i}'/'constant', 
+#                             raw_directory/f'processor{i}'/'constant')
+#         else:
+#             shutil.move(dafoam_directory/'0.9998', 
+#                         raw_directory/f'-1')
+#     os.chdir(current_directory)
 
 
-    # Loop through each snapshot configuration
-    for snapshot_index in range(len(snapshot_samples)):
-        if rank == 0:
-            print('\n\n\n\n')
-            print('=============================================')
-            print(f'Grassmann point {grassmann_index+1}/{num_grassmann_samples}, snapshot {snapshot_index+1}/{num_snapshot_samples}')
-            print('=============================================\n')
+#     # Loop through each snapshot configuration
+#     for snapshot_index in range(len(snapshot_samples)):
+#         if rank == 0:
+#             print('\n\n\n\n')
+#             print('=============================================')
+#             print(f'Grassmann point {grassmann_index+1}/{num_grassmann_samples}, snapshot {snapshot_index+1}/{num_snapshot_samples}')
+#             print('=============================================\n')
         
-        # Update all of the snapshot parameters for current configuration
-        for key in snapshot_samples[snapshot_index].keys():
-            sim[key] = snapshot_samples[snapshot_index][key]
+#         # Update all of the snapshot parameters for current configuration
+#         for key in snapshot_samples[snapshot_index].keys():
+#             sim[key] = snapshot_samples[snapshot_index][key]
 
-        # Primal solve
-        sim.run()
+#         # Primal solve
+#         sim.run()
 
-        # Update PETSc vectors to most recent solution
-        dafoam_instance.arrayVal2Vec(dafoam_instance.getStates(), petsc_states)
-        dafoam_instance.arrayVal2Vec(sim[x_vol_dafoam], petsc_vert_coords)
+#         # Update PETSc vectors to most recent solution
+#         dafoam_instance.arrayVal2Vec(dafoam_instance.getStates(), petsc_states)
+#         dafoam_instance.arrayVal2Vec(sim[x_vol_dafoam], petsc_vert_coords)
 
-        write_snapshot(
-            file_name,
-            petsc_states,
-            snapshot_index=snapshot_index,
-            snapshot_configurations=snapshot_raw_samples,
-            grassmann_configuration=grassmann_raw_samples[grassmann_index],
-            snapshot_parameter_labels=None,
-            grassmann_parameter_labels=None,
-            vertex_coordinates=petsc_vert_coords,
-            centroid_coordinates=petsc_centroid_coords,       
-            converged=dafoam_solver.last_time_converged,
-            reference_snapshot=False,
-            comm=dafoam_instance.comm
-        )
+#         write_snapshot(
+#             file_name,
+#             petsc_states,
+#             snapshot_index=snapshot_index,
+#             snapshot_configurations=snapshot_raw_samples,
+#             grassmann_configuration=grassmann_raw_samples[grassmann_index],
+#             snapshot_parameter_labels=None,
+#             grassmann_parameter_labels=None,
+#             vertex_coordinates=petsc_vert_coords,
+#             centroid_coordinates=petsc_centroid_coords,       
+#             converged=dafoam_solver.last_time_converged,
+#             reference_snapshot=False,
+#             comm=dafoam_instance.comm
+#         )
 
-        # Move OpenFOAM solution to solution directory
-        current_directory = Path.cwd()
-        os.chdir(dafoam_directory)
+#         # Move OpenFOAM solution to solution directory
+#         current_directory = Path.cwd()
+#         os.chdir(dafoam_directory)
         
-        dafoam_instance.renameSolution(9998)
+#         dafoam_instance.renameSolution(9998)
         
-        if rank == 0:
-            if comm_size > 1:
-                for i in range(comm_size):
-                    shutil.move(dafoam_directory/f'processor{i}'/'0.9998/', 
-                            raw_directory/f'processor{i}'/f'{snapshot_index:04}')
-            else:
-                shutil.move(dafoam_directory/'0.9998', 
-                        raw_directory/f'{snapshot_index:04}')
+#         if rank == 0:
+#             if comm_size > 1:
+#                 for i in range(comm_size):
+#                     shutil.move(dafoam_directory/f'processor{i}'/'0.9998/', 
+#                             raw_directory/f'processor{i}'/f'{snapshot_index:04}')
+#             else:
+#                 shutil.move(dafoam_directory/'0.9998', 
+#                         raw_directory/f'{snapshot_index:04}')
         
-        os.chdir(current_directory)
+#         os.chdir(current_directory)

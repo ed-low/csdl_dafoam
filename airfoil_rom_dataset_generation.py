@@ -419,128 +419,26 @@ snapshot_vars_and_limits = {
     }
 }
 
+from rom_training_helper_functions import DAFoamCSDLDatasetGenerator
+
+# print(dafoam_instance.getStateVariableMap()[0])
+data_generator = DAFoamCSDLDatasetGenerator(dafoam_instance=dafoam_instance, 
+                                            csdl_simulator=sim, 
+                                            primary_variables=grassmann_vars_and_limits, 
+                                            secondary_variables=snapshot_vars_and_limits, 
+                                            storage_location=storage_location, 
+                                            dataset_keyword=dataset_keyword,
+                                            num_primary_samples=num_grassmann_samples,
+                                            num_secondary_samples=num_snapshot_samples,
+                                            random_state_seed=random_state_seed,
+                                            h5_file_base_name="point")
 
 
-# region Initialization
-# Generate PETSc vector for state storage (will use this for writing to file)
-petsc_states           = dafoam_instance.array2Vec(dafoam_instance.getStates())
+data = data_generator.read_h5_file('/media/edward/DATA/Edward/AFRL_project/csdl_dafoam/openfoam_airfoil/testing_h5_training/point_0.h5', visualize_data=True)
+# print(data)
 
-# Make directory
-os.makedirs(storage_location/dataset_keyword, exist_ok = True)
-
-
-# Build limits for sampling
-xlimits_grassmann, labels_grassmann, slicer_grassmann, shapes_grassmann = build_xlimits(grassmann_vars_and_limits)
-xlimits_snapshot,  labels_snapshot,  slicer_snapshot,  shapes_snapshot  = build_xlimits(snapshot_vars_and_limits)
-
-# Create LHS samplers and sample
-lhs_grassmann         = LHS(xlimits=xlimits_grassmann, criterion='m', random_state=random_state_seed)
-grassmann_raw_samples = lhs_grassmann(num_grassmann_samples)
-grassmann_samples     = reshape_samples(grassmann_raw_samples, slicer_grassmann, shapes_grassmann)
-
-lhs_snapshot          = LHS(xlimits=xlimits_snapshot,  criterion='m', random_state=random_state_seed)
-snapshot_raw_samples  = lhs_snapshot(num_snapshot_samples)
-snapshot_samples      = reshape_samples(snapshot_raw_samples, slicer_snapshot, shapes_snapshot)
-
-
-# Print to console
-print_sample_table(grassmann_vars_and_limits, grassmann_raw_samples)
-print_sample_table(snapshot_vars_and_limits, snapshot_raw_samples)
-
-
-# region Begin sampling
-# Loop through each Grassmann point
-for grassmann_index in range(len(grassmann_samples)):
-    # TODO: (re)initialize solver with better initial condition for new grassmann point
-
-    # Dataset file name (.h5 file)
-    file_name = storage_location/dataset_keyword/f'{dataset_keyword}_point{grassmann_index}.h5'
-    
-    # Make a folder for the raw OpenFOAM save
-    raw_directory = storage_location/dataset_keyword/f'{dataset_keyword}_point{grassmann_index}_raw'
-    os.makedirs(raw_directory, exist_ok = True)
-
-    # Copy the constant folder to the raw directory
-    current_directory = Path.cwd()
-    os.chdir(dafoam_directory)
-    shutil.copytree('./constant', raw_directory/'constant')
-    os.chdir(current_directory)
-
-    # Update all of the grassmann parameters for current point
-    for key in grassmann_samples[grassmann_index].keys():
-            sim[key] = grassmann_samples[grassmann_index][key]
-
-    # Loop through each snapshot configuration
-    for snapshot_index in range(len(snapshot_samples)):
-        print('\n\n\n\n')
-        print('=============================================')
-        print(f'Grassmann point {grassmann_index+1}/{num_grassmann_samples}, snapshot {snapshot_index+1}/{num_snapshot_samples}')
-        print('=============================================\n')
-        
-        # Update all of the snapshot parameters for current configuration
-        for key in snapshot_samples[snapshot_index].keys():
-            sim[key] = snapshot_samples[snapshot_index][key]
-
-        sim.run()
-
-        # Update PETSc vector to most recent solution
-        dafoam_instance.arrayVal2Vec(dafoam_instance.getStates(), petsc_states)
-
-        write_snapshot(
-            file_name,
-            petsc_states,
-            snapshot_index=snapshot_index,
-            snapshot_configurations=snapshot_raw_samples,
-            grassmann_configuration=grassmann_raw_samples[grassmann_index],
-            snapshot_parameter_labels=None,
-            grassmann_parameter_labels=None,
-            converged=dafoam_solver.last_time_converged,
-            reference_snapshot=False,
-            comm=dafoam_instance.comm
-        )
-
-        # Move OpenFOAM solution to solution directory
-        current_directory = Path.cwd()
-        os.chdir(dafoam_directory)
-        dafoam_instance.renameSolution(9998)
-        shutil.move('./0.9998', 
-                  raw_directory/f'{snapshot_index:04}')
-        os.chdir(current_directory)
-
-    print('\n\n\n\n')
-    print('=============================================')
-    print(f'Grassmann point {grassmann_index+1}/{num_grassmann_samples}, reference snapshot')
-    print('=============================================\n')
-
-    # Compute the reference state for this point on the manifold
-    for key in snapshot_vars_and_limits.keys():
-        sim[key] = snapshot_vars_and_limits[key]['ref_value']*np.ones(key.shape)
-    
-    sim.run()
-
-    # Update PETSc vector to most recent solution
-    dafoam_instance.arrayVal2Vec(dafoam_instance.getStates(), petsc_states)
-
-    write_snapshot(
-        file_name,
-        petsc_states,
-        snapshot_index=snapshot_index,
-        snapshot_configurations=snapshot_raw_samples,
-        grassmann_configuration=grassmann_raw_samples[grassmann_index],
-        snapshot_parameter_labels=None,
-        grassmann_parameter_labels=None,
-        converged=dafoam_solver.last_time_converged,
-        reference_snapshot=True,
-        comm=dafoam_instance.comm
-    )
-
-    # Move OpenFOAM solution to solution directory
-    current_directory = Path.cwd()
-    os.chdir(dafoam_directory)
-    dafoam_instance.renameSolution(9998)
-    shutil.move('./0.9998', 
-                raw_directory/f'snapshot_ref')
-    os.chdir(current_directory)
+# data_generator.sample_variables()
+# data_generator.run_sweep()
 
 
 
@@ -550,114 +448,244 @@ for grassmann_index in range(len(grassmann_samples)):
 
 
 
-# # Original case
-# from smt.sampling_methods import LHS
-# from rom_training_helper_functions import *
 
-# sim = csdl.experimental.PySimulator(recorder)
-
-# dataset_keyword       = 'airfoil'
-# state_store_file_name = f'2gs_100ss_state_store_comm_size{comm_size}_rank{rank_str}.npy'
-# random_state_seed     = 0
-
-
+# # region Initialization
 # # Generate PETSc vector for state storage (will use this for writing to file)
-# petc_states           = dafoam_instance.array2Vec(dafoam_instance.getStates())
+# petsc_states           = dafoam_instance.array2Vec(dafoam_instance.getStates())
 
-# if not Path(state_store_file_name).is_file():
-
-#     # Names of variables for the parametric POD grouping
-#     # grassmann_variables indicates the variables which correspond to points on the Grassmann manifold
-#     # shapshot_variables indicates the variables which correspond to "snapshots" or realizations
-#     num_grassmann_samples     = 2
-#     num_snapshot_samples      = 100
-
-#     grassmann_vars_and_limits = {
-#         flight_conditions_group.mach_number: {
-#             'name': 'mach_number',   
-#             'range': [0.65, 0.75],
-#         }, 
-#         flight_conditions_group.angle_of_attack_deg: {
-#             'name': 'angle_of_attack_deg',     
-#             'range': [0., 10],
-#         },
-#         flight_conditions_group.altitude_m: {
-#             'name': 'altitude_m', 
-#             'range': [7000., 13000],
-#             }
-#     }
-
-#     snapshot_vars_and_limits = {
-#         percent_change_in_thickness_dof: {
-#             'name': 'percent_change_in_thickness_dof',
-#             'range': [-10, 10],
-#             'ref_value': 0, 
-#         },
-#         normalized_percent_camber_change_dof: {
-#             'name': 'normalized_percent_camber_change_dof',
-#             'range': [-10, 10],
-#             'ref_value': 0, 
-#         }
-#     }
-
-#     print(f'percent_change_in_thickness_dof.value.shape: {percent_change_in_thickness_dof.value.shape}')
-#     print(f'normalized_percent_camber_change_dof.value.shape: {normalized_percent_camber_change_dof.value.shape}')
-
-#     # Build limits for sampling
-#     xlimits_grassmann, labels_grassmann, slicer_grassmann, shapes_grassmann = build_xlimits(grassmann_vars_and_limits)
-#     xlimits_snapshot,  labels_snapshot,  slicer_snapshot,  shapes_snapshot  = build_xlimits(snapshot_vars_and_limits)
+# # Make directory
+# os.makedirs(storage_location/dataset_keyword, exist_ok = True)
 
 
-#     # Create LHS samplers and sample
-#     lhs_grassmann = LHS(xlimits=xlimits_grassmann, criterion='m', random_state=random_state_seed)
-#     lhs_snapshot  = LHS(xlimits=xlimits_snapshot,  criterion='m', random_state=random_state_seed)
+# # Build limits for sampling
+# xlimits_grassmann, labels_grassmann, slicer_grassmann, shapes_grassmann = build_xlimits(grassmann_vars_and_limits)
+# xlimits_snapshot,  labels_snapshot,  slicer_snapshot,  shapes_snapshot  = build_xlimits(snapshot_vars_and_limits)
 
-#     grassmann_raw_samples = lhs_grassmann(num_grassmann_samples)
-#     snapshot_raw_samples  = lhs_snapshot(num_snapshot_samples)
+# # Create LHS samplers and sample
+# lhs_grassmann         = LHS(xlimits=xlimits_grassmann, criterion='m', random_state=random_state_seed)
+# grassmann_raw_samples = lhs_grassmann(num_grassmann_samples)
+# grassmann_samples     = reshape_samples(grassmann_raw_samples, slicer_grassmann, shapes_grassmann)
 
-#     print(grassmann_raw_samples)
-#     print(snapshot_raw_samples)
+# lhs_snapshot          = LHS(xlimits=xlimits_snapshot,  criterion='m', random_state=random_state_seed)
+# snapshot_raw_samples  = lhs_snapshot(num_snapshot_samples)
+# snapshot_samples      = reshape_samples(snapshot_raw_samples, slicer_snapshot, shapes_snapshot)
 
-#     grassmann_samples = reshape_samples(grassmann_raw_samples, slicer_grassmann, shapes_grassmann)
-#     snapshot_samples  = reshape_samples(snapshot_raw_samples, slicer_snapshot, shapes_snapshot)
 
+# # Print to console
+# print_sample_table(grassmann_vars_and_limits, grassmann_raw_samples)
+# print_sample_table(snapshot_vars_and_limits, snapshot_raw_samples)
+
+
+# # region Begin sampling
+# # Loop through each Grassmann point
+# for grassmann_index in range(len(grassmann_samples)):
+#     # TODO: (re)initialize solver with better initial condition for new grassmann point
+
+#     # Dataset file name (.h5 file)
+#     file_name = storage_location/dataset_keyword/f'{dataset_keyword}_point{grassmann_index}.h5'
+    
+#     # Make a folder for the raw OpenFOAM save
+#     raw_directory = storage_location/dataset_keyword/f'{dataset_keyword}_point{grassmann_index}_raw'
+#     os.makedirs(raw_directory, exist_ok = True)
+
+#     # Copy the constant folder to the raw directory
 #     current_directory = Path.cwd()
+#     os.chdir(dafoam_directory)
+#     shutil.copytree('./constant', raw_directory/'constant')
+#     os.chdir(current_directory)
 
-#     state_store = np.zeros((dafoam_solver.num_local_state_elements, num_grassmann_samples*num_snapshot_samples))
-#     converged   = np.zeros((num_grassmann_samples, num_snapshot_samples))
+#     # Update all of the grassmann parameters for current point
+#     for key in grassmann_samples[grassmann_index].keys():
+#             sim[key] = grassmann_samples[grassmann_index][key]
 
-#     for grassmann_index in range(len(grassmann_samples)):
+#     # Loop through each snapshot configuration
+#     for snapshot_index in range(len(snapshot_samples)):
+#         print('\n\n\n\n')
+#         print('=============================================')
+#         print(f'Grassmann point {grassmann_index+1}/{num_grassmann_samples}, snapshot {snapshot_index+1}/{num_snapshot_samples}')
+#         print('=============================================\n')
+        
+#         # Update all of the snapshot parameters for current configuration
+#         for key in snapshot_samples[snapshot_index].keys():
+#             sim[key] = snapshot_samples[snapshot_index][key]
 
-#         for key in grassmann_samples[grassmann_index].keys():
-#                 sim[key] = grassmann_samples[grassmann_index][key]
+#         sim.run()
 
-#         for snapshot_index in range(len(snapshot_samples)):
+#         # Update PETSc vector to most recent solution
+#         dafoam_instance.arrayVal2Vec(dafoam_instance.getStates(), petsc_states)
+
+#         write_snapshot(
+#             file_name,
+#             petsc_states,
+#             snapshot_index=snapshot_index,
+#             snapshot_configurations=snapshot_raw_samples,
+#             grassmann_configuration=grassmann_raw_samples[grassmann_index],
+#             snapshot_parameter_labels=None,
+#             grassmann_parameter_labels=None,
+#             converged=dafoam_solver.last_time_converged,
+#             reference_snapshot=False,
+#             comm=dafoam_instance.comm
+#         )
+
+#         # Move OpenFOAM solution to solution directory
+#         current_directory = Path.cwd()
+#         os.chdir(dafoam_directory)
+#         dafoam_instance.renameSolution(9998)
+#         shutil.move('./0.9998', 
+#                   raw_directory/f'{snapshot_index:04}')
+#         os.chdir(current_directory)
+
+#     print('\n\n\n\n')
+#     print('=============================================')
+#     print(f'Grassmann point {grassmann_index+1}/{num_grassmann_samples}, reference snapshot')
+#     print('=============================================\n')
+
+#     # Compute the reference state for this point on the manifold
+#     for key in snapshot_vars_and_limits.keys():
+#         sim[key] = snapshot_vars_and_limits[key]['ref_value']*np.ones(key.shape)
+    
+#     sim.run()
+
+#     # Update PETSc vector to most recent solution
+#     dafoam_instance.arrayVal2Vec(dafoam_instance.getStates(), petsc_states)
+
+#     write_snapshot(
+#         file_name,
+#         petsc_states,
+#         snapshot_index=snapshot_index,
+#         snapshot_configurations=snapshot_raw_samples,
+#         grassmann_configuration=grassmann_raw_samples[grassmann_index],
+#         snapshot_parameter_labels=None,
+#         grassmann_parameter_labels=None,
+#         converged=dafoam_solver.last_time_converged,
+#         reference_snapshot=True,
+#         comm=dafoam_instance.comm
+#     )
+
+#     # Move OpenFOAM solution to solution directory
+#     current_directory = Path.cwd()
+#     os.chdir(dafoam_directory)
+#     dafoam_instance.renameSolution(9998)
+#     shutil.move('./0.9998', 
+#                 raw_directory/f'snapshot_ref')
+#     os.chdir(current_directory)
+
+
+
+
+
+
+
+
+
+# # # Original case
+# # from smt.sampling_methods import LHS
+# # from rom_training_helper_functions import *
+
+# # sim = csdl.experimental.PySimulator(recorder)
+
+# # dataset_keyword       = 'airfoil'
+# # state_store_file_name = f'2gs_100ss_state_store_comm_size{comm_size}_rank{rank_str}.npy'
+# # random_state_seed     = 0
+
+
+# # # Generate PETSc vector for state storage (will use this for writing to file)
+# # petc_states           = dafoam_instance.array2Vec(dafoam_instance.getStates())
+
+# # if not Path(state_store_file_name).is_file():
+
+# #     # Names of variables for the parametric POD grouping
+# #     # grassmann_variables indicates the variables which correspond to points on the Grassmann manifold
+# #     # shapshot_variables indicates the variables which correspond to "snapshots" or realizations
+# #     num_grassmann_samples     = 2
+# #     num_snapshot_samples      = 100
+
+# #     grassmann_vars_and_limits = {
+# #         flight_conditions_group.mach_number: {
+# #             'name': 'mach_number',   
+# #             'range': [0.65, 0.75],
+# #         }, 
+# #         flight_conditions_group.angle_of_attack_deg: {
+# #             'name': 'angle_of_attack_deg',     
+# #             'range': [0., 10],
+# #         },
+# #         flight_conditions_group.altitude_m: {
+# #             'name': 'altitude_m', 
+# #             'range': [7000., 13000],
+# #             }
+# #     }
+
+# #     snapshot_vars_and_limits = {
+# #         percent_change_in_thickness_dof: {
+# #             'name': 'percent_change_in_thickness_dof',
+# #             'range': [-10, 10],
+# #             'ref_value': 0, 
+# #         },
+# #         normalized_percent_camber_change_dof: {
+# #             'name': 'normalized_percent_camber_change_dof',
+# #             'range': [-10, 10],
+# #             'ref_value': 0, 
+# #         }
+# #     }
+
+# #     print(f'percent_change_in_thickness_dof.value.shape: {percent_change_in_thickness_dof.value.shape}')
+# #     print(f'normalized_percent_camber_change_dof.value.shape: {normalized_percent_camber_change_dof.value.shape}')
+
+# #     # Build limits for sampling
+# #     xlimits_grassmann, labels_grassmann, slicer_grassmann, shapes_grassmann = build_xlimits(grassmann_vars_and_limits)
+# #     xlimits_snapshot,  labels_snapshot,  slicer_snapshot,  shapes_snapshot  = build_xlimits(snapshot_vars_and_limits)
+
+
+# #     # Create LHS samplers and sample
+# #     lhs_grassmann = LHS(xlimits=xlimits_grassmann, criterion='m', random_state=random_state_seed)
+# #     lhs_snapshot  = LHS(xlimits=xlimits_snapshot,  criterion='m', random_state=random_state_seed)
+
+# #     grassmann_raw_samples = lhs_grassmann(num_grassmann_samples)
+# #     snapshot_raw_samples  = lhs_snapshot(num_snapshot_samples)
+
+# #     print(grassmann_raw_samples)
+# #     print(snapshot_raw_samples)
+
+# #     grassmann_samples = reshape_samples(grassmann_raw_samples, slicer_grassmann, shapes_grassmann)
+# #     snapshot_samples  = reshape_samples(snapshot_raw_samples, slicer_snapshot, shapes_snapshot)
+
+# #     current_directory = Path.cwd()
+
+# #     state_store = np.zeros((dafoam_solver.num_local_state_elements, num_grassmann_samples*num_snapshot_samples))
+# #     converged   = np.zeros((num_grassmann_samples, num_snapshot_samples))
+
+# #     for grassmann_index in range(len(grassmann_samples)):
+
+# #         for key in grassmann_samples[grassmann_index].keys():
+# #                 sim[key] = grassmann_samples[grassmann_index][key]
+
+# #         for snapshot_index in range(len(snapshot_samples)):
             
-#             for key in snapshot_samples[snapshot_index].keys():
-#                 sim[key] = snapshot_samples[snapshot_index][key]
+# #             for key in snapshot_samples[snapshot_index].keys():
+# #                 sim[key] = snapshot_samples[snapshot_index][key]
 
-#             sim.run()
+# #             sim.run()
 
-#             print(sim[ambient_conditions_group.rho_kg_m3])
+# #             print(sim[ambient_conditions_group.rho_kg_m3])
 
-#             # Write mesh to disk
-#             os.chdir(dafoam_directory)
-#             dafoam_instance.renameSolution((grassmann_index + 1)*100. + snapshot_index + 1)
-#             os.chdir(current_directory)
+# #             # Write mesh to disk
+# #             os.chdir(dafoam_directory)
+# #             dafoam_instance.renameSolution((grassmann_index + 1)*100. + snapshot_index + 1)
+# #             os.chdir(current_directory)
 
-#             state_store[:, snapshot_index + grassmann_index*num_snapshot_samples] = dafoam_instance.getStates()
-#             if dafoam_solver.last_time_converged:
-#                 converged[grassmann_index, snapshot_index] = 1
+# #             state_store[:, snapshot_index + grassmann_index*num_snapshot_samples] = dafoam_instance.getStates()
+# #             if dafoam_solver.last_time_converged:
+# #                 converged[grassmann_index, snapshot_index] = 1
 
-#     print(converged)
-#     np.save(current_directory/state_store_file_name, state_store)
+# #     print(converged)
+# #     np.save(current_directory/state_store_file_name, state_store)
 
-# else:
-#     current_directory = Path.cwd()
-#     state_store = np.load(current_directory/state_store_file_name)
-#     print(state_store)
-#     plt.plot(state_store[:, range(50)])
-#     plt.show()
+# # else:
+# #     current_directory = Path.cwd()
+# #     state_store = np.load(current_directory/state_store_file_name)
+# #     print(state_store)
+# #     plt.plot(state_store[:, range(50)])
+# #     plt.show()
 
 
 
