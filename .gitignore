@@ -6,8 +6,7 @@ openfoam_*/
 stored_files/
 optimization_case_results/
 ASO_2DAF_send/
-airfoil_test_*_outputs/
-bwb_test_*_outputs/
+*_outputs/
 storage/
 
 # Misc files
@@ -19,6 +18,11 @@ playground.py
 *.gz
 *.npy
 *.yml
+*.h5
+*.svg
+*.pdf
+*.tex
+*.tikz
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
