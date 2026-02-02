@@ -15,7 +15,7 @@ import lsdo_geo
 
 # Optimization
 from modopt import CSDLAlphaProblem
-from modopt import PySLSQP, OpenSQP
+from modopt import PySLSQP, OpenSQP, InteriorPoint
 
 # IDWarp and DAFoam
 from csdl_idwarp import DAFoamMeshWarper
@@ -64,7 +64,7 @@ interactive_plots = False
 
 
 # DAFoam
-dafoam_directory    = os.path.join(os.getcwd(), 'openfoam_739k_bwb_symmetry/')
+dafoam_directory    = os.path.join(os.getcwd(), 'openfoam_669k_bwb_symmetry/')
 dafoamPrintInterval = 100
 
 # Initial/reference values for DAFoam (best to use base conditions)
@@ -167,7 +167,7 @@ da_options = {
         },
     },
     "writeAdjointFields": False,
-    "debug": True,
+    "debug": False,
     "printDAOptions": True,
     "printInterval": dafoamPrintInterval,
 }
@@ -521,7 +521,7 @@ with csdl.experimental.mpi.enter_mpi_region(rank, comm) as mpi_region:
 # 2: Minimize CD wrt angle-of-attack, root/tip twist, constrained by CL=0.5
 # 3: Minimize CD wrt angle-of-attack, wing shape (thickness/camber ffd), constrained by CL=0.5
 # 4: Minimize CD wrt angle-of-attack, wing shape (thickness/camber ffd) and wing twists, constrained by CL=0.5
-# 5: Maximize CL/CD wrt angle-of-attack and wing shape
+# 5: Maximize CL/CD wrt angle-of-attack and wing shape (thickness/camber ffd)
 # 6: Maximize CL/CD wrt angle-of-attack, wing shape (thickness/camber ffd) and wing twists
 # 7: Maximize CL/CD wrt angle-of-attack, wing shape (camber ffd) and wing twists
 optimization_case = 5
@@ -612,7 +612,7 @@ elif optimization_case == 5:
     drag = dafoam_function_outputs.drag
 
     # Design variables
-    flight_conditions_group.angle_of_attack_deg.set_as_design_variable(lower=0, upper=10, scaler=1./12.)
+    flight_conditions_group.angle_of_attack_deg.set_as_design_variable(lower=0, upper=10, scaler=1./10.)
     percent_change_in_thickness_dof_wing.set_as_design_variable(lower=-10, upper=30., adder=10., scaler=1./40.)
     normalized_percent_camber_change_dof_wing.set_as_design_variable(lower=-20., upper=20., scaler=1./20.)
 
@@ -668,51 +668,40 @@ recorder.stop()
 # ===============================
 sim = csdl.experimental.PySimulator(recorder)
 
-# Can set design variables here and run sim to test
-# sim[root_twist]  = 3*3.14159/180
-# sim.run()
-
-# Uncomment to run and check derivatives via finite difference
-# sim.check_totals()
-# derivs = sim.compute_totals([CD],[root_twist, tip_twist, flight_conditions_group.angle_of_attack])
-
-# Only allow visualization on the root rank
-if rank == 0 and not is_headless():
-    visualize_on_this_rank = True
-else:
-    visualize_on_this_rank = False
+# Only allow visualization and modopt output files on the root rank
+visualize_on_this_rank           = True  if rank == 0 and not is_headless() else False
+turn_off_outputs_on_nonroot_rank = False if rank == 0 else True
+recording_on_root_rank           = True  if rank == 0 else False
 
 # Optimization solver setup and run
-prob        = CSDLAlphaProblem(problem_name=f'{problem_name}_rank{rank_str}', simulator=sim)
+prob        = CSDLAlphaProblem(problem_name=f'{problem_name}', simulator=sim)
 
 # # # PySLSQP optimizer setup
 # # solver_options = {'maxiter': 20,
 # #                   'iprint': 2,
-# #                   'visualize': visualize_on_this_rank,
-# #                   'summary_filename': f'rank{rank_str}_slsqp_summary.out',
-# #                   'save_figname':     f'rank{rank_str}_slsqp_plot.pdf',
-# #                   'save_filename':    f'rank{rank_str}_slsqp_recorder.hdf5'}
+# #                   'readable_outputs': ['x'],
+# #                   'recording': True,
+# #                   'turn_off_outputs': turn_off_outputs_on_this_rank}
 # # optimizer   = PySLSQP(prob, solver_options=solver_options)
 # # optimizer.solve()
 # # optimizer.print_results()
 
+# # OpenSQP optimizer setup
+# open_sqp_options = {'maxiter': 40,
+#                     'readable_outputs': ['x'],
+#                     'recording': True,
+#                     'ls_max_step': 0.5,
+#                     'turn_off_outputs': turn_off_outputs_on_nonroot_rank}
+# optimizer = OpenSQP(prob, **open_sqp_options)
+# optimizer.solve()
+# optimizer.print_results()
 
-# OpenSQP optimizer setup
-open_sqp_options = {'maxiter': 40,
-                    'readable_outputs': ['x'],
-                    'recording': True,
-                    'ls_max_step': 0.05}
-if rank == 0:
-    print("OpenSQP options:")
-    print(f"{open_sqp_options}")
-
-optimizer   = OpenSQP(prob, **open_sqp_options)
+# InteriorPoint optimizer setup
+interior_point_options = {'maxiter': 40,
+                          'recording': recording_on_root_rank,
+                          'ls_max_step': 1.,
+                          'turn_off_outputs': turn_off_outputs_on_nonroot_rank}
+optimizer   = InteriorPoint(prob, **interior_point_options)
 optimizer.solve()
 optimizer.print_results()
 
-
-
-
-
-# # # Extra items to use, if necessary
-# # optimizer.check_first_derivatives(prob.x0)
