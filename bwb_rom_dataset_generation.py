@@ -600,7 +600,7 @@ snapshot_vars_and_limits = {
 }
 
 
-from rom_training_helper_functions import DAFoamCSDLDatasetGenerator
+from rom_training_helper_functions import TrainingDataInterface
 
 # print(dafoam_instance.getStateVariableMap()[0])
 data_generator = DAFoamCSDLDatasetGenerator(dafoam_instance=dafoam_instance, 

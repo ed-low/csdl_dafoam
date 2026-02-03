@@ -17,14 +17,11 @@ import lsdo_function_spaces as lfs
 import lsdo_geo
 
 # LSDO_geo specific
-from lsdo_geo.core.parameterization.free_form_deformation_functions import (
-    construct_tight_fit_ffd_block,construct_ffd_block_around_entities
-)
+from lsdo_geo.core.parameterization.free_form_deformation_functions import (construct_ffd_block_around_entities)
 from lsdo_geo.core.parameterization.volume_sectional_parameterization import (
     VolumeSectionalParameterization,
     VolumeSectionalParameterizationInputs
 )
-from lsdo_geo.core.parameterization.parameterization_solver import ParameterizationSolver, GeometricVariables
 
 # Optimization
 from modopt import CSDLAlphaProblem
@@ -36,11 +33,9 @@ from csdl_dafoam import instantiateDAFoam, DAFoamFunctions, DAFoamSolver, comput
 import standard_atmosphere_model as sam
 
 # BWB specific
-from bwb_helper_functions import setup_geometry, read_geometry_pickle, write_geometry_pickle, gather_array_to_rank0, read_simple_pickle, write_simple_pickle
+from bwb_helper_functions import gather_array_to_rank0, read_simple_pickle, write_simple_pickle
 
-# Plotting
-from vedo import Points, show
-import matplotlib.pyplot as plt
+
 from check_headless import is_headless
 
 # Hashing (for file name generation)

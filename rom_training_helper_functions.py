@@ -10,8 +10,8 @@ from mpi4py import MPI
 from vedo import Arrows, Points, Plotter, Text2D, show
 
 
-# region DAFOAMCSDLDATASETGENERATOR
-class DAFoamCSDLDatasetGenerator():  
+# region TRAININGDATAINTERFACE
+class TrainingDataInterface():  
     def __init__(self, 
                  dafoam_instance,
                  csdl_simulator, 
@@ -26,7 +26,7 @@ class DAFoamCSDLDatasetGenerator():
                  ):
         
         # TODO: See if there is DAFoam API to get whether a variable is volVectorStates, volScalarStates, modelStates, or surfaceScalarStates.
-        # We'll just define here for the rhoSimpleFoam case for now. Can add to here if necessary 
+        # We'll just define here for the rhoSimpleFoam case for now. Can add to here if necessary for other models
         self.solver_variable_storage_type = {"centroid_coordinates":    "volVectorStates", # We'll say that the cell coordinates match the volume vector state form
                                              "U":                       "volVectorStates",
                                              "p":                       "volScalarStates",
