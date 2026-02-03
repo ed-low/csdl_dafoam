@@ -1,10 +1,119 @@
 import numpy as np
 import time
 import hashlib
-
-
-# TIMER
+import os
+import sys
+import contextlib
 from contextlib import contextmanager
+import pickle
+from mpi4py import MPI
+
+
+
+# region read_simple_pickle
+def read_simple_pickle(file_path):
+    with open(file_path, 'rb') as handle:
+        contents = pickle.load(handle)
+
+    return contents
+
+
+
+# region write_simple_pickle
+def write_simple_pickle(var_to_write, file_path):
+    with open(file_path, 'wb+') as handle:
+        var_to_write_copy = var_to_write.copy()
+        pickle.dump(var_to_write_copy, handle, protocol=pickle.HIGHEST_PROTOCOL)
+
+
+
+# region gather_array_to_rank0
+def gather_array_to_rank0(x_local: np.ndarray, comm: MPI.Comm = MPI.COMM_WORLD):
+    """
+    Gather local arrays to rank 0.
+    
+    Returns on rank 0:
+        - x_full: (N_total, dim) array
+        - sizes: list of local row counts from each rank
+        - index_ranges: list of (start, stop) tuples for each rank's slice
+    
+    On other ranks:
+        - x_full is None
+        - sizes and index_ranges are available for consistency
+    """
+    rank = comm.Get_rank()
+    size = comm.Get_size()
+
+    local_npts = np.array([x_local.shape[0]], dtype=np.int32)
+    sizes = np.zeros(size, dtype=np.int32)
+    comm.Allgather([local_npts, MPI.INT], [sizes, MPI.INT])
+
+    if x_local.ndim > 1:
+        dim = x_local.shape[1]
+        counts = sizes * dim
+    else:
+        dim = -1
+        counts = sizes
+    displacements = np.insert(np.cumsum(counts), 0, 0)[:-1]
+
+    # Compute start/stop indices for slicing back full array
+    starts = np.insert(np.cumsum(sizes), 0, 0)[:-1]
+    stops = starts + sizes
+    index_ranges = list(zip(starts, stops))
+
+    sendbuf = x_local.flatten()
+    recvbuf = None
+    if rank == 0:
+        total_count = np.sum(counts)
+        recvbuf = np.empty(total_count, dtype=np.float64)
+
+    comm.Gatherv(sendbuf, (recvbuf, counts, displacements, MPI.DOUBLE), root=0)
+
+    if rank == 0:
+        if dim == -1:
+            x_full = recvbuf.reshape((-1))
+        else:
+            x_full = recvbuf.reshape((-1, dim))
+        return x_full, sizes, index_ranges
+    else:
+        return None, sizes, index_ranges
+
+
+
+#region is_headless
+def is_headless():
+    # 1. Common Unix/Linux: no X11 display variable
+    if sys.platform != "win32":
+        if not os.environ.get("DISPLAY") and not os.environ.get("WAYLAND_DISPLAY"):
+            return True
+
+    # 2. Try to create a simple GUI context (Tkinter) to verify display availability.
+    try:
+        # suppress stderr from Tk if it complains
+        with contextlib.redirect_stderr(open(os.devnull, "w")):
+            import tkinter
+            root = tkinter.Tk()
+            root.withdraw()
+            root.update_idletasks()
+            root.destroy()
+    except Exception:
+        return True  # failed to create even a minimal window -> likely headless
+
+    # 3. Check common headless backends (e.g., matplotlib using Agg implies no interactive display)
+    try:
+        import matplotlib
+        backend = matplotlib.get_backend().lower()
+        if "agg" in backend and not ("tk" in backend or "qt" in backend or "wx" in backend):
+            # Agg can be explicitly set even in non-headless cases, so this is a soft signal.
+            pass  # don't conclusively declare headless based solely on this
+    except ImportError:
+        pass  # matplotlib not present, ignore
+
+    return False  # if we reached here, a display seems available
+
+
+
+# region Timer
 # Use this to print the timings for certain lines
 timings = {}  # Optional: for logging total times
 
@@ -21,8 +130,8 @@ def Timer(name, rank, timing_enabled):
         yield
 
 
-# HASHER (for generating filenames)
-import hashlib
+
+# region hash_array_tol
 def hash_array_tol(arr: np.ndarray, tol: float = 1e-8, length: int = 16) -> str:
     """
     Generate a tolerance-aware short hash of a NumPy array.
@@ -43,7 +152,9 @@ def hash_array_tol(arr: np.ndarray, tol: float = 1e-8, length: int = 16) -> str:
     return full_hash[:length]
 
 
-# QUIET_BARRIER (replacement for comm.Barrier() so that cpu doesn't idle at 100%)
+
+# region quiet_barrier
+# (replacement for comm.Barrier() so that cpu doesn't idle at 100%)
 def quiet_barrier(comm, interval=0.01):
     req = comm.Ibarrier()
     while not req.Test():
@@ -51,6 +162,7 @@ def quiet_barrier(comm, interval=0.01):
 
 
 
+# region compute_vertex_normals
 def compute_vertex_normals(dafoam_instance, outward_ref=None):
     """
     Compute per-vertex normals from mesh connectivity.
@@ -136,6 +248,7 @@ def compute_vertex_normals(dafoam_instance, outward_ref=None):
 
 
 
+# region average_normals_at_duplicate_points
 def average_normals_at_duplicate_points(points, normals):
     """
     points:  (N, 3)

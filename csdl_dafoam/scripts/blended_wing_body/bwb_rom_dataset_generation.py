@@ -13,24 +13,20 @@ import csdl_alpha as csdl
 import lsdo_function_spaces as lfs
 import lsdo_geo
 
-# Optimization
-from modopt import CSDLAlphaProblem
-from modopt import PySLSQP, OpenSQP, InteriorPoint
-
 # IDWarp and DAFoam
-from csdl_idwarp import DAFoamMeshWarper
-from csdl_dafoam import instantiateDAFoam, DAFoamFunctions, DAFoamSolver, compute_dafoam_input_variables
-import standard_atmosphere_model as sam
+from csdl_dafoam.core.csdl_idwarp import DAFoamMeshWarper
+from csdl_dafoam.core.csdl_dafoam import instantiateDAFoam, DAFoamFunctions, DAFoamSolver, compute_dafoam_input_variables
+import csdl_dafoam.utils.standard_atmosphere_model as sam
+from csdl_dafoam.utils.runscript_helper_functions import *
+
+from csdl_dafoam.utils.training_interface import TrainingDataInterface
+
 
 # BWB specific
-from bwb_helper_functions import setup_geometry, read_geometry_pickle, write_geometry_pickle, gather_array_to_rank0, read_simple_pickle, write_simple_pickle
-
-from helper_functions import Timer, hash_array_tol, quiet_barrier, compute_vertex_normals, average_normals_at_duplicate_points
+from bwb_helper_functions import setup_geometry, read_geometry_pickle, write_geometry_pickle
 
 # Plotting
-from vedo import Points, Arrows, Mesh, show
-import matplotlib.pyplot as plt
-from check_headless import is_headless
+from vedo import Points, Arrows, show
 
 #---- DEBUGGING TOOLS ----
 import faulthandler
@@ -52,7 +48,7 @@ stp_file_name             = 'bwbv2_no_wingtip_coarse_refined_flat.stp'
 geometry_pickle_file_name = 'bwb_stored_refit.pickle'
 
 # Mesh
-average_normals_at_edges  = True # if true, this will average the normals of the shared point between two surfaces (might be useful for some cases)
+average_normals_at_edges  = False # if true, this will average the normals of the shared point between two surfaces (might be useful for some cases)
 
 # MPI and timing
 comm           = MPI.COMM_WORLD
@@ -65,7 +61,7 @@ interactive_plots = False
 
 # DAFoam
 dafoam_directory    = os.path.join(os.getcwd(), 'openfoam_669k_bwb_symmetry/')
-dafoamPrintInterval = 100
+dafoamPrintInterval = 100 
 
 # Initial/reference values for DAFoam (best to use base conditions)
 # These correspond to M=0.75 @ 30k feet
@@ -78,15 +74,6 @@ aoa0      = 0
 A0        = 518           # Projected area of entire BWB. Used for normalizing CD and CL
 rho0      = p0 / T0 / 287 # used for normalizing CD and CL
 
-# wall_list = ['wall_wing_cap',
-#             'wall_wing',
-#             'wall_transition',
-#             'wall_body']
-# #
-#    'wall_wing_cap_edge',
-#    'wall_trailing_surf_wing',
-#    'wall_trailing_surf_transition',
-#    'wall_trailing_surf_body', 
 # wall_list = ["wall"]
 wall_list = ['wall_body_lower',
              'wall_body_upper', 
@@ -132,6 +119,9 @@ da_options = {
     # transonic preconditioner to speed up the ff convergence
     "transonicPCOption": 2,
     "adjPCLag": 5,
+    # "adjEqnOption": {"gmresRelTol": 1.0e-6, "pcFillLevel": 1, "jacMatReOrdering": "rcm", "useNonZeroInitGuess": False},
+    # # transonic preconditioner to speed up the adjoint convergence
+    # "transonicPCOption": 1,
     "normalizeStates": {
         "U": U0,
         "p": p0,
@@ -169,7 +159,7 @@ da_options = {
     "writeAdjointFields": False,
     "debug": False,
     "printDAOptions": True,
-    "printInterval": dafoamPrintInterval,
+    "printInterval": dafoamPrintInterval
 }
 
 # region Mesh options
@@ -179,6 +169,11 @@ mesh_options = {
     "symmetryPlanes": [],
 }
 
+
+# region Training options
+# Storage options
+dataset_keyword       = 'bwb_training_testing'
+storage_location      = Path(dafoam_directory)
 
 
 # ===============================
@@ -191,7 +186,7 @@ rank_str  = f"{rank:0{len(str(comm_size-1))}d}" # string with zero-padded rank i
 
 
 # region DAFoam instance
-dafoam_instance               = instantiateDAFoam(da_options, comm, dafoam_directory, mesh_options)
+dafoam_instance               = instantiateDAFoam(da_options, comm, str(dafoam_directory), mesh_options)
 dafoam_instance.printInterval = dafoamPrintInterval
 x_surf_dafoam_initial_local   = dafoam_instance.getSurfaceCoordinates()
 x_vol_dafoam_initial_local    = dafoam_instance.xv0
@@ -218,29 +213,16 @@ geometry_pickle_file_path         = Path(geometry_directory)/geometry_pickle_fil
 stp_file_path                     = Path(geometry_directory)/stp_file_name
 surface_mesh_projection_file_path = Path(dafoam_directory)/f'projected_surface_mesh_{x_surf_hash}.pickle'
 
-# local_value = dafoam_instance.getNLocalAdjointStates()
-# total_value = comm.allreduce(local_value, op=MPI.SUM)
-# quiet_barrier(comm)
-# if rank ==0:
-#     print(total_value)
-#     input('Press ENTER to continue')
-# quiet_barrier(comm)
 
+# ########################################
+# # Use this to visualize data 
+# data_generator = TrainingDataInterface(dafoam_instance=dafoam_instance, 
+#                                             storage_location=storage_location, 
+#                                             dataset_keyword=dataset_keyword,
+#                                             h5_file_base_name="point")
 
-# import time
-# start = time.process_time()
-# dafoam_instance.getResiduals()
-# processor_time = time.process_time() - start
-
-# total_processor_time   = comm.allreduce(processor_time, op=MPI.SUM)
-# average_processor_time = total_processor_time/comm_size
-
-# quiet_barrier(comm)
-# if rank == 0:
-#     print(f'Total processor time: {total_processor_time}')
-#     print(f'Average processor time: {average_processor_time}')
-#     input('Press ENTER to continue...')
-# quiet_barrier(comm)
+# data = data_generator.read_h5_file(Path(storage_location)/dataset_keyword/"point_0.h5", visualize_data=True)
+# ########################################
 
 
 # ===============================
@@ -368,12 +350,12 @@ else:
                     x_surf_dafoam_initial, 
                     grid_search_density_parameter = 1,      # 1 
                     projection_tolerance          = 1e-3,   # 1.e-3m 
-                    grid_search_density_cutoff    = 150,    # 20
+                    grid_search_density_cutoff    = 12,    # 150
                     force_reprojection            = False,
                     plot                          = show_plots and not is_headless(),
                     interactive                   = interactive_plots,                     
                     direction                     = normals,
-                    num_workers                   = 48
+                    num_workers                   = comm_size
                 )
 
             print('Writing surface mesh projection pickle...')
@@ -514,194 +496,107 @@ with csdl.experimental.mpi.enter_mpi_region(rank, comm) as mpi_region:
     mpi_region.set_as_global_output(dafoam_function_outputs.lift)
     mpi_region.set_as_global_output(dafoam_function_outputs.drag)
 
-
-# region Optimization problem selection
-# optimization_case options
-# 1: Maximize CL/CD wrt angle-of-attack
-# 2: Minimize CD wrt angle-of-attack, root/tip twist, constrained by CL=0.5
-# 3: Minimize CD wrt angle-of-attack, wing shape (thickness/camber ffd), constrained by CL=0.5
-# 4: Minimize CD wrt angle-of-attack, wing shape (thickness/camber ffd) and wing twists, constrained by CL=0.5
-# 5: Maximize CL/CD wrt angle-of-attack and wing shape (thickness/camber ffd)
-# 6: Maximize CL/CD wrt angle-of-attack, wing shape (thickness/camber ffd) and wing twists
-# 7: Maximize CL/CD wrt angle-of-attack, wing shape (camber ffd) and wing twists
-optimization_case = 5
-
-
-if optimization_case == 1:
-    # Declaring and naming some variables
-    lift = dafoam_function_outputs.lift
-    drag = dafoam_function_outputs.drag
-
-    # Design variables
-    flight_conditions_group.angle_of_attack_deg.set_as_design_variable(lower=0, upper=10)
-
-    # Objectives
-    objective_fun = -lift/drag
-    objective_fun.set_as_objective()
-
-
-elif optimization_case == 2:
-    # Declaring and naming some variables
-    dynamic_pressure = 0.5*ambient_conditions_group.rho_kg_m3*flight_conditions_group.airspeed_m_s*flight_conditions_group.airspeed_m_s
-    lift = dafoam_function_outputs.lift
-    drag = dafoam_function_outputs.drag
-    CL   = lift/(dynamic_pressure*A0)
-    CD   = drag/(dynamic_pressure*A0)
-    root_twist.name = 'root_twist'
-    tip_twist.name  = 'tip_twist'
-    twist_lim_deg   = 5
-    twist_lim_rad   = twist_lim_deg*np.pi/180
-
-    # Design variables
-    flight_conditions_group.angle_of_attack_deg.set_as_design_variable(lower=0, upper=10)
-    root_twist.set_as_design_variable(lower=-twist_lim_rad, upper=twist_lim_rad, scaler=1/twist_lim_rad)
-    tip_twist.set_as_design_variable(lower=-twist_lim_rad, upper=twist_lim_rad, scaler=1/twist_lim_rad)
-
-    # Constraints
-    CL.set_as_constraint(equals=0.5)
-
-    # Objective
-    CD.set_as_objective()
-
-
-elif optimization_case == 3:
-    # Declaring and naming some variables
-    dynamic_pressure = 0.5*ambient_conditions_group.rho_kg_m3*flight_conditions_group.airspeed_m_s*flight_conditions_group.airspeed_m_s
-    lift = dafoam_function_outputs.lift
-    drag = dafoam_function_outputs.drag
-    CL   = lift/(dynamic_pressure*A0)
-    CD   = drag/(dynamic_pressure*A0)
-
-    # Design variables
-    flight_conditions_group.angle_of_attack_deg.set_as_design_variable(lower=0., upper=10., scaler=1./12)
-    percent_change_in_thickness_dof_wing.set_as_design_variable(lower=-10, upper=30., adder=10., scaler=1./40.)
-    normalized_percent_camber_change_dof_wing.set_as_design_variable(lower=-20., upper=20., scaler=1./20.)
-
-    # Constraints
-    CL.set_as_constraint(equals=0.5)
-
-    # Objective
-    CD.set_as_objective()
-
-
-elif optimization_case == 4:
-    # Declaring and naming some variables
-    dynamic_pressure = 0.5*ambient_conditions_group.rho_kg_m3*flight_conditions_group.airspeed_m_s*flight_conditions_group.airspeed_m_s
-    lift = dafoam_function_outputs.lift
-    drag = dafoam_function_outputs.drag
-    CL   = lift/(dynamic_pressure*A0)
-    CD   = drag/(dynamic_pressure*A0)
-    twist_lim_deg   = 5
-    twist_lim_rad   = twist_lim_deg*np.pi/180
-
-    # Design variables
-    flight_conditions_group.angle_of_attack_deg.set_as_design_variable(lower=-2., upper=10., adder=2., scaler=1./12.)
-    percent_change_in_thickness_dof_wing.set_as_design_variable(lower=-10, upper=30., adder=10., scaler=1./40.)
-    normalized_percent_camber_change_dof_wing.set_as_design_variable(lower=-20., upper=20., scaler=1./20.)
-    wing_twists.set_as_design_variable(lower=-twist_lim_rad, upper=twist_lim_rad, scaler=1/twist_lim_rad)
-
-    # Constraints
-    CL.set_as_constraint(equals=0.5)
-
-    # Objective
-    CD.set_as_objective()
-
-
-elif optimization_case == 5:
-    lift = dafoam_function_outputs.lift
-    drag = dafoam_function_outputs.drag
-
-    # Design variables
-    flight_conditions_group.angle_of_attack_deg.set_as_design_variable(lower=0, upper=10, scaler=1./10.)
-    percent_change_in_thickness_dof_wing.set_as_design_variable(lower=-10, upper=30., adder=10., scaler=1./40.)
-    normalized_percent_camber_change_dof_wing.set_as_design_variable(lower=-20., upper=20., scaler=1./20.)
-
-    # Objectives
-    objective_fun = -lift/drag
-    objective_fun.set_as_objective()
-
-
-elif optimization_case == 6:
-    # Declaring and naming some variables
-    lift = dafoam_function_outputs.lift
-    drag = dafoam_function_outputs.drag
-    twist_lim_deg   = 5
-    twist_lim_rad   = twist_lim_deg*np.pi/180
-
-    # Design variables
-    flight_conditions_group.angle_of_attack_deg.set_as_design_variable(lower=-2., upper=10., adder=2., scaler=1./12.)
-    percent_change_in_thickness_dof_wing.set_as_design_variable(lower=-10, upper=30., adder=10., scaler=1./40.)
-    normalized_percent_camber_change_dof_wing.set_as_design_variable(lower=-20., upper=20., scaler=1./20.)
-    wing_twists.set_as_design_variable(lower=-twist_lim_rad, upper=twist_lim_rad, scaler=1/twist_lim_rad)
-
-    # Objective
-    objective_fun = -lift/drag
-    objective_fun.set_as_objective()
-
-
-elif optimization_case == 7:
-    # Declaring and naming some variables
-    lift = dafoam_function_outputs.lift
-    drag = dafoam_function_outputs.drag
-    twist_lim_deg   = 10
-    twist_lim_rad   = twist_lim_deg*np.pi/180
-
-    # Design variables
-    flight_conditions_group.angle_of_attack_deg.set_as_design_variable(lower=-2., upper=10., adder=2., scaler=1./12.)
-    normalized_percent_camber_change_dof_wing.set_as_design_variable(lower=-30., upper=30., scaler=1./30.)
-    wing_twists.set_as_design_variable(lower=-twist_lim_rad, upper=twist_lim_rad, scaler=1/twist_lim_rad)
-
-    # Objective
-    objective_fun = -lift/drag
-    objective_fun.set_as_objective()
-
-else:
-    print('Not a valid case number')
-
-
 recorder.stop()
 
 
 
 # ===============================
-# region SIM
+# region SIM SETUP
 # ===============================
 sim = csdl.experimental.PySimulator(recorder)
 
-# Only allow visualization and modopt output files on the root rank
-visualize_on_this_rank           = True  if rank == 0 and not is_headless() else False
-turn_off_outputs_on_nonroot_rank = False if rank == 0 else True
-recording_on_root_rank           = True  if rank == 0 else False
 
-# Optimization solver setup and run
-prob        = CSDLAlphaProblem(problem_name=f'{problem_name}', simulator=sim)
 
-# # # PySLSQP optimizer setup
-# # solver_options = {'maxiter': 20,
-# #                   'iprint': 2,
-# #                   'readable_outputs': ['x'],
-# #                   'recording': True,
-# #                   'turn_off_outputs': turn_off_outputs_on_this_rank}
-# # optimizer   = PySLSQP(prob, solver_options=solver_options)
-# # optimizer.solve()
-# # optimizer.print_results()
+# ===============================
+# region TRAINING
+# ===============================
 
-# # OpenSQP optimizer setup
-# open_sqp_options = {'maxiter': 40,
-#                     'readable_outputs': ['x'],
-#                     'recording': True,
-#                     'ls_max_step': 0.5,
-#                     'turn_off_outputs': turn_off_outputs_on_nonroot_rank}
-# optimizer = OpenSQP(prob, **open_sqp_options)
-# optimizer.solve()
-# optimizer.print_results()
 
-# InteriorPoint optimizer setup
-interior_point_options = {'maxiter': 40,
-                          'recording': recording_on_root_rank,
-                          'ls_max_step': 1.,
-                          'turn_off_outputs': turn_off_outputs_on_nonroot_rank}
-optimizer   = InteriorPoint(prob, **interior_point_options)
-optimizer.solve()
-optimizer.print_results()
 
+# Sampling options
+# grassmann_variables indicates the variables which correspond to points on the Grassmann manifold
+# snapshot_variables indicates the variables which correspond to "snapshots" or realizations
+num_grassmann_samples     = 2
+num_snapshot_samples      = 20
+random_state_seed         = 0
+
+# Specify variables and their limits for sampling
+# Expect the following structure:
+# grassmann_vars_and_limits = {
+#   csdl_variable_1: {
+#       'name': name_string,
+#       'range': [min_val, max_val],
+#   }
+#   csdl_variable_2: {...}
+#
+#}
+# snapshot_vars_and_limits = {
+#   csdl_variable_1: {
+#       'name': name_string,
+#       'range': [min_val, max_val],
+#       'ref_val': reference_value,
+#   }
+#   csdl_variable_2: {...}
+#
+#}
+# Make sure that the csdl_variables are the actual csdl_variables
+# The name is for labeling during the file save
+# The range is the limits for sampling
+# The ref_value is the reference value for the particular Grassmann manifold point.
+
+grassmann_vars_and_limits = {
+    # flight_conditions_group.mach_number: {
+    #     'name': 'mach_number',   
+    #     'range': [0.65, 0.75],
+    # }, 
+    flight_conditions_group.angle_of_attack_deg: {
+        'name': 'angle_of_attack_deg',     
+        'range': [0., 10],
+    },
+    # flight_conditions_group.altitude_m: {
+    #     'name': 'altitude_m', 
+    #     'range': [7000., 13000],
+    #     }
+}
+
+snapshot_vars_and_limits = {
+    # percent_change_in_thickness_dof_wing: {
+    #     'name': '%_thickness_change_wing',
+    #     'range': [-10, 10],
+    #     'ref_value': 0, 
+    # },
+    normalized_percent_camber_change_dof_wing: {
+        'name': '%_camber_change_wing',
+        'range': [-10, 10],
+        'ref_value': 0, 
+    },
+    root_twist: {
+        'name': 'root_twist',
+        'range': [-10*np.pi/180, 10*np.pi/180],
+        'ref_value': 0, 
+    },
+    tip_twist: {
+        'name': 'tip_twist',
+        'range': [-10*np.pi/180, 10*np.pi/180],
+        'ref_value': 0, 
+    },
+    mid_twist: {
+        'name': 'mid_twist',
+        'range': [-10*np.pi/180, 10*np.pi/180],
+        'ref_value': 0, 
+    },
+}
+
+data_generator = TrainingDataInterface(dafoam_instance=dafoam_instance, 
+                                            storage_location=storage_location, 
+                                            dataset_keyword=dataset_keyword,
+                                            primary_variables=grassmann_vars_and_limits, 
+                                            secondary_variables=snapshot_vars_and_limits, 
+                                            csdl_simulator=sim,
+                                            num_primary_samples=num_grassmann_samples,
+                                            num_secondary_samples=num_snapshot_samples,
+                                            random_state_seed=random_state_seed,
+                                            h5_file_base_name="point")
+
+data_generator.sample_variables()
+data_generator.run_sweep()

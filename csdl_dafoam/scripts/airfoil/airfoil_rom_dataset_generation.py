@@ -32,20 +32,10 @@ from modopt import CSDLAlphaProblem
 from modopt import PySLSQP, OpenSQP
 
 # IDWarp and DAFoam
-from csdl_idwarp import DAFoamMeshWarper
-from csdl_dafoam import instantiateDAFoam, DAFoamFunctions, DAFoamSolver, compute_dafoam_input_variables
-import standard_atmosphere_model as sam
-
-# BWB specific
-from bwb_helper_functions import setup_geometry, read_geometry_pickle, write_geometry_pickle, gather_array_to_rank0, read_simple_pickle, write_simple_pickle
-
-# Plotting
-from vedo import Points, show
-import matplotlib.pyplot as plt
-from check_headless import is_headless
-
-# Hashing (for file name generation)
-import hashlib
+from csdl_dafoam.core.csdl_idwarp import DAFoamMeshWarper
+from csdl_dafoam.core.csdl_dafoam import instantiateDAFoam, DAFoamFunctions, DAFoamSolver, compute_dafoam_input_variables
+import csdl_dafoam.utils.standard_atmosphere_model as sam
+from csdl_dafoam.utils.runscript_helper_functions import *
 
 #---- DEBUGGING TOOLS ----
 import faulthandler
@@ -351,10 +341,6 @@ sim = csdl.experimental.PySimulator(recorder)
 # ===============================
 # region TRAINING
 # ===============================
-from smt.sampling_methods import LHS
-from rom_training_helper_functions import *
-
-
 # region Options and user setup
 # Storage options
 dataset_keyword       = 'airfoil_training'
@@ -419,7 +405,7 @@ snapshot_vars_and_limits = {
     }
 }
 
-from rom_training_helper_functions import TrainingDataInterface
+from csdl_dafoam.utils.training_interface import TrainingDataInterface
 
 # print(dafoam_instance.getStateVariableMap()[0])
 data_generator = TrainingDataInterface(dafoam_instance=dafoam_instance, 
@@ -434,7 +420,7 @@ data_generator = TrainingDataInterface(dafoam_instance=dafoam_instance,
                                             h5_file_base_name="point")
 
 
-data = data_generator.read_h5_file('/media/edward/DATA/Edward/AFRL_project/csdl_dafoam/openfoam_airfoil/testing_h5_training/point_0.h5', visualize_data=True)
+data = data_generator.read_h5_file(Path(dafoam_directory)/dataset_keyword/"point_0.h5", visualize_data=True)
 # print(data)
 
 # data_generator.sample_variables()

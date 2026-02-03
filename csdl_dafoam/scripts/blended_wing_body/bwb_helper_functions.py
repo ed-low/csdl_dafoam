@@ -3,8 +3,6 @@ import csdl_alpha as csdl
 import lsdo_geo as lg
 
 
-
-from pathlib import Path
 import pickle
 def write_geometry_pickle(geometry, geometry_file_path):
 
@@ -27,74 +25,6 @@ def read_geometry_pickle(geometry_file_path):
 
     return lg.Geometry(functions=function_set.functions, function_names=function_set.function_names, 
                                 name=function_set.name, space=function_set.space)
-
-
-def read_simple_pickle(file_path):
-    with open(file_path, 'rb') as handle:
-        contents = pickle.load(handle)
-
-    return contents
-
-
-def write_simple_pickle(var_to_write, file_path):
-    with open(file_path, 'wb+') as handle:
-        var_to_write_copy = var_to_write.copy()
-        pickle.dump(var_to_write_copy, handle, protocol=pickle.HIGHEST_PROTOCOL)
-
-
-
-from mpi4py import MPI
-def gather_array_to_rank0(x_local: np.ndarray, comm: MPI.Comm = MPI.COMM_WORLD):
-    """
-    Gather local arrays to rank 0.
-    
-    Returns on rank 0:
-        - x_full: (N_total, dim) array
-        - sizes: list of local row counts from each rank
-        - index_ranges: list of (start, stop) tuples for each rank's slice
-    
-    On other ranks:
-        - x_full is None
-        - sizes and index_ranges are available for consistency
-    """
-    rank = comm.Get_rank()
-    size = comm.Get_size()
-
-    local_npts = np.array([x_local.shape[0]], dtype=np.int32)
-    sizes = np.zeros(size, dtype=np.int32)
-    comm.Allgather([local_npts, MPI.INT], [sizes, MPI.INT])
-
-    if x_local.ndim > 1:
-        dim = x_local.shape[1]
-        counts = sizes * dim
-    else:
-        dim = -1
-        counts = sizes
-    displacements = np.insert(np.cumsum(counts), 0, 0)[:-1]
-
-    # Compute start/stop indices for slicing back full array
-    starts = np.insert(np.cumsum(sizes), 0, 0)[:-1]
-    stops = starts + sizes
-    index_ranges = list(zip(starts, stops))
-
-    sendbuf = x_local.flatten()
-    recvbuf = None
-    if rank == 0:
-        total_count = np.sum(counts)
-        recvbuf = np.empty(total_count, dtype=np.float64)
-
-    comm.Gatherv(sendbuf, (recvbuf, counts, displacements, MPI.DOUBLE), root=0)
-
-    if rank == 0:
-        if dim == -1:
-            x_full = recvbuf.reshape((-1))
-        else:
-            x_full = recvbuf.reshape((-1, dim))
-        return x_full, sizes, index_ranges
-    else:
-        return None, sizes, index_ranges
-
-
 
 import lsdo_function_spaces as lfs
 from lsdo_geo.core.parameterization.free_form_deformation_functions import (

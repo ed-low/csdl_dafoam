@@ -3,9 +3,7 @@
 # ===============================
 import numpy as np
 import os
-import time
 from pathlib import Path
-import shutil
 
 # MPI
 from mpi4py import MPI
@@ -15,20 +13,21 @@ import csdl_alpha as csdl
 import lsdo_function_spaces as lfs
 import lsdo_geo
 
+# Optimization
+from modopt import CSDLAlphaProblem
+from modopt import PySLSQP, OpenSQP, InteriorPoint
+
 # IDWarp and DAFoam
-from csdl_idwarp import DAFoamMeshWarper
-from csdl_dafoam import instantiateDAFoam, DAFoamFunctions, DAFoamSolver, compute_dafoam_input_variables
-import standard_atmosphere_model as sam
+from csdl_dafoam.core.csdl_idwarp import DAFoamMeshWarper
+from csdl_dafoam.core.csdl_dafoam import instantiateDAFoam, DAFoamFunctions, DAFoamSolver, compute_dafoam_input_variables
+import csdl_dafoam.utils.standard_atmosphere_model as sam
+from csdl_dafoam.utils.runscript_helper_functions import *
 
 # BWB specific
-from bwb_helper_functions import setup_geometry, read_geometry_pickle, write_geometry_pickle, gather_array_to_rank0, read_simple_pickle, write_simple_pickle
-
-from helper_functions import Timer, hash_array_tol, quiet_barrier, compute_vertex_normals, average_normals_at_duplicate_points
+from bwb_helper_functions import setup_geometry, read_geometry_pickle, write_geometry_pickle
 
 # Plotting
-from vedo import Points, Arrows, Mesh, show
-import matplotlib.pyplot as plt
-from check_headless import is_headless
+from vedo import Points, Arrows, show
 
 #---- DEBUGGING TOOLS ----
 import faulthandler
@@ -50,7 +49,7 @@ stp_file_name             = 'bwbv2_no_wingtip_coarse_refined_flat.stp'
 geometry_pickle_file_name = 'bwb_stored_refit.pickle'
 
 # Mesh
-average_normals_at_edges  = False # if true, this will average the normals of the shared point between two surfaces (might be useful for some cases)
+average_normals_at_edges  = True # if true, this will average the normals of the shared point between two surfaces (might be useful for some cases)
 
 # MPI and timing
 comm           = MPI.COMM_WORLD
@@ -62,8 +61,8 @@ interactive_plots = False
 
 
 # DAFoam
-dafoam_directory    = os.path.join(os.getcwd(), 'openfoam_739k_bwb_symmetry/')
-dafoamPrintInterval = 1 # This doesn't actually seem to affect anything...
+dafoam_directory    = os.path.join(os.getcwd(), 'openfoam_669k_bwb_symmetry/')
+dafoamPrintInterval = 100
 
 # Initial/reference values for DAFoam (best to use base conditions)
 # These correspond to M=0.75 @ 30k feet
@@ -76,6 +75,15 @@ aoa0      = 0
 A0        = 518           # Projected area of entire BWB. Used for normalizing CD and CL
 rho0      = p0 / T0 / 287 # used for normalizing CD and CL
 
+# wall_list = ['wall_wing_cap',
+#             'wall_wing',
+#             'wall_transition',
+#             'wall_body']
+# #
+#    'wall_wing_cap_edge',
+#    'wall_trailing_surf_wing',
+#    'wall_trailing_surf_transition',
+#    'wall_trailing_surf_body', 
 # wall_list = ["wall"]
 wall_list = ['wall_body_lower',
              'wall_body_upper', 
@@ -121,9 +129,6 @@ da_options = {
     # transonic preconditioner to speed up the ff convergence
     "transonicPCOption": 2,
     "adjPCLag": 5,
-    # "adjEqnOption": {"gmresRelTol": 1.0e-6, "pcFillLevel": 1, "jacMatReOrdering": "rcm", "useNonZeroInitGuess": False},
-    # # transonic preconditioner to speed up the adjoint convergence
-    # "transonicPCOption": 1,
     "normalizeStates": {
         "U": U0,
         "p": p0,
@@ -157,7 +162,11 @@ da_options = {
             "patches": ["inout"],
             "components": ["solver", "function"],
         },
-    }
+    },
+    "writeAdjointFields": False,
+    "debug": False,
+    "printDAOptions": True,
+    "printInterval": dafoamPrintInterval,
 }
 
 # region Mesh options
@@ -179,7 +188,7 @@ rank_str  = f"{rank:0{len(str(comm_size-1))}d}" # string with zero-padded rank i
 
 
 # region DAFoam instance
-dafoam_instance               = instantiateDAFoam(da_options, comm, str(dafoam_directory), mesh_options)
+dafoam_instance               = instantiateDAFoam(da_options, comm, dafoam_directory, mesh_options)
 dafoam_instance.printInterval = dafoamPrintInterval
 x_surf_dafoam_initial_local   = dafoam_instance.getSurfaceCoordinates()
 x_vol_dafoam_initial_local    = dafoam_instance.xv0
@@ -356,12 +365,12 @@ else:
                     x_surf_dafoam_initial, 
                     grid_search_density_parameter = 1,      # 1 
                     projection_tolerance          = 1e-3,   # 1.e-3m 
-                    grid_search_density_cutoff    = 12,    # 150
+                    grid_search_density_cutoff    = 150,    # 20
                     force_reprojection            = False,
                     plot                          = show_plots and not is_headless(),
                     interactive                   = interactive_plots,                     
                     direction                     = normals,
-                    num_workers                   = comm_size
+                    num_workers                   = 48
                 )
 
             print('Writing surface mesh projection pickle...')
@@ -502,288 +511,194 @@ with csdl.experimental.mpi.enter_mpi_region(rank, comm) as mpi_region:
     mpi_region.set_as_global_output(dafoam_function_outputs.lift)
     mpi_region.set_as_global_output(dafoam_function_outputs.drag)
 
+
+# region Optimization problem selection
+# optimization_case options
+# 1: Maximize CL/CD wrt angle-of-attack
+# 2: Minimize CD wrt angle-of-attack, root/tip twist, constrained by CL=0.5
+# 3: Minimize CD wrt angle-of-attack, wing shape (thickness/camber ffd), constrained by CL=0.5
+# 4: Minimize CD wrt angle-of-attack, wing shape (thickness/camber ffd) and wing twists, constrained by CL=0.5
+# 5: Maximize CL/CD wrt angle-of-attack and wing shape (thickness/camber ffd)
+# 6: Maximize CL/CD wrt angle-of-attack, wing shape (thickness/camber ffd) and wing twists
+# 7: Maximize CL/CD wrt angle-of-attack, wing shape (camber ffd) and wing twists
+optimization_case = 5
+
+
+if optimization_case == 1:
+    # Declaring and naming some variables
+    lift = dafoam_function_outputs.lift
+    drag = dafoam_function_outputs.drag
+
+    # Design variables
+    flight_conditions_group.angle_of_attack_deg.set_as_design_variable(lower=0, upper=10)
+
+    # Objectives
+    objective_fun = -lift/drag
+    objective_fun.set_as_objective()
+
+
+elif optimization_case == 2:
+    # Declaring and naming some variables
+    dynamic_pressure = 0.5*ambient_conditions_group.rho_kg_m3*flight_conditions_group.airspeed_m_s*flight_conditions_group.airspeed_m_s
+    lift = dafoam_function_outputs.lift
+    drag = dafoam_function_outputs.drag
+    CL   = lift/(dynamic_pressure*A0)
+    CD   = drag/(dynamic_pressure*A0)
+    root_twist.name = 'root_twist'
+    tip_twist.name  = 'tip_twist'
+    twist_lim_deg   = 5
+    twist_lim_rad   = twist_lim_deg*np.pi/180
+
+    # Design variables
+    flight_conditions_group.angle_of_attack_deg.set_as_design_variable(lower=0, upper=10)
+    root_twist.set_as_design_variable(lower=-twist_lim_rad, upper=twist_lim_rad, scaler=1/twist_lim_rad)
+    tip_twist.set_as_design_variable(lower=-twist_lim_rad, upper=twist_lim_rad, scaler=1/twist_lim_rad)
+
+    # Constraints
+    CL.set_as_constraint(equals=0.5)
+
+    # Objective
+    CD.set_as_objective()
+
+
+elif optimization_case == 3:
+    # Declaring and naming some variables
+    dynamic_pressure = 0.5*ambient_conditions_group.rho_kg_m3*flight_conditions_group.airspeed_m_s*flight_conditions_group.airspeed_m_s
+    lift = dafoam_function_outputs.lift
+    drag = dafoam_function_outputs.drag
+    CL   = lift/(dynamic_pressure*A0)
+    CD   = drag/(dynamic_pressure*A0)
+
+    # Design variables
+    flight_conditions_group.angle_of_attack_deg.set_as_design_variable(lower=0., upper=10., scaler=1./12)
+    percent_change_in_thickness_dof_wing.set_as_design_variable(lower=-10, upper=30., adder=10., scaler=1./40.)
+    normalized_percent_camber_change_dof_wing.set_as_design_variable(lower=-20., upper=20., scaler=1./20.)
+
+    # Constraints
+    CL.set_as_constraint(equals=0.5)
+
+    # Objective
+    CD.set_as_objective()
+
+
+elif optimization_case == 4:
+    # Declaring and naming some variables
+    dynamic_pressure = 0.5*ambient_conditions_group.rho_kg_m3*flight_conditions_group.airspeed_m_s*flight_conditions_group.airspeed_m_s
+    lift = dafoam_function_outputs.lift
+    drag = dafoam_function_outputs.drag
+    CL   = lift/(dynamic_pressure*A0)
+    CD   = drag/(dynamic_pressure*A0)
+    twist_lim_deg   = 5
+    twist_lim_rad   = twist_lim_deg*np.pi/180
+
+    # Design variables
+    flight_conditions_group.angle_of_attack_deg.set_as_design_variable(lower=-2., upper=10., adder=2., scaler=1./12.)
+    percent_change_in_thickness_dof_wing.set_as_design_variable(lower=-10, upper=30., adder=10., scaler=1./40.)
+    normalized_percent_camber_change_dof_wing.set_as_design_variable(lower=-20., upper=20., scaler=1./20.)
+    wing_twists.set_as_design_variable(lower=-twist_lim_rad, upper=twist_lim_rad, scaler=1/twist_lim_rad)
+
+    # Constraints
+    CL.set_as_constraint(equals=0.5)
+
+    # Objective
+    CD.set_as_objective()
+
+
+elif optimization_case == 5:
+    lift = dafoam_function_outputs.lift
+    drag = dafoam_function_outputs.drag
+
+    # Design variables
+    flight_conditions_group.angle_of_attack_deg.set_as_design_variable(lower=0, upper=10, scaler=1./10.)
+    percent_change_in_thickness_dof_wing.set_as_design_variable(lower=-10, upper=30., adder=10., scaler=1./40.)
+    normalized_percent_camber_change_dof_wing.set_as_design_variable(lower=-20., upper=20., scaler=1./20.)
+
+    # Objectives
+    objective_fun = -lift/drag
+    objective_fun.set_as_objective()
+
+
+elif optimization_case == 6:
+    # Declaring and naming some variables
+    lift = dafoam_function_outputs.lift
+    drag = dafoam_function_outputs.drag
+    twist_lim_deg   = 5
+    twist_lim_rad   = twist_lim_deg*np.pi/180
+
+    # Design variables
+    flight_conditions_group.angle_of_attack_deg.set_as_design_variable(lower=-2., upper=10., adder=2., scaler=1./12.)
+    percent_change_in_thickness_dof_wing.set_as_design_variable(lower=-10, upper=30., adder=10., scaler=1./40.)
+    normalized_percent_camber_change_dof_wing.set_as_design_variable(lower=-20., upper=20., scaler=1./20.)
+    wing_twists.set_as_design_variable(lower=-twist_lim_rad, upper=twist_lim_rad, scaler=1/twist_lim_rad)
+
+    # Objective
+    objective_fun = -lift/drag
+    objective_fun.set_as_objective()
+
+
+elif optimization_case == 7:
+    # Declaring and naming some variables
+    lift = dafoam_function_outputs.lift
+    drag = dafoam_function_outputs.drag
+    twist_lim_deg   = 10
+    twist_lim_rad   = twist_lim_deg*np.pi/180
+
+    # Design variables
+    flight_conditions_group.angle_of_attack_deg.set_as_design_variable(lower=-2., upper=10., adder=2., scaler=1./12.)
+    normalized_percent_camber_change_dof_wing.set_as_design_variable(lower=-30., upper=30., scaler=1./30.)
+    wing_twists.set_as_design_variable(lower=-twist_lim_rad, upper=twist_lim_rad, scaler=1/twist_lim_rad)
+
+    # Objective
+    objective_fun = -lift/drag
+    objective_fun.set_as_objective()
+
+else:
+    print('Not a valid case number')
+
+
 recorder.stop()
 
 
 
 # ===============================
-# region SIM SETUP
+# region SIM
 # ===============================
 sim = csdl.experimental.PySimulator(recorder)
 
+# Only allow visualization and modopt output files on the root rank
+visualize_on_this_rank           = True  if rank == 0 and not is_headless() else False
+turn_off_outputs_on_nonroot_rank = False if rank == 0 else True
+recording_on_root_rank           = True  if rank == 0 else False
 
+# Optimization solver setup and run
+prob        = CSDLAlphaProblem(problem_name=f'{problem_name}', simulator=sim)
 
-# ===============================
-# region TRAINING
-# ===============================
-from smt.sampling_methods import LHS
-from rom_training_helper_functions import *
+# # # PySLSQP optimizer setup
+# # solver_options = {'maxiter': 20,
+# #                   'iprint': 2,
+# #                   'readable_outputs': ['x'],
+# #                   'recording': True,
+# #                   'turn_off_outputs': turn_off_outputs_on_this_rank}
+# # optimizer   = PySLSQP(prob, solver_options=solver_options)
+# # optimizer.solve()
+# # optimizer.print_results()
 
+# # OpenSQP optimizer setup
+# open_sqp_options = {'maxiter': 40,
+#                     'readable_outputs': ['x'],
+#                     'recording': True,
+#                     'ls_max_step': 0.5,
+#                     'turn_off_outputs': turn_off_outputs_on_nonroot_rank}
+# optimizer = OpenSQP(prob, **open_sqp_options)
+# optimizer.solve()
+# optimizer.print_results()
 
-# region Options and user setup
-# Storage options
-dataset_keyword       = 'bwb_training_testing'
-storage_location      = Path(dafoam_directory)
+# InteriorPoint optimizer setup
+interior_point_options = {'maxiter': 40,
+                          'recording': recording_on_root_rank,
+                          'ls_max_step': 1.,
+                          'turn_off_outputs': turn_off_outputs_on_nonroot_rank}
+optimizer   = InteriorPoint(prob, **interior_point_options)
+optimizer.solve()
+optimizer.print_results()
 
-# Sampling options
-# grassmann_variables indicates the variables which correspond to points on the Grassmann manifold
-# snapshot_variables indicates the variables which correspond to "snapshots" or realizations
-num_grassmann_samples     = 10
-num_snapshot_samples      = 20
-random_state_seed         = 0
-
-# Specify variables and their limits for sampling
-# Expect the following structure:
-# grassmann_vars_and_limits = {
-#   csdl_variable_1: {
-#       'name': name_string,
-#       'range': [min_val, max_val],
-#   }
-#   csdl_variable_2: {...}
-#
-#}
-# snapshot_vars_and_limits = {
-#   csdl_variable_1: {
-#       'name': name_string,
-#       'range': [min_val, max_val],
-#       'ref_val': reference_value,
-#   }
-#   csdl_variable_2: {...}
-#
-#}
-# Make sure that the csdl_variables are the actual csdl_variables
-# The name is for labeling during the file save
-# The range is the limits for sampling
-# The ref_value is the reference value for the particular Grassmann manifold point.
-
-grassmann_vars_and_limits = {
-    # flight_conditions_group.mach_number: {
-    #     'name': 'mach_number',   
-    #     'range': [0.65, 0.75],
-    # }, 
-    flight_conditions_group.angle_of_attack_deg: {
-        'name': 'angle_of_attack_deg',     
-        'range': [0., 10],
-    },
-    # flight_conditions_group.altitude_m: {
-    #     'name': 'altitude_m', 
-    #     'range': [7000., 13000],
-    #     }
-}
-
-snapshot_vars_and_limits = {
-    # percent_change_in_thickness_dof_wing: {
-    #     'name': '%_thickness_change_wing',
-    #     'range': [-10, 10],
-    #     'ref_value': 0, 
-    # },
-    normalized_percent_camber_change_dof_wing: {
-        'name': '%_camber_change_wing',
-        'range': [-10, 10],
-        'ref_value': 0, 
-    },
-    root_twist: {
-        'name': 'root_twist',
-        'range': [-10*np.pi/180, 10*np.pi/180],
-        'ref_value': 0, 
-    },
-    tip_twist: {
-        'name': 'tip_twist',
-        'range': [-10*np.pi/180, 10*np.pi/180],
-        'ref_value': 0, 
-    },
-    mid_twist: {
-        'name': 'mid_twist',
-        'range': [-10*np.pi/180, 10*np.pi/180],
-        'ref_value': 0, 
-    },
-}
-
-
-from rom_training_helper_functions import TrainingDataInterface
-
-# print(dafoam_instance.getStateVariableMap()[0])
-data_generator = DAFoamCSDLDatasetGenerator(dafoam_instance=dafoam_instance, 
-                                            csdl_simulator=sim, 
-                                            primary_variables=grassmann_vars_and_limits, 
-                                            secondary_variables=snapshot_vars_and_limits, 
-                                            storage_location=storage_location, 
-                                            dataset_keyword=dataset_keyword,
-                                            num_primary_samples=num_grassmann_samples,
-                                            num_secondary_samples=num_snapshot_samples,
-                                            random_state_seed=random_state_seed,
-                                            h5_file_base_name="point")
-
-
-data = data_generator.read_h5_file('/media/edward/DATA/Edward/AFRL_project/csdl_dafoam/openfoam_airfoil/testing_h5_training/point_0.h5', visualize_data=True)
-# print(data)
-
-# data_generator.sample_variables()
-# data_generator.run_sweep()
-
-
-
-# # region Initialization
-# # Generate PETSc vector for state storage (will use this for writing to file)
-# petsc_states           = dafoam_instance.array2Vec(dafoam_instance.getStates())
-# petsc_vert_coords      = dafoam_instance.array2Vec(x_vol_dafoam.value)
-# petsc_centroid_coords  = dafoam_instance.array2Vec(dafoam_instance.getCellCentroids())
-
-# # Make directory
-# if rank == 0:
-#     os.makedirs(storage_location/dataset_keyword, exist_ok = True)
-
-# # Make dafoam_directory path a Path
-# dafoam_directory = Path(dafoam_directory)
-
-# quiet_barrier(comm)
-
-# # Build limits for sampling
-# xlimits_grassmann, labels_grassmann, slicer_grassmann, shapes_grassmann = build_xlimits(grassmann_vars_and_limits)
-# xlimits_snapshot,  labels_snapshot,  slicer_snapshot,  shapes_snapshot  = build_xlimits(snapshot_vars_and_limits)
-
-# # Create LHS samplers and sample
-# lhs_grassmann         = LHS(xlimits=xlimits_grassmann, criterion='m', random_state=random_state_seed)
-# grassmann_raw_samples = lhs_grassmann(num_grassmann_samples)
-# grassmann_samples     = reshape_samples(grassmann_raw_samples, slicer_grassmann, shapes_grassmann)
-
-# lhs_snapshot          = LHS(xlimits=xlimits_snapshot,  criterion='m', random_state=random_state_seed)
-# snapshot_raw_samples  = lhs_snapshot(num_snapshot_samples)
-# snapshot_samples      = reshape_samples(snapshot_raw_samples, slicer_snapshot, shapes_snapshot)
-
-# print(labels_grassmann)
-# print(labels_snapshot)
-
-# # Print to console
-# if rank == 0:
-#     print_sample_table(grassmann_vars_and_limits, grassmann_raw_samples)
-#     print_sample_table(snapshot_vars_and_limits, snapshot_raw_samples)
-
-# quiet_barrier(comm)
-
-
-# # region Begin sampling
-# # Loop through each Grassmann point
-# for grassmann_index in range(len(grassmann_samples)):
-#     # TODO: (re)initialize solver with better initial condition for new grassmann point
-    
-#     # Dataset file name (.h5 file)
-#     file_name = storage_location/dataset_keyword/f'{dataset_keyword}_point{grassmann_index}.h5'
-        
-#     if rank == 0:
-#         # Make a folder for the raw OpenFOAM save
-#         raw_directory = storage_location/dataset_keyword/f'{dataset_keyword}_point{grassmann_index}_raw'
-#         os.makedirs(raw_directory, exist_ok = True)
-
-#         # Copy the constant folder to the raw directory
-#         current_directory = Path.cwd()
-#         os.chdir(dafoam_directory)
-#         shutil.copytree('./constant', raw_directory/'constant')
-#         os.chdir(current_directory)
-
-#     # Update all of the grassmann parameters for current point
-#     for key in grassmann_samples[grassmann_index].keys():
-#             sim[key] = grassmann_samples[grassmann_index][key]
-
-
-#     if rank == 0:
-#         print('\n\n\n\n')
-#         print('=============================================')
-#         print(f'Grassmann point {grassmann_index+1}/{num_grassmann_samples}, reference snapshot')
-#         print('=============================================\n')
-
-#     # Compute the reference state for this point on the manifold
-#     for key in snapshot_vars_and_limits.keys():
-#         sim[key] = snapshot_vars_and_limits[key]['ref_value']*np.ones(key.shape)
-    
-#     sim.run()
-
-#     # Update PETSc vector to most recent solution
-#     dafoam_instance.arrayVal2Vec(dafoam_instance.getStates(), petsc_states)
-#     dafoam_instance.arrayVal2Vec(sim[x_vol_dafoam], petsc_vert_coords)
-#     dafoam_instance.arrayVal2Vec(dafoam_instance.getCellCentroids(), petsc_centroid_coords)
-
-#     write_snapshot(
-#         file_name,
-#         petsc_states,
-#         snapshot_index=None,
-#         snapshot_configurations=snapshot_raw_samples,
-#         grassmann_configuration=grassmann_raw_samples[grassmann_index],
-#         snapshot_parameter_labels=labels_snapshot,
-#         grassmann_parameter_labels=labels_grassmann,
-#         vertex_coordinates=petsc_vert_coords,
-#         centroid_coordinates=petsc_centroid_coords,
-#         converged=dafoam_solver.last_time_converged,
-#         reference_snapshot=True,
-#         comm=dafoam_instance.comm
-#     )
-    
-#     # Move OpenFOAM solution to solution directory
-#     current_directory = Path.cwd()
-#     os.chdir(dafoam_directory)
-    
-#     dafoam_instance.renameSolution(9998)
-    
-#     if rank == 0:
-#         if comm_size > 1:
-#             for i in range(comm_size):
-#                 shutil.move(dafoam_directory/f'processor{i}'/'0.9998', 
-#                         raw_directory/f'processor{i}'/'-1')
-#                 shutil.copytree(dafoam_directory/f'processor{i}'/'constant', 
-#                             raw_directory/f'processor{i}'/'constant')
-#         else:
-#             shutil.move(dafoam_directory/'0.9998', 
-#                         raw_directory/f'-1')
-#     os.chdir(current_directory)
-
-
-#     # Loop through each snapshot configuration
-#     for snapshot_index in range(len(snapshot_samples)):
-#         if rank == 0:
-#             print('\n\n\n\n')
-#             print('=============================================')
-#             print(f'Grassmann point {grassmann_index+1}/{num_grassmann_samples}, snapshot {snapshot_index+1}/{num_snapshot_samples}')
-#             print('=============================================\n')
-        
-#         # Update all of the snapshot parameters for current configuration
-#         for key in snapshot_samples[snapshot_index].keys():
-#             sim[key] = snapshot_samples[snapshot_index][key]
-
-#         # Primal solve
-#         sim.run()
-
-#         # Update PETSc vectors to most recent solution
-#         dafoam_instance.arrayVal2Vec(dafoam_instance.getStates(), petsc_states)
-#         dafoam_instance.arrayVal2Vec(sim[x_vol_dafoam], petsc_vert_coords)
-
-#         write_snapshot(
-#             file_name,
-#             petsc_states,
-#             snapshot_index=snapshot_index,
-#             snapshot_configurations=snapshot_raw_samples,
-#             grassmann_configuration=grassmann_raw_samples[grassmann_index],
-#             snapshot_parameter_labels=None,
-#             grassmann_parameter_labels=None,
-#             vertex_coordinates=petsc_vert_coords,
-#             centroid_coordinates=petsc_centroid_coords,       
-#             converged=dafoam_solver.last_time_converged,
-#             reference_snapshot=False,
-#             comm=dafoam_instance.comm
-#         )
-
-#         # Move OpenFOAM solution to solution directory
-#         current_directory = Path.cwd()
-#         os.chdir(dafoam_directory)
-        
-#         dafoam_instance.renameSolution(9998)
-        
-#         if rank == 0:
-#             if comm_size > 1:
-#                 for i in range(comm_size):
-#                     shutil.move(dafoam_directory/f'processor{i}'/'0.9998/', 
-#                             raw_directory/f'processor{i}'/f'{snapshot_index:04}')
-#             else:
-#                 shutil.move(dafoam_directory/'0.9998', 
-#                         raw_directory/f'{snapshot_index:04}')
-        
-#         os.chdir(current_directory)
