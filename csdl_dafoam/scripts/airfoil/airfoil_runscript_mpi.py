@@ -46,8 +46,8 @@ os.environ["PETSC_OPTIONS"] = "-malloc_debug"
 # ===============================
 # region USER INPUT
 # ===============================
-# Keyword for optimization name (optimization results folder will be saved with this name)
-problem_name              = 'airfoil_test'
+# Keyword for optimization name (optimization results folder will be saved with this name in dafoam directory)
+problem_name              = 'airfoil_setup_test'
 
 # Geometry
 geometry_directory        =  os.path.join(os.getcwd(), 'airfoil_geometry/')
@@ -59,7 +59,7 @@ comm           = MPI.COMM_WORLD
 TIMING_ENABLED = True  # True if we want timing printed for the CSDL operations
 
 # DAFoam
-dafoam_directory = os.path.join(os.getcwd(), 'openfoam_airfoil/')
+dafoam_directory = os.path.join(os.getcwd(), f'results/{problem_name}/')
 dafoamPrintInterval = 100
 
 # Initial/reference values for DAFoam (best to use base conditions)

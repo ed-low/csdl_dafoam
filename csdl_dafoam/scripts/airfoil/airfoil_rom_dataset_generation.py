@@ -61,7 +61,7 @@ comm           = MPI.COMM_WORLD
 TIMING_ENABLED = True  # True if we want timing printed for the CSDL operations
 
 # DAFoam
-dafoam_directory = Path.cwd()/'openfoam_airfoil/'
+dafoam_directory = Path.cwd()/'results'/f'{problem_name}'
 
 # Initial/reference values for DAFoam (best to use base conditions)
 U0        = 238.0         # used for normalizing CD and CL

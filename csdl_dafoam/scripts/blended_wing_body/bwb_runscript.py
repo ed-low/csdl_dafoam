@@ -59,9 +59,8 @@ timing_enabled = True  # True if we want timing printed for the CSDL operations
 show_plots        = False
 interactive_plots = False
 
-
 # DAFoam
-dafoam_directory    = os.path.join(os.getcwd(), 'openfoam_669k_bwb_symmetry/')
+dafoam_directory    = os.path.join(os.getcwd(), f'results/{problem_name}/')
 dafoamPrintInterval = 100
 
 # Initial/reference values for DAFoam (best to use base conditions)

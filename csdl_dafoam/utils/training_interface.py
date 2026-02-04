@@ -23,7 +23,8 @@ class TrainingDataInterface():
                  num_primary_samples=2,
                  num_secondary_samples=20,
                  random_state_seed=0,
-                 h5_file_base_name="point"
+                 h5_file_base_name="point",
+                 gather_raw_files=True
                  ):
         
         # TODO: See if there is DAFoam API to get whether a variable is volVectorStates, volScalarStates, modelStates, or surfaceScalarStates.
@@ -45,6 +46,7 @@ class TrainingDataInterface():
         self.num_secondary_samples      = num_secondary_samples
         self.random_state_seed          = random_state_seed
         self.h5_file_base_name          = h5_file_base_name
+        self.gather_raw_files           = gather_raw_files
 
         # MPI values for easier access
         self.comm                       = dafoam_instance.comm
@@ -123,7 +125,7 @@ class TrainingDataInterface():
 
             print(f'Rank {rank} done initializing!')
 
-            if self.rank == 0:
+            if self.rank == 0 and self.gather_raw_files:
                 # Make a folder for the raw OpenFOAM save
                 raw_directory = self.storage_location/self.dataset_keyword/f'{self.h5_file_base_name}_{primary_idx}_raw'
                 os.makedirs(raw_directory, exist_ok = True)
@@ -155,25 +157,26 @@ class TrainingDataInterface():
                 self.write_sample(h5file_path, secondary_idx)
 
                 # Move OpenFOAM solution to solution directory
-                current_directory = Path.cwd()
-                os.chdir(dafoam_directory)
-                dafoam_instance.renameSolution(9998)
-                
-                if rank == 0:
-                    if comm_size > 1:
-                        for i in range(comm_size):
-                            shutil.move(dafoam_directory/f'processor{i}'/'0.9998/', 
-                                    raw_directory/f'processor{i}'/f'{secondary_idx:04}')
-                           
-                            # Copy constant folder to directory (only need to do this once)
-                            if primary_idx == 0 and secondary_idx == 0:
-                                shutil.copytree(dafoam_directory/f'processor{i}'/'constant', 
-                                raw_directory/f'processor{i}'/'constant')
-                    else:
-                        shutil.move(dafoam_directory/'0.9998', 
-                                raw_directory/f'{secondary_idx:04}')
-                
-                os.chdir(current_directory)
+                if self.gather_raw_files:
+                    current_directory = Path.cwd()
+                    os.chdir(dafoam_directory)
+                    dafoam_instance.renameSolution(9998)
+                    
+                    if rank == 0:
+                        if comm_size > 1:
+                            for i in range(comm_size):
+                                shutil.move(dafoam_directory/f'processor{i}'/'0.9998/', 
+                                        raw_directory/f'processor{i}'/f'{secondary_idx:04}')
+                            
+                                # Copy constant folder to directory (only need to do this once)
+                                if primary_idx == 0 and secondary_idx == 0:
+                                    shutil.copytree(dafoam_directory/f'processor{i}'/'constant', 
+                                    raw_directory/f'processor{i}'/'constant')
+                        else:
+                            shutil.move(dafoam_directory/'0.9998', 
+                                    raw_directory/f'{secondary_idx:04}')
+                    
+                    os.chdir(current_directory)
 
     
     # region initialize_h5_file
