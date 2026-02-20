@@ -274,3 +274,34 @@ def average_normals_at_duplicate_points(points, normals):
         normals_out[dup_indices] = avg_n/np.linalg.norm(avg_n)
 
     return normals_out
+
+
+
+# region print_runscript_info
+def print_runscript_info():
+    """
+    Print the command line invocation and script content to console.
+    Useful for documenting simulation runs in output logs.
+    """
+    # Print command line invocation
+    print("="*80)
+    print("COMMAND LINE:")
+    print(" ".join(sys.argv))
+    print("="*80)
+    
+    # Print script content
+    script_path = sys.argv[0]
+    try:
+        with open(script_path, 'r') as f:
+            script_content = f.read()
+        
+        print("BEGIN RUNSCRIPT CONTENT:")
+        print("="*80)
+        print(script_content)
+        print("END RUNSCRIPT CONTENT:")
+        print("="*80)
+        print()  # Extra newline before actual output starts
+    except FileNotFoundError:
+        print(f"Warning: Could not read script file at {script_path}")
+        print("="*80)
+        print()
