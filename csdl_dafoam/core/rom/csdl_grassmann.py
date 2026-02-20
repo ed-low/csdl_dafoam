@@ -1,7 +1,7 @@
 import numpy as np
 import csdl_alpha as csdl
 import os
-from custom_explicit_reduced_svd import customExplicitReducedSVD
+from csdl_dafoam.utils.custom_explicit_reduced_svd import customExplicitReducedSVD
 from mpi4py import MPI
 
 

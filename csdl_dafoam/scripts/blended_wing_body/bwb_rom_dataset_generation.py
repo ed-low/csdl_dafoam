@@ -34,13 +34,14 @@ faulthandler.enable()
 os.environ["PETSC_OPTIONS"] = "-malloc_debug"
 #-------------------------
 
-
+# Write this runscript to file before anything
+print_runscript_info()
 
 # ===============================
 # region USER INPUT
 # ===============================
 # Keyword for optimization name (optimization results folder will be saved with this name)
-problem_name              = 'bwb_test'
+problem_name              = 'bwb_training_test'
 
 # Geometry
 geometry_directory        =  os.path.join(os.getcwd(), 'bwb_geometry/')
@@ -60,7 +61,7 @@ interactive_plots = False
 
 
 # DAFoam
-dafoam_directory    = os.path.join(os.getcwd(), 'openfoam_669k_bwb_symmetry/')
+dafoam_directory    = os.path.join(os.getcwd(), f'results/{problem_name}')
 dafoamPrintInterval = 100 
 
 # Initial/reference values for DAFoam (best to use base conditions)
@@ -587,11 +588,23 @@ snapshot_vars_and_limits = {
     },
 }
 
+# A dictionary of variables whose values are important to know if one wants to rerun the simulation
+# For instance, while angle of attack might be a sampled variable, we'd need to know that we were also at a specific altitude and Mach number
+important_non_sampled_variables = {
+    flight_conditions_group.airspeed_m_s: {
+        "name": "airspeed_m_s"
+    }, 
+    flight_conditions_group.altitude_m: {
+        "name": "altitude_m"
+    }
+}
+
 data_generator = TrainingDataInterface(dafoam_instance=dafoam_instance, 
                                             storage_location=storage_location, 
                                             dataset_keyword=dataset_keyword,
                                             primary_variables=grassmann_vars_and_limits, 
-                                            secondary_variables=snapshot_vars_and_limits, 
+                                            secondary_variables=snapshot_vars_and_limits,
+                                            non_sampled_variables=important_non_sampled_variables, 
                                             csdl_simulator=sim,
                                             num_primary_samples=num_grassmann_samples,
                                             num_secondary_samples=num_snapshot_samples,

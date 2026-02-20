@@ -41,13 +41,14 @@ faulthandler.enable()
 os.environ["PETSC_OPTIONS"] = "-malloc_debug"
 #-------------------------
 
-
+# Write this runscript to file before anything
+print_runscript_info()
 
 # ===============================
 # region USER INPUT
 # ===============================
 # Keyword for optimization name (optimization results folder will be saved with this name in dafoam directory)
-problem_name              = 'airfoil_setup_test'
+problem_name              = 'ls_max_step_0_5_test'
 
 # Geometry
 geometry_directory        =  os.path.join(os.getcwd(), 'airfoil_geometry/')
@@ -443,42 +444,44 @@ sim = csdl.experimental.PySimulator(recorder)
 visualize_on_this_rank           = True  if rank == 0 and not is_headless() else False
 turn_off_outputs_on_nonroot_rank = False if rank == 0 else True
 recording_on_root_rank           = True  if rank == 0 else False
+rank_outputs                     = ['x'] if rank == 0 else []
 
 # Optimization solver setup and run
-prob        = CSDLAlphaProblem(problem_name=f'{problem_name}', simulator=sim)
+prob                = CSDLAlphaProblem(problem_name=f'{problem_name}', simulator=sim)
+optimizer_choice    = 2 # Set to 1 for PySLSQP, 2 for OpenSQP, or 3 for InteriorPoint
 
-# # # PySLSQP optimizer setup
-# # solver_options = {'maxiter': 20,
-# #                   'iprint': 2,
-# #                   'readable_outputs': ['x'],
-# #                   'recording': True,
-# #                   'turn_off_outputs': turn_off_outputs_on_this_rank}
-# # optimizer   = PySLSQP(prob, solver_options=solver_options)
-# # optimizer.solve()
-# # optimizer.print_results()
+if optimizer_choice == 1:
+    # PySLSQP optimizer setup
+    solver_options = {'maxiter': 20,
+                    'iprint': 2,
+                    'readable_outputs': rank_outputs,
+                    'recording': recording_on_root_rank,
+                    'turn_off_outputs': turn_off_outputs_on_nonroot_rank}
+    optimizer   = PySLSQP(prob, solver_options=solver_options)
+    optimizer.solve()
+    optimizer.print_results()
 
-# # OpenSQP optimizer setup
-# open_sqp_options = {'maxiter': 40,
-#                     'readable_outputs': ['x'],
-#                     'recording': True,
-#                     'ls_max_step': 0.5,
-#                     'turn_off_outputs': turn_off_outputs_on_nonroot_rank}
-# optimizer = OpenSQP(prob, **open_sqp_options)
-# optimizer.solve()
-# optimizer.print_results()
+elif optimizer_choice == 2:
+    # OpenSQP optimizer setup
+    open_sqp_options = {'maxiter': 40,
+                        'readable_outputs': rank_outputs,
+                        'recording': recording_on_root_rank,
+                        'ls_max_step': 0.5,
+                        'turn_off_outputs': turn_off_outputs_on_nonroot_rank}
+    optimizer = OpenSQP(prob, **open_sqp_options)
+    optimizer.solve()
+    optimizer.print_results()
 
-# InteriorPoint optimizer setup
-interior_point_options = {'maxiter': 40,
-                          'recording': recording_on_root_rank,
-                          'ls_max_step': 1.,
-                          'turn_off_outputs': turn_off_outputs_on_nonroot_rank}
-optimizer   = InteriorPoint(prob, **interior_point_options)
-optimizer.solve()
-optimizer.print_results()
-
-
-
-
-
-# # Extra items to use, if necessary
-# optimizer.check_first_derivatives(prob.x0)
+elif optimizer_choice == 3:
+    # InteriorPoint optimizer setup
+    interior_point_options = {'maxiter': 40,
+                            'readable_outputs': rank_outputs,
+                            'recording': recording_on_root_rank,
+                            'ls_max_step': 1.,
+                            'turn_off_outputs': turn_off_outputs_on_nonroot_rank}
+    optimizer   = InteriorPoint(prob, **interior_point_options)
+    optimizer.solve()
+    optimizer.print_results()
+    
+else:
+    print(f'Check optimizer choice. {optimizer_choice} is not an option.')
