@@ -48,7 +48,7 @@ print_runscript_info()
 # region USER INPUT
 # ===============================
 # Keyword for optimization name (optimization results folder will be saved with this name in dafoam directory)
-problem_name              = 'ls_max_step_0_5_test'
+problem_name              = 'airfoil_setup_test'
 
 # Geometry
 geometry_directory        =  os.path.join(os.getcwd(), 'airfoil_geometry/')
@@ -415,7 +415,7 @@ elif optimization_case == 3:
     objective_fun.set_as_objective()
 
 
-if optimization_case == 4:
+elif optimization_case == 4:
     # Declaring and naming some variables
     drag = dafoam_function_outputs.drag
 
@@ -463,22 +463,26 @@ if optimizer_choice == 1:
 
 elif optimizer_choice == 2:
     # OpenSQP optimizer setup
-    open_sqp_options = {'maxiter': 40,
+    open_sqp_options = {'maxiter': 100,
                         'readable_outputs': rank_outputs,
                         'recording': recording_on_root_rank,
-                        'ls_max_step': 0.5,
-                        'turn_off_outputs': turn_off_outputs_on_nonroot_rank}
+                        'ls_max_step': 1.,
+                        'turn_off_outputs': turn_off_outputs_on_nonroot_rank,}
+                        #'hot_start_from':'/media/edward/DATA/Edward/AFRL_project/csdl_dafoam_workspace/airfoil_case/results/airfoil_setup_test/airfoil_setup_test_outputs/2026-02-03_16.02.02.618346/record.hdf5',
+                        #'hot_start_rtol':1e-3}
     optimizer = OpenSQP(prob, **open_sqp_options)
     optimizer.solve()
     optimizer.print_results()
 
 elif optimizer_choice == 3:
     # InteriorPoint optimizer setup
-    interior_point_options = {'maxiter': 40,
+    interior_point_options = {'maxiter': 100,
                             'readable_outputs': rank_outputs,
                             'recording': recording_on_root_rank,
                             'ls_max_step': 1.,
-                            'turn_off_outputs': turn_off_outputs_on_nonroot_rank}
+                            'turn_off_outputs': turn_off_outputs_on_nonroot_rank,
+                            'hot_start_from':'/media/edward/DATA/Edward/AFRL_project/csdl_dafoam_workspace/airfoil_case/results/airfoil_setup_test/airfoil_setup_test_outputs/2026-02-03_16.02.02.618346/record.hdf5',
+                            'hot_start_rtol':1e-3}
     optimizer   = InteriorPoint(prob, **interior_point_options)
     optimizer.solve()
     optimizer.print_results()

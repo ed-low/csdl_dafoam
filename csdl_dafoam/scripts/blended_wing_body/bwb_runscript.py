@@ -125,7 +125,10 @@ da_options = {
         },
     },
     "adjStateOrdering": "cell",
-    "adjEqnOption": {"gmresRelTol": 1.0e-4, "pcFillLevel": 1, "jacMatReOrdering": "natural"},
+    # Original options 
+    # "adjEqnOption": {"gmresRelTol": 1.0e-4, "pcFillLevel": 1, "jacMatReOrdering": "natural"},
+    "adjEqnOption": {"gmresRelTol": 1e-3, "gmresMaxIters": 2000, "jacMatReOrdering": "natural", "useNonZeroInitGuess": True, "useMGSO": True},
+   # "adjEqnOption": {"gmresRelTol": 1e-4, "jacMatReOrdering": "natural", "useNonZeroInitGuess": True, "useMGSO": True},
     # transonic preconditioner to speed up the ff convergence
     "transonicPCOption": 2,
     "adjPCLag": 5,
@@ -688,12 +691,13 @@ if optimizer_choice == 1:
 
 elif optimizer_choice == 2:
     # OpenSQP optimizer setup
-    open_sqp_options = {'maxiter': 40,
+    open_sqp_options = {'maxiter': 80,
                         'readable_outputs': rank_outputs,
                         'recording': recording_on_root_rank,
                         'ls_max_step': 1.,
                         'turn_off_outputs': turn_off_outputs_on_nonroot_rank,
-                        'hot_start_from': '/media/edward/DATA/Edward/AFRL_project/csdl_dafoam_workspace/blended_wing_body_case/results/case5_opensqp/case5_opensqp_outputs/2026-02-05_07.59.06.838711/record.hdf5'}
+                        'hot_start_from': '/media/edward/DATA/Edward/AFRL_project/csdl_dafoam_workspace/blended_wing_body_case/results/case5_opensqp/case5_opensqp_outputs/2026-02-05_07.59.06.838711/record.hdf5',
+                        'hot_start_rtol': 1e-4}
     optimizer = OpenSQP(prob, **open_sqp_options)
     optimizer.solve()
     optimizer.print_results()

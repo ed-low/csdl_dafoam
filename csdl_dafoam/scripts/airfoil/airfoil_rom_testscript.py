@@ -2,7 +2,10 @@
 # region PACKAGES
 # ===============================
 import numpy as np
+import sys
 import os
+import time
+import pickle
 from pathlib import Path
 
 # MPI
@@ -21,18 +24,18 @@ from lsdo_geo.core.parameterization.volume_sectional_parameterization import (
 
 # Optimization
 from modopt import CSDLAlphaProblem
-from modopt import PySLSQP, OpenSQP
+from modopt import PySLSQP, OpenSQP, InteriorPoint
 
 # IDWarp and DAFoam
 from csdl_dafoam.core.csdl_idwarp import DAFoamMeshWarper
-from csdl_dafoam.core.csdl_dafoam import instantiateDAFoam, DAFoamFunctions, compute_dafoam_input_variables
-from csdl_dafoam.core.rom.csdl_dafoam_rom import  DAFoamROM, DAFoamROM2, DAFoamROM3, DAFoamROM4
+from csdl_dafoam.core.csdl_dafoam import instantiateDAFoam, DAFoamFunctions, DAFoamSolver, compute_dafoam_input_variables
+from csdl_dafoam.core.rom.csdl_dafoam_rom import DAFoamROM
+from csdl_dafoam.utils.training_interface import TrainingDataInterface
 import csdl_dafoam.utils.standard_atmosphere_model as sam
-
 from csdl_dafoam.utils.runscript_helper_functions import *
 
-# Plotting
-import matplotlib.pyplot as plt
+# Hashing (for file name generation)
+import hashlib
 
 #---- DEBUGGING TOOLS ----
 import faulthandler
@@ -40,16 +43,17 @@ faulthandler.enable()
 os.environ["PETSC_OPTIONS"] = "-malloc_debug"
 #-------------------------
 
-
+# Write this runscript to file before anything
+print_runscript_info()
 
 # ===============================
 # region USER INPUT
 # ===============================
-# Keyword for optimization name (optimization results folder will be saved with this name)
-problem_name              = 'airfoil_test'
+# Keyword for optimization name (optimization results folder will be saved with this name in dafoam directory)
+problem_name              = 'training_test'
 
 # Geometry
-geometry_directory        =  Path.cwd()/'airfoil_geometry/'
+geometry_directory        =  os.path.join(os.getcwd(), 'airfoil_geometry/')
 stp_file_name             = 'airfoil_transonic_unitspan_2.stp'
 geometry_pickle_file_name = 'airfoil_stored_refit.pickle'
 
@@ -57,15 +61,16 @@ geometry_pickle_file_name = 'airfoil_stored_refit.pickle'
 comm           = MPI.COMM_WORLD
 TIMING_ENABLED = True  # True if we want timing printed for the CSDL operations
 
-# region DAFoam options
-dafoam_directory = Path.cwd()/'results'/f'{problem_name}'
+# DAFoam
+dafoam_directory = os.path.join(os.getcwd(), f'results/{problem_name}/')
+dafoamPrintInterval = 100
 
 # Initial/reference values for DAFoam (best to use base conditions)
-U0        = 238.0         # used for normalizing CD and CL
-p0        = 101325.0
-T0        = 300.0
+U0        = 206.53653128321116         # used for normalizing CD and CL
+p0        = 19509.303373738785
+T0        = 216.65227163736915
 nuTilda0  = 4.5e-5
-aoa0      = 0
+aoa0      = 1.416e-1
 A0        = 0.1           #
 rho0      = p0 / T0 / 287 # used for normalizing CD and CL
 
@@ -135,16 +140,27 @@ da_options = {
             "patches": ["inout"],
             "components": ["solver", "function"],
         },
-    }
+    },
+    "writeAdjointFields": False,
+    "debug": False,
+    "printDAOptions": True,
+    "printInterval": dafoamPrintInterval
 }
 
 # region Mesh options
 mesh_options = {
-    "gridFile": str(dafoam_directory),
+    "gridFile": dafoam_directory,
     "fileType": "OpenFOAM",
     "symmetryPlanes": [],
 }
 
+
+# ===============================
+# region Training data options
+# ===============================
+# Storage options
+dataset_keyword       = 'airfoil_training'
+storage_location      = Path(dafoam_directory)
 
 
 # ===============================
@@ -153,20 +169,35 @@ mesh_options = {
 # MPI information
 rank      = comm.Get_rank()
 comm_size = comm.Get_size()
-rank_str      = f"{rank:0{len(str(comm_size-1))}d}" # string with zero-padded rank index (for prints)
-print(comm_size)
+rank_str  = f"{rank:0{len(str(comm_size-1))}d}" # string with zero-padded rank index (for prints)
 
-# region File paths
-geometry_pickle_file_path   = Path(geometry_directory)/geometry_pickle_file_name
-stp_file_path               = Path(geometry_directory)/stp_file_name
 
 # region DAFoam instance
 dafoam_instance             = instantiateDAFoam(da_options, comm, dafoam_directory, mesh_options)
-x_surf_dafoam_initial       = dafoam_instance.getSurfaceCoordinates()
+x_surf_dafoam_initial_mpi   = dafoam_instance.getSurfaceCoordinates()
+x_vol_dafoam_initial_mpi    = dafoam_instance.xv0
 
-# Load ROM training data
-state_store_path            = dafoam_directory/'airfoil_training/airfoil_training_point0.h5'
-local_data, global_metadata = read_snapshots(state_store_path, dafoam_instance=dafoam_instance)
+local_n_surf  = x_surf_dafoam_initial_mpi.shape[0]
+local_n_vol   = x_vol_dafoam_initial_mpi.shape[0]
+
+# Gathering surface mesh to rank 0 (need to do this to avoid 'no-element' ranks in the projection
+# and geometry evaluation functions)
+(x_surf_dafoam_initial, 
+x_surf_dafoam_initial_size,
+x_surf_dafoam_initial_indices) = gather_array_to_rank0(x_surf_dafoam_initial_mpi, comm)
+
+# Get hash for surface mesh projection file read/write (broadcast to other ranks)
+if rank == 0:
+    x_surf_hash = hash_array_tol(x_surf_dafoam_initial)
+else:
+    x_surf_hash = None
+
+x_surf_hash = comm.bcast(x_surf_hash, root=0)
+
+# region File paths
+geometry_pickle_file_path         = Path(geometry_directory)/geometry_pickle_file_name
+stp_file_path                     = Path(geometry_directory)/stp_file_name
+surface_mesh_projection_file_path = Path(dafoam_directory)/f'projected_surface_mesh_{x_surf_hash}.pickle'
 
 
 # ===============================
@@ -178,17 +209,63 @@ recorder.start()
 
 
 geometry = lsdo_geo.import_geometry(stp_file_path,
-                                                parallelize=False)
+                                    parallelize=False)
 
 
-projected_surf_mesh_dafoam = geometry.project(
-    x_surf_dafoam_initial, 
-    grid_search_density_parameter = 1,      
-    projection_tolerance          = 1.e-3,  
-    grid_search_density_cutoff    = 50,     
-    force_reprojection            = False,
-    plot                          = False  
-)
+# region Surface mesh projection
+# Now do we do the same check for the surface mesh projection
+if surface_mesh_projection_file_path.is_file():
+    if rank == 0:
+        print('Found surface mesh projection pickle!')
+    projected_surf_mesh_dafoam = read_simple_pickle(surface_mesh_projection_file_path)
+
+else:
+    if rank == 0:
+        print('No projected surface mesh file found.')
+        try:
+            # ORIGINAL CODE
+            # with Timer('projecting on surface mesh'):
+            #     projected_surf_mesh_dafoam = geometry.project(
+            #         x_surf_dafoam_initial, 
+            #         grid_search_density_parameter = 1,      # 1     (ORIGINAL)
+            #         projection_tolerance          = 1e-4,   #1.e-3m (ORIGINAL)
+            #         grid_search_density_cutoff    = 50,     # 20    (ORIGINAL) 50
+            #         force_reprojection            = False,
+            #         plot                          = False    # UCSD_LAB
+            #     )
+
+            # Debugging/timing
+            import cProfile
+            import pstats
+            with cProfile.Profile() as pr:
+                projected_surf_mesh_dafoam = geometry.project(
+                    x_surf_dafoam_initial, 
+                    grid_search_density_parameter = 1,      # 1     (ORIGINAL)
+                    projection_tolerance          = 1e-10,   #1.e-3m (ORIGINAL)
+                    grid_search_density_cutoff    = 50,     # 20    (ORIGINAL) 50
+                    force_reprojection            = False,
+                    plot                          = False    # UCSD_LAB
+                )
+            # Summarize top time-consuming functions
+            stats = pstats.Stats(pr)
+            stats.strip_dirs().sort_stats(pstats.SortKey.TIME).print_stats(30)
+
+            print('Writing surface mesh projection pickle...')
+            write_simple_pickle(projected_surf_mesh_dafoam, surface_mesh_projection_file_path)
+            print('Done!')
+
+        # Added this exception because I was getting an ungraceful MPI termination
+        except Exception as e:
+            import traceback
+            print(f"[Rank 0 ERROR] Projection/pickle step failed:\n{traceback.format_exc()}", flush=True)
+            comm.Abort(1) # Abort MPI processes instead of letting them hang
+
+    comm.Barrier()
+    if rank != 0:
+        projected_surf_mesh_dafoam = read_simple_pickle(surface_mesh_projection_file_path)
+
+print(f'Rank {rank_str} done reading projected surface mesh!')
+comm.Barrier()
 
 # -------------------------------------------------------------------------------------------
 # COPY PASTED GEOMETRY STUFF HERE:
@@ -241,384 +318,86 @@ geometry_coefficients = ffd_block.evaluate_ffd(coefficients=ffd_coefficients, pl
 geometry.set_coefficients(geometry_coefficients) 
 # -------------------------------------------------------------------------------------------
 
-x_surf_dafoam = geometry.evaluate(projected_surf_mesh_dafoam, plot=False)
-x_surf_dafoam   = x_surf_dafoam.flatten()
+with Timer(f'evaluating geometry component', rank, TIMING_ENABLED):
+    x_surf_dafoam_full = geometry.evaluate(projected_surf_mesh_dafoam, plot=False)
 
-# region IDWarp and DAFoam
-idwarp_model    = DAFoamMeshWarper(dafoam_instance)
-x_vol_dafoam    = idwarp_model.evaluate(x_surf_dafoam)
+# region Surface mesh distribution
+i0, i1          = x_surf_dafoam_initial_indices[rank]
 
 # Flight condition variables
-flight_conditions_group                     = csdl.VariableGroup()
-flight_conditions_group.mach_number         = csdl.Variable(value=global_metadata['grassmann_configuration'][0], name="mach_number") #7.38907838e-01, name="mach_number")
-flight_conditions_group.angle_of_attack_deg = csdl.Variable(value=global_metadata['grassmann_configuration'][1], name="angle_of_attack_deg") #1.01091987e-01, name="angle_of_attack_deg")
-flight_conditions_group.altitude_m          = csdl.Variable(value=global_metadata['grassmann_configuration'][2], name="altitude (m)") #9.49785954e+03, name="altitude (m)")
+flight_conditions_group                 = csdl.VariableGroup()
+flight_conditions_group.mach_number     = csdl.Variable(value=0.7, name="mach_number")
+flight_conditions_group.angle_of_attack_deg = csdl.Variable(value=aoa0, name="angle_of_attack_deg")
+flight_conditions_group.altitude_m      = csdl.Variable(value=1.194e+4, name="altitude (m)")
 
 # Atmospheric condition variables
 ambient_conditions_group = sam.compute_ambient_conditions_group(flight_conditions_group.altitude_m)
 
-
-
-# DAFoam input variable generation
-# Generate our DAFoam CSDL input variable group 
-# (this will add airspeed_m_s to the flight conditions group if not already present)
-dafoam_input_variables_group = compute_dafoam_input_variables(dafoam_instance, 
-                                                              ambient_conditions_group, 
-                                                              flight_conditions_group,
-                                                              x_vol_dafoam)
-
-
-
-# region ROM options
-# Training dataset location
-# state_store_dir = Path.cwd()/f'2gs_100ss_state_store_comm_size{comm_size}_rank{rank_str}.npy' # (old version)
-
-# Reduced dimension 
-# (set to -1 for automatic selection, where target_energy will be used to determine cutoff)
-num_modes     = -1
-target_energy = 0.999  # e.g. use 0.999 for 99.9%
-
-# Centering mode
-# Options:
-# 0: no centering
-# 1: mean centered
-# 2: center by reference
-centering_mode = 1
-
-# Scaling factors for training data 
-# Options:
-# 0: no scaling
-# 1: scale by normalization factors in da_options["normalizeStates"]
-# 2: scale by reference values from grassmann point
-# 3: scale by statistics (standard deviation of data)
-scaling_mode = 2
-
-# Inner product weighting
-# Options:
-# None: no weights
-# "cell": weigh by cell volumes and face surface areas
-# "cell_and_scaling"
-# "compressible_inner_product"
-weight_mode  = 'compressible_inner_product'
-ignore_phi   = True
-
-# Load states 
-# training_data  = np.load(state_store_dir) # (old version)
-
-# Select subsection (if necessary). We'll call our states, y
-#y_training = training_data[:, :50] # (old version)
-y_training = local_data['snapshots_local']
-
-
-# TODO: MPI business. Would need to gather everything to rank zero, compute POD, and then disperse.
-#       For now, we'll assume that this is serial and that everything is here.
-
-
-# region ROM Mode computation
-# Scaling mode assignment
-state_names, state_map = dafoam_instance.getStateVariableMap(True)
-
-# Create a dictionary for the states
-state_inds = {}
-for name in state_names:
-    state_idx = state_names.index(name)
-    state_inds[name] = state_map == state_idx
-
-
-if scaling_mode == 0:   # No scaling
-    scaling_factors = np.ones((dafoam_instance.getNLocalAdjointStates(), ))
-
-elif scaling_mode == 1: # Scale by normalization factors set in da_options["normalizeStates"]
-    scaling_factors = dafoam_instance.getStateScalingFactors()
-
-elif scaling_mode == 2: # Scale by normalization factors set in da_options["normalizeStates"]
-    scaling_factors = np.ones((dafoam_instance.getNLocalAdjointStates(), ))
-
-    def apply_state_scaling(name, value):
-        idx = state_names.index(name)
-        scaling_factors[state_map == idx] = value
-
-    apply_state_scaling('U0',       ambient_conditions_group.a_m_s.value[0])
-    apply_state_scaling('U1',       ambient_conditions_group.a_m_s.value[0])
-    apply_state_scaling('U2',       ambient_conditions_group.a_m_s.value[0])
-    apply_state_scaling('p',        ambient_conditions_group.P_Pa.value[0])
-    apply_state_scaling('T',        ambient_conditions_group.T_K.value[0])
-    apply_state_scaling('nuTilda',  10000*ambient_conditions_group.nu_m2_s.value[0])
-    apply_state_scaling('phi',      1)
-
-elif scaling_mode == 3: # Scale by statistics (standard deviation of data)
-    scaling_factors = np.std(y_training, axis=1)
-
-    # To avoid division by zero/small value
-    eps = 1e-12
-    scaling_factors[scaling_factors < eps] = 1 
-
-else:
-    raise NotImplementedError(f'scaling mode option "{scaling_mode}" not a valid choice yet.')
-
-y_training = y_training/scaling_factors[:, None]
-
-
-# Centering
-if centering_mode == 0: # No centering
-    y_reference = np.zeros_like(y_training[:, 0])
-
-elif centering_mode == 1: # Mean centering
-    y_reference = y_training.mean(axis=1)
-
-elif centering_mode == 2: # Center by reference
-    # DON'T FORGET TO SCALE
-    y_reference = local_data['reference_snapshot_local']/scaling_factors
-else:
-    raise NotImplementedError(f'centering mode option "{centering_mode}" not a valid choice yet.')
-
-
-# Weighting mode assignment
-n_cells = dafoam_instance.solver.getNLocalCells()
-if weight_mode is None:
-    weights = np.ones_like(y_reference)
-
-elif weight_mode == 'cell':
-    weights = dafoam_instance.getStateWeights()
-
-elif weight_mode == 'compressible_inner_product':
-    R       = 287 # Gas constant, air [J/kg/K]
-    gamma   = 1.4 # Specific heat ratio, air
-    c_v     = R / (gamma - 1)
-
-    n_cells = dafoam_instance.solver.getNLocalCells()
-    weights  = dafoam_instance.getStateWeights()
+with csdl.experimental.mpi.enter_mpi_region(rank, comm) as mpi_region:
     
-    if centering_mode == 0:
-        rho_ref = ambient_conditions_group.rho_kg_m3.value
-        sos_ref = ambient_conditions_group.a_m_s.value
-        T_ref   = ambient_conditions_group.T_K.value
-        mu_ref  = ambient_conditions_group.mu_kg_m_s.value
-        alpha_q = rho_ref * sos_ref * dafoam_instance.getStateWeights()[5*n_cells:]
-    else:
-        rho_ref = y_reference[3*n_cells:4*n_cells] / R / y_reference[4*n_cells:5*n_cells]
-        sos_ref = np.sqrt(gamma * R * y_reference[4*n_cells:5*n_cells])
-        T_ref   = y_reference[4*n_cells:5*n_cells]
-        print(rho_ref.shape)
+    x_surf_dafoam   = x_surf_dafoam_full[i0:i1, :]
+    x_surf_dafoam   = x_surf_dafoam.flatten()
 
+    # region IDWarp and DAFoam
+    idwarp_model    = DAFoamMeshWarper(dafoam_instance)
+    x_vol_dafoam    = idwarp_model.evaluate(x_surf_dafoam)
 
-    # print(f'Velocity weight: {rho_ref}')
-    # print(f'Pressure weight: {1/(rho_ref * sos_ref**2)}')
-    # print(f'Temperature weight: {rho_ref * c_v/T_ref}')
-    # print(f'nuTilda weight: {mu_ref/rho_ref}')
-
-    weights[0:3*n_cells]         *= np.repeat(rho_ref, 3)
-    weights[3*n_cells:4*n_cells] *= 1/(rho_ref * sos_ref**2)
-    weights[4*n_cells:5*n_cells] *= (rho_ref * c_v / T_ref)
-    weights[5*n_cells:6*n_cells] *= 0 #(mu_ref / rho_ref)
-    weights[6*n_cells:]          *= 0 #alpha_q
-
-elif weight_mode == 'cell_and_scaling':
-    weights  = dafoam_instance.getStateWeights()
-    weights *= scaling_factors
-
-else:
-    raise TypeError(f'{weight_mode} not an implemented weighting method.')
-
-
-# Reference-centered data
-z = y_training - y_reference[:, None]
-
-# Method of snapshots (referenced https://willcox-research-group.github.io/rom-operator-inference-Python3/_modules/opinf/basis/_pod.html#method_of_snapshots)
-min_thresh = 1e-15
-n_states   = z.shape[0] 
-gramian    = z.T @ (weights[:, None] * z / n_states)
-
-eigvals, eigvecs = np.linalg.eigh(gramian)
-
-# Re-order (largest to smallest).
-eigvals = eigvals[::-1]
-eigvecs = eigvecs[:, ::-1]
-
-# By definition the Gramian is symmetric positive semi-definite.
-# If any eigenvalues are smaller than zero, they are only measuring
-# numerical error and can be truncated.
-positives = eigvals > max(min_thresh, abs(np.min(eigvals)))
-eigvecs   = eigvecs[:, positives]
-eigvals   = eigvals[positives]
-
-# Rescale and square root eigenvalues to get singular values.
-s           = np.sqrt(eigvals * n_states)
-pod_modes   = z @ (eigvecs / s)
-
-
-# # Scale and zero-mean our data
-# z = np.sqrt(weights)[:, None]*(y_training - y_reference[:, None])
-
-
-# # Compute our svd and determine number of modes needed (if user specified), and compute POD modes
-# u, s, vh  = np.linalg.svd(z, full_matrices=False)
-
-
-cumulative_energy = np.cumsum(s**2)
-total_energy      = cumulative_energy[-1]
-energy_fraction   = cumulative_energy / total_energy
-
-if num_modes == -1:
-    num_modes = np.searchsorted(energy_fraction, target_energy) + 1
-    print(f"{num_modes} modes required to capture {target_energy*100}% total energy")
-else:
-    print(f"{num_modes} captures {energy_fraction[num_modes - 1]*100}% of the total energy")
-
-# eps            = 1e-20 # or e.g. 1e-12 relative threshold
-# inv_sqrt       = np.zeros_like(weights)
-# mask           = weights > eps
-# inv_sqrt[mask] = 1.0/np.sqrt(weights[mask])
-# pod_modes      = inv_sqrt[:, None]*u[:, :num_modes]
-
-pod_modes = pod_modes[:, :num_modes]
-
-
-
-# ----- Plotting section -----
-show_training_plots = True
-n_cells             = dafoam_instance.solver.getNLocalCells()
-
-if show_training_plots:
-    # RAW DATA PLOT
-    fig, (ax1, ax2) = plt.subplots(1, 2)
-    for i in range(3,7): ax1.axvline(n_cells*i, alpha=0.5, linestyle='--', color='gray')
-    ax1.plot(scaling_factors[:, None]*y_training)
-    ax1.plot(scaling_factors*y_reference, linestyle=':', label='reference state')
-    ax1.legend()
-
-    im = ax2.imshow(scaling_factors[:, None]*y_training, aspect=y_training.shape[1]/y_training.shape[0])
-    for i in range(3,7): ax2.axhline(n_cells*i, alpha=0.5, linestyle='--', color='gray')
-    fig.colorbar(im)
-    fig.suptitle('Raw training data')
-
-    # SCALED DATA PLOT
-    fig, (ax1, ax2) = plt.subplots(1, 2)
-    for i in range(3,7): ax1.axvline(n_cells*i, alpha=0.5, linestyle='--', color='gray')
-    ax1.plot(y_training)
-    ax1.plot(y_reference, linestyle=':', label='reference state')
-    ax1.legend()
-
-    im = ax2.imshow(y_training, aspect=y_training.shape[1]/y_training.shape[0])
-    for i in range(3,7): ax2.axhline(n_cells*i, alpha=0.5, linestyle='--', color='gray')
-    fig.colorbar(im)
-    fig.suptitle('Scaled training data')
-
-    # SCALED, CENTERED DATA PLOT
-    fig, (ax1, ax2) = plt.subplots(1, 2)
-    for i in range(3,7): ax1.axvline(n_cells*i, alpha=0.5, linestyle='--', color='gray')
-    ax1.plot(z)
-
-    clim = np.max(np.abs(z))
-    im = ax2.imshow(z, aspect=y_training.shape[1]/y_training.shape[0], cmap='seismic', vmin=-clim, vmax=clim)
-    for i in range(3,7): ax2.axhline(n_cells*i, alpha=0.5, linestyle='--', color='gray')
-    fig.colorbar(im)
-    fig.suptitle('Scaled, centered training data')
-
-    # POD MODE ENERGY PLOT
-    plt.figure(4)
-    plt.plot(energy_fraction)
-    plt.axvline(num_modes, label=f'Target ({target_energy*100}%)', color='gray', alpha=0.5, linestyle='--')
-    plt.title('POD mode variance capture')
-    plt.xlabel('Number of modes')
-    plt.ylabel('Cumulative variance')
-    plt.legend()
+    # Need to split up angle-of-attack (and any other CSDL variables which DAFoam takes the derivative with respect to)
+    flight_conditions_group.angle_of_attack_deg = mpi_region.split_custom(flight_conditions_group.angle_of_attack_deg, split_func = lambda x:x)
     
-    # SCALING FACTOR PLOT
-    plt.figure(5)
-    for i in range(3,7): plt.axvline(n_cells*i, alpha=0.5, linestyle='--', color='gray')
-    plt.plot(scaling_factors)
-    plt.title('Data scaling factors')
+    # DAFoam input variable generation
+    # Generate our DAFoam CSDL input variable group 
+    # (this will add airspeed_m_s to the flight conditions group if not already present)
+    dafoam_input_variables_group = compute_dafoam_input_variables(dafoam_instance, 
+                                                                ambient_conditions_group, 
+                                                                flight_conditions_group,
+                                                                x_vol_dafoam)
+    
+    # POD Data import
+    data_generator = TrainingDataInterface(dafoam_instance=dafoam_instance, 
+                                            storage_location=storage_location, 
+                                            dataset_keyword=dataset_keyword,
+                                            h5_file_base_name="point")
 
-    # INNER PRODUCT WEIGHT PLOT
-    plt.figure(6)
-    for i in range(3,7): plt.axvline(n_cells*i, alpha=0.5, linestyle='--', color='gray')
-    plt.plot(weights)
-    plt.title('Inner product weights')
+    # Manually obtaining the file for now
+    data = data_generator.load_h5(Path(storage_location)/dataset_keyword/"point_0.h5", only_distributed_data=False)
 
-    # POD MODE PLOT
-    fig, (ax1, ax2) = plt.subplots(1, 2)
-    for i in range(3,7): ax1.axvline(n_cells*i, alpha=0.5, linestyle='--', color='gray')
-    ax1.plot(pod_modes)
+    # Assemble POD modes and relevant vectors:
+    state_info  = data_generator.state_info # Get our state variable names
+    pod_modes   = np.array(np.concatenate([data["pod"]["modes"][state_var] for state_var in state_info.keys()], axis=0))[:, 0:20]
+    scaling     = np.array(np.concatenate([data["pod"]["scaling"][state_var] * np.ones((np.size(state_info[state_var]["indices"]),)) for state_var in state_info.keys()]))
+    weights     = np.array(np.concatenate([data["pod"]["weights"][state_var] for state_var in state_info.keys()]))
+    reference_state = np.array(np.concatenate([data["pod"]["reference_state"][state_var] for state_var in state_info.keys()]))
 
-    clim = np.max(np.abs(pod_modes))
-    im = ax2.imshow(pod_modes, aspect=pod_modes.shape[1]/pod_modes.shape[0], cmap='seismic', vmin=-clim, vmax=clim)
-    for i in range(3,7): ax2.axhline(n_cells*i, alpha=0.5, linestyle='--', color='gray')
-    fig.colorbar(im)
-    fig.suptitle('POD modes')
+    print(f"Rank {rank} modes: {pod_modes}")
+    print(f"Rank {rank} scaling: {scaling}")
+    print(f"Rank {rank} weights: {weights}")
+    print(f"Rank {rank} reference_state: {reference_state}")
 
-    plt.show()
+    # DAFoamSolver Implicit component setup and evaluation
+    dafoam_rom           = DAFoamROM(dafoam_instance, pod_modes=pod_modes, reference_state=reference_state, weights=weights, scaling=scaling, rom_type='galerkin')
+    dafoam_rom_states    = dafoam_rom.evaluate(dafoam_input_variables_group)
 
+    # Reconstruct state
+    dafoam_state_estimate = reference_state + scaling[:, None] * pod_modes @ dafoam_rom_states
 
+    # DAFoamFunctions Explicit component setup and evaluation
+    dafoam_functions = DAFoamFunctions(dafoam_instance)
+    dafoam_function_outputs = dafoam_functions.evaluate(dafoam_state_estimate, 
+                                                        dafoam_input_variables_group)
 
-
-# DAFoamSolver Implicit component setup and evaluation
-dafoam_rom           = DAFoamROM4(dafoam_instance, 
-                                 pod_modes=pod_modes, 
-                                 tolerance=1e-8, 
-                                 fom_ref_state=scaling_factors*y_reference, 
-                                 max_iters=50, 
-                                 scaling_factors=scaling_factors, 
-                                 weights=weights, 
-                                 update_jac_frequency=5,
-                                 num_initial_jac_updates=1)
-
-dafoam_rom_states    = dafoam_rom.evaluate(dafoam_input_variables_group)
-
-dafoam_fom_states    =  scaling_factors*y_reference + scaling_factors*csdl.matvec(pod_modes, dafoam_rom_states)
-
-
-
-# # Comparing FD to JVP J rom
-# import matplotlib as mpl
-
-# J_rom_jvp = dafoam_rom._compute_reduced_jacobian(pod_modes, dafoam_fom_states.value, dafoam_rom_states.value, weights, scaling_factors)
-# J_rom_fd  = dafoam_rom._compute_reduced_jacobian(pod_modes, dafoam_fom_states.value, dafoam_rom_states.value, weights, scaling_factors, mode='fd')
-
-# fig, axs = plt.subplots(2, 2)
-
-# pclr = axs[0, 0].pcolor(J_rom_jvp)
-# axs[0, 0].set_title('J_rom JVP')
-# plt.colorbar(pclr, ax=axs[0, 0])
-
-# pclr = axs[0, 1].pcolor(J_rom_fd)
-# axs[0, 1].set_title('J_rom FD')
-# plt.colorbar(pclr, ax=axs[0, 1])
-
-# pclr = axs[1, 0].pcolor(J_rom_fd - J_rom_jvp)
-# axs[1, 0].set_title('J_rom diff (FD - JVP)')
-# plt.colorbar(pclr, ax=axs[1, 0])
-
-# pclr = axs[1, 1].pcolor((J_rom_fd - J_rom_jvp)/J_rom_jvp, cmap=mpl.colormaps['seismic'], vmin=-0.1, vmax=0.1)
-# axs[1, 1].set_title('J_rom rel diff (FD - JVP)/JVP')
-# plt.colorbar(pclr, ax=axs[1, 1])
-
-# input('Press ENTER to continue...')
-
-
-# # Compare FOM and ROM initial solution
-# plt.figure()
-# dafoam_state_diff    = (dafoam_solver_states - dafoam_fom_states)
-# plt.scatter(np.array(range(dafoam_instance.getNLocalAdjointStates())), dafoam_state_diff.value, label='FOM-ROM')
-# plt.scatter(np.array(range(dafoam_instance.getNLocalAdjointStates())), dafoam_fom_states.value, label='ROM predicted')
-# plt.scatter(np.array(range(dafoam_instance.getNLocalAdjointStates())), dafoam_solver_states.value, label='FOM')
-# # plt.ylim((-1,1))
-# plt.legend()
-# plt.show()
-# input('Press ENTER to continue')
-
-
-# DAFoamFunctions Explicit component setup and evaluation
-dafoam_functions        = DAFoamFunctions(dafoam_instance, disable_jacvec_normalization=True)
-dafoam_function_outputs = dafoam_functions.evaluate(dafoam_fom_states, 
-                                                    dafoam_input_variables_group)
+    outputDict = dafoam_instance.getOption("function")
+    for outputName in outputDict.keys():
+        mpi_region.set_as_global_output(getattr(dafoam_function_outputs, outputName))
+    # mpi_region.set_as_global_output(dafoam_function_outputs.drag)
 
 
 # region Optimization problem selection
 # optimization_case options
 # 1: Maximize CL/CD wrt angle-of-attack
 # 2: Minimize CD wrt angle-of-attack, wing shape (thickness/camber ffd), constrained by CL=0.5
-# 3: Minimize CL/CD wrt wing shape (thickness/camber ffd)
+# 3: Maximize CL/CD wrt angle-of-attack, wing shape (thickness/camber ffd)
+# 4: Minimize D wrt angle-of-attack (test case)
 optimization_case = 3
 
 
@@ -660,18 +439,33 @@ elif optimization_case == 3:
     drag = dafoam_function_outputs.drag
 
     # Design variables
-    percent_change_in_thickness_dof.set_as_design_variable(lower=-8, upper=8, scaler=1./10)
-    normalized_percent_camber_change_dof.set_as_design_variable(lower=-8, upper=8, scaler=1./10)
+    # flight_conditions_group.angle_of_attack_deg.set_as_design_variable(lower=0, upper=10, scaler=1./10)
+    percent_change_in_thickness_dof.set_as_design_variable(lower=-10, upper=10, scaler=1./10)
+    normalized_percent_camber_change_dof.set_as_design_variable(lower=-10, upper=10, scaler=1./10)
 
     # Objectives
     objective_fun = -lift/drag
     objective_fun.set_as_objective()
 
 
+elif optimization_case == 4:
+    # Declaring and naming some variables
+    drag = dafoam_function_outputs.drag
+
+    # Design variables
+    flight_conditions_group.angle_of_attack_deg.set_as_design_variable(lower=0, upper=10, scaler=1./10)
+
+    # Objectives
+    objective_fun = drag
+    objective_fun.set_as_objective()
+
+
 else:
     print('Not a valid case number')
 
+
 recorder.stop()
+
 
 
 # ===============================
@@ -679,340 +473,52 @@ recorder.stop()
 # ===============================
 sim = csdl.experimental.PySimulator(recorder)
 
-# Can set design variables here and run sim to test
-# sim[root_twist]  = 3*3.14159/180
-# sim.run()
-# dafoam_instance.solver.writeAdjointFields('sol', 11001, np.ascontiguousarray(dafoam_fom_states.value))
-
-# dafoam_instance()
-
-# dafoam_instance.solver.writeAdjointFields('sol', 11002, np.ascontiguousarray(dafoam_instance.getStates()))
-
-
-# Uncomment to run and check derivatives via finite difference
-# sim.check_totals()
-# derivs = sim.compute_totals([CD],[root_twist, tip_twist, flight_conditions_group.angle_of_attack_deg])
-
-# Only allow visualization on the root rank
-if rank == 0 and not is_headless():
-    visualize_on_this_rank = True
-else:
-    visualize_on_this_rank = False
+# Only allow visualization and modopt output files on the root rank
+visualize_on_this_rank           = True  if rank == 0 and not is_headless() else False
+turn_off_outputs_on_nonroot_rank = False if rank == 0 else True
+recording_on_root_rank           = True  if rank == 0 else False
+rank_outputs                     = ['x'] if rank == 0 else []
 
 # Optimization solver setup and run
-prob        = CSDLAlphaProblem(problem_name=f'{problem_name}_rank{rank_str}', simulator=sim)
-
-# # PySLSQP optimizer setup
-# solver_options = {'maxiter': 20,
-#                   'iprint': 2,
-#                   'visualize': visualize_on_this_rank,
-#                   'summary_filename': f'rank{rank_str}_slsqp_summary.out',
-#                   'save_figname':     f'rank{rank_str}_slsqp_plot.pdf',
-#                   'save_filename':    f'rank{rank_str}_slsqp_recorder.hdf5'}
-# optimizer   = PySLSQP(prob, solver_options=solver_options)
-# optimizer.solve()
-# optimizer.print_results()
-
-
-# OpenSQP optimizer setup
-open_sqp_options = {'maxiter': 20,
-                    'readable_outputs': ['x']}
-optimizer   = OpenSQP(prob, **open_sqp_options)
-optimizer.solve()
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-# # indices1 = np.concatenate((1*np.ones(n_cells, ), 2*np.ones(n_cells, ), 3*np.ones(n_cells, ), 4*np.ones(n_cells, ), 5*np.ones(n_cells, ), 6*np.ones(n_cells, ), 7*np.ones_like(face_areas)))
-# # dafoam_instance.solver.writeAdjointFields('indices', 8888, np.ascontiguousarray(indices1))
-
-
-
-
-
-# plt.figure()
-# n_cells          = dafoam_instance.solver.getNLocalCells()
-# state_var_partition_lines = n_cells*np.array(range(1, 7))
-# for i in range(6):
-#     plt.axvline(x=state_var_partition_lines[i], color='gray', linestyle='--', alpha=0.5)
-# plt.plot(pod_modes[:, 5:None:-1], linestyle='--')
-# plt.show()
-
-
-# # Some plotting
-# n_cells          = dafoam_instance.solver.getNLocalCells()
-# state_var_partition_lines = n_cells*np.array(range(1, 7))
-
-# plt.figure(1) #Plotting raw stored data
-# for i in range(6):
-#     plt.axvline(x=state_var_partition_lines[i], color='gray', linestyle='--', alpha=0.5)
-# plt.plot(state_store)
-# plt.title('Raw training data [u,v,w,p,T,nuTilda,phi]')
-# plt.xlabel('Index')
-# plt.ylabel('Value')
-
-# plt.figure(2) #Plotting different reference vectors
-# for i in range(6):
-#     plt.axvline(x=state_var_partition_lines[i], color='gray', linestyle='--', alpha=0.5)
-# plt.plot(scale_factors,     label='Scale factors')
-# plt.plot(state_store_mean,  label='Data mean')
-# plt.plot(stat_scaling,      label='Stat scaling')
-# plt.title('Reference and normalization vectors')
-# plt.xlabel('Index')
-# plt.ylabel('Value')
-# plt.legend()
-# plt.show(block=False)
-
-# plt.figure(3) #Plotting data scaled by scaling factor
-# for i in range(6):
-#     plt.axvline(x=state_var_partition_lines[i], color='gray', linestyle='--', alpha=0.5)
-# plt.plot((state_store - state_store_mean[:, np.newaxis])/scale_factors[:, np.newaxis])
-# plt.title('Mean centered training data scaled by scaling factor')
-# plt.xlabel('Index')
-# plt.ylabel('Value')
-
-# # plt.figure(4) #Plotting data scaled by abs(mean) + 1
-# # for i in range(6):
-# #     plt.axvline(x=state_var_partition_lines[i], color='gray', linestyle='--', alpha=0.5)
-# # plt.plot((state_store - state_store_mean[:, np.newaxis])/(np.abs(state_store_mean[:, np.newaxis]) + 1))
-# # plt.title('Mean centered training data scaled by abs(mean) + 1')
-# # plt.xlabel('Index')
-# # plt.ylabel('Value')
-# # plt.show()
-
-# plt.figure(5) #Plotting data scaled by stat_scaling
-# for i in range(6):
-#     plt.axvline(x=state_var_partition_lines[i], color='gray', linestyle='--', alpha=0.5)
-# plt.plot((state_store - state_store_mean[:, np.newaxis])/stat_scaling[:, np.newaxis])
-# plt.title('Mean centered training data scaled by standard deviation')
-# plt.xlabel('Index')
-# plt.ylabel('Value')
-# plt.show()
-
-# z = (state_store - state_store_mean[:, None])/scale_factors[:, None]
-
-# # Compute our modes
-# u, s, vh  = np.linalg.svd(z, full_matrices=False)
-# pod_modes = u[:, :num_modes]
-
-# print(f'phi.T@phi: {pod_modes.T@pod_modes}')
-
-
-# plt.figure(6) #Plotting pod modes
-# for i in range(6):
-#     plt.axvline(x=state_var_partition_lines[i], color='gray', linestyle='--', alpha=0.5)
-# plt.plot(pod_modes)
-# plt.show()
-
-
-# # Initialize pyOFM
-# current_dir = os.getcwd()
-# os.chdir(dafoam_directory)
-# for i in range(num_modes):
-#     ofm.writeField(f'U_mode_{i}',       'volVectorField', np.ascontiguousarray(pod_modes[0*n_cells:3*n_cells, i]))
-#     ofm.writeField(f'p_mode_{i}',       'volScalarField', np.ascontiguousarray(pod_modes[3*n_cells:4*n_cells, i]))
-#     ofm.writeField(f'T_mode_{i}',       'volScalarField', np.ascontiguousarray(pod_modes[4*n_cells:5*n_cells, i]))
-#     ofm.writeField(f'nuTilda_mode_{i}', 'volScalarField', np.ascontiguousarray(pod_modes[5*n_cells:6*n_cells, i]))
-#     os.rename(f'./0/U_mode_{i}.gz',       f'./10000/U_mode{i}.gz')
-#     os.rename(f'./0/p_mode_{i}.gz',       f'./10000/p_mode{i}.gz')
-#     os.rename(f'./0/T_mode_{i}.gz',       f'./10000/T_mode{i}.gz')
-#     os.rename(f'./0/nuTilda_mode_{i}.gz', f'./10000/nuTilda_mode{i}.gz')
-# os.chdir(current_dir)
-
-
-
-
-# svals = s  # rename as appropriate
-# cum_energy = np.cumsum(svals**2)
-# total = cum_energy[-1]
-# energy_fraction = cum_energy / total
-# for k in [5,10,20,50,100]:
-#     if k <= len(svals):
-#         print(f"m={k:3d}  energy captured = {energy_fraction[k-1]:.6f}")
-# # minimal m for target energy
-# target = 0.999  # e.g. 99.9%
-# m_req = np.searchsorted(energy_fraction, target) + 1
-# print("m required for", target, "energy =", m_req)
-
-
-
-
-
-
-
-
-# # DAFoamSolver Implicit component setup and evaluation
-# dafoam_rom           = DAFoamROM(dafoam_instance, phi=pod_modes, fom_states_ref=state_store_mean, max_iters=1000, scaling_factors=scale_factors)
-# dafoam_rom_states    = dafoam_rom.evaluate(dafoam_input_variables_group)
-
-# print(f'dafoam_rom_states: {dafoam_rom_states.value}')
-
-# dafoam_fom_states    = csdl.matvec(pod_modes, dafoam_rom_states)
-
-# # DAFoamFunctions Explicit component setup and evaluation
-# dafoam_functions = DAFoamFunctions(dafoam_instance)
-# dafoam_function_outputs = dafoam_functions.evaluate(dafoam_fom_states, 
-#                                                     dafoam_input_variables_group)
-
-
-
-# recorder.stop()
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-# # Write modes to file for visualization
-# current_dir = os.getcwd()
-# os.chdir(dafoam_directory)
-# base_index = 5000
-# n_cells = dafoam_instance.solver.getNLocalCells()
-# for i in range(num_modes):
-#     try:
-#         os.mkdir(f'./{base_index + i}')
-#     except:
-#         None
-#     ofm.writeField(f'U_mode',       'volVectorField', np.ascontiguousarray(pod_modes[0*n_cells:3*n_cells, i]))
-#     ofm.writeField(f'p_mode',       'volScalarField', np.ascontiguousarray(pod_modes[3*n_cells:4*n_cells, i]))
-#     ofm.writeField(f'T_mode',       'volScalarField', np.ascontiguousarray(pod_modes[4*n_cells:5*n_cells, i]))
-#     ofm.writeField(f'nuTilda_mode', 'volScalarField', np.ascontiguousarray(pod_modes[5*n_cells:6*n_cells, i]))
-#     os.rename(f'./0/U_mode.gz',       f'./{base_index + i}/U_mode.gz')
-#     os.rename(f'./0/p_mode.gz',       f'./{base_index + i}/p_mode.gz')
-#     os.rename(f'./0/T_mode.gz',       f'./{base_index + i}/T_mode.gz')
-#     os.rename(f'./0/nuTilda_mode.gz', f'./{base_index + i}/nuTilda_mode.gz')
-# os.chdir(current_dir)
-
-# os.chdir(dafoam_directory)
-# base_index = 6000
-# n_cells = dafoam_instance.solver.getNLocalCells()
-# for i in range(num_modes):
-#     try:
-#         os.mkdir(f'./{base_index + i}')
-#     except:
-#         None
-#     ofm.writeField(f'U_temp',       'volVectorField', np.ascontiguousarray(y_training[0*n_cells:3*n_cells, i]))
-#     ofm.writeField(f'p_temp',       'volScalarField', np.ascontiguousarray(y_training[3*n_cells:4*n_cells, i]))
-#     ofm.writeField(f'T_temp',       'volScalarField', np.ascontiguousarray(y_training[4*n_cells:5*n_cells, i]))
-#     ofm.writeField(f'nuTilda_temp', 'volScalarField', np.ascontiguousarray(y_training[5*n_cells:6*n_cells, i]))
-#     os.rename(f'./0/U_temp.gz',       f'./{base_index + i}/U_temp.gz')
-#     os.rename(f'./0/p_temp.gz',       f'./{base_index + i}/p_temp.gz')
-#     os.rename(f'./0/T_temp.gz',       f'./{base_index + i}/T_temp.gz')
-#     os.rename(f'./0/nuTilda_temp.gz', f'./{base_index + i}/nuTilda_temp.gz')
-# os.chdir(current_dir)
-
-# base_index = 7000
-# for i in range(num_modes):
-#     dafoam_instance.solver.writeAdjointFields('mode', base_index + i, np.ascontiguousarray(pod_modes[:, i]))
-
-# os.chdir(dafoam_directory)
-# base_index = 8000
-# n_cells = dafoam_instance.solver.getNLocalCells()
-# for i in range(num_modes):
-#     try:
-#         os.mkdir(f'./{base_index + i}')
-#     except:
-#         None
-#     ofm.writeField(f'z_U',       'volVectorField', np.ascontiguousarray(z[0*n_cells:3*n_cells, i]))
-#     ofm.writeField(f'z_p',       'volScalarField', np.ascontiguousarray(z[3*n_cells:4*n_cells, i]))
-#     ofm.writeField(f'z_T',       'volScalarField', np.ascontiguousarray(z[4*n_cells:5*n_cells, i]))
-#     ofm.writeField(f'z_nuTilda', 'volScalarField', np.ascontiguousarray(z[5*n_cells:6*n_cells, i]))
-#     os.rename(f'./0/z_U.gz',       f'./{base_index + i}/z_U.gz')
-#     os.rename(f'./0/z_p.gz',       f'./{base_index + i}/z_p.gz')
-#     os.rename(f'./0/z_T.gz',       f'./{base_index + i}/z_T.gz')
-#     os.rename(f'./0/z_nuTilda.gz', f'./{base_index + i}/z_nuTilda.gz')
-# os.chdir(current_dir)
-
-# os.chdir(dafoam_directory)
-# base_index = 9000
-# n_cells = dafoam_instance.solver.getNLocalCells()
-# for i in range(1):
-#     try:
-#         os.mkdir(f'./{base_index + i}')
-#     except:
-#         None
-#     ofm.writeField(f'U_weights',         'volVectorField', np.ascontiguousarray(weights[0*n_cells:3*n_cells]))
-#     ofm.writeField(f'p_weights',         'volScalarField', np.ascontiguousarray(weights[3*n_cells:4*n_cells]))
-#     ofm.writeField(f'T_weights',         'volScalarField', np.ascontiguousarray(weights[4*n_cells:5*n_cells]))
-#     ofm.writeField(f'nuTilda_weights',   'volScalarField', np.ascontiguousarray(weights[5*n_cells:6*n_cells]))
-#     os.rename(f'./0/U_weights.gz',       f'./{base_index + i}/U_weights.gz')
-#     os.rename(f'./0/p_weights.gz',       f'./{base_index + i}/p_weights.gz')
-#     os.rename(f'./0/T_weights.gz',       f'./{base_index + i}/T_weights.gz')
-#     os.rename(f'./0/nuTilda_weights.gz',       f'./{base_index + i}/nuTilda_weights.gz')
-
-#     ofm.writeField(f'U_sqrt_weights',         'volVectorField', np.ascontiguousarray(np.sqrt(weights[0*n_cells:3*n_cells])))
-#     ofm.writeField(f'p_sqrt_weights',         'volScalarField', np.ascontiguousarray(np.sqrt(weights[3*n_cells:4*n_cells])))
-#     ofm.writeField(f'T_sqrt_weights',         'volScalarField', np.ascontiguousarray(np.sqrt(weights[4*n_cells:5*n_cells])))
-#     ofm.writeField(f'nuTilda_sqrt_weights',   'volScalarField', np.ascontiguousarray(np.sqrt(weights[5*n_cells:6*n_cells])))
-#     os.rename(f'./0/U_sqrt_weights.gz',       f'./{base_index + i}/U_sqrt_weights.gz')
-#     os.rename(f'./0/p_sqrt_weights.gz',       f'./{base_index + i}/p_sqrt_weights.gz')
-#     os.rename(f'./0/T_sqrt_weights.gz',       f'./{base_index + i}/T_sqrt_weights.gz')
-#     os.rename(f'./0/nuTilda_sqrt_weights.gz',       f'./{base_index + i}/nuTilda_sqrt_weights.gz')
-
-#     ofm.writeField(f'U_scale',         'volVectorField', np.ascontiguousarray(scaling_factors[0*n_cells:3*n_cells]))
-#     ofm.writeField(f'p_scale',         'volScalarField', np.ascontiguousarray(scaling_factors[3*n_cells:4*n_cells]))
-#     ofm.writeField(f'T_scale',         'volScalarField', np.ascontiguousarray(scaling_factors[4*n_cells:5*n_cells]))
-#     ofm.writeField(f'nuTilda_scale',   'volScalarField', np.ascontiguousarray(scaling_factors[5*n_cells:6*n_cells]))
-#     os.rename(f'./0/U_scale.gz',       f'./{base_index + i}/U_scale.gz')
-#     os.rename(f'./0/p_scale.gz',       f'./{base_index + i}/p_scale.gz')
-#     os.rename(f'./0/T_scale.gz',       f'./{base_index + i}/T_scale.gz')
-#     os.rename(f'./0/nuTilda_scale.gz',       f'./{base_index + i}/nuTilda_scale.gz')
-
-#     ofm.writeField(f'U_ref',         'volVectorField', np.ascontiguousarray(y_reference[0*n_cells:3*n_cells]))
-#     ofm.writeField(f'p_ref',         'volScalarField', np.ascontiguousarray(y_reference[3*n_cells:4*n_cells]))
-#     ofm.writeField(f'T_ref',         'volScalarField', np.ascontiguousarray(y_reference[4*n_cells:5*n_cells]))
-#     ofm.writeField(f'nuTilda_ref',   'volScalarField', np.ascontiguousarray(y_reference[5*n_cells:6*n_cells]))
-#     os.rename(f'./0/U_ref.gz',       f'./{base_index + i}/U_ref.gz')
-#     os.rename(f'./0/p_ref.gz',       f'./{base_index + i}/p_ref.gz')
-#     os.rename(f'./0/T_ref.gz',       f'./{base_index + i}/T_ref.gz')
-#     os.rename(f'./0/nuTilda_ref.gz',       f'./{base_index + i}/nuTilda_ref.gz')
-# os.chdir(current_dir)
-
-# os.chdir(dafoam_directory)
-# base_index = 10000
-# n_cells = dafoam_instance.solver.getNLocalCells()
-# for i in range(num_modes):
-#     try:
-#         os.mkdir(f'./{base_index + i}')
-#     except:
-#         None
-#     ofm.writeField(f'U_centered',       'volVectorField', np.ascontiguousarray(y_training[0*n_cells:3*n_cells, i] - y_reference[0*n_cells:3*n_cells]))
-#     ofm.writeField(f'p_centered',       'volScalarField', np.ascontiguousarray(y_training[3*n_cells:4*n_cells, i] - y_reference[3*n_cells:4*n_cells]))
-#     ofm.writeField(f'T_centered',       'volScalarField', np.ascontiguousarray(y_training[4*n_cells:5*n_cells, i] - y_reference[4*n_cells:5*n_cells]))
-#     ofm.writeField(f'nuTilda_centered', 'volScalarField', np.ascontiguousarray(y_training[5*n_cells:6*n_cells, i] - y_reference[5*n_cells:6*n_cells]))
-#     os.rename(f'./0/U_centered.gz',       f'./{base_index + i}/U_centered.gz')
-#     os.rename(f'./0/p_centered.gz',       f'./{base_index + i}/p_centered.gz')
-#     os.rename(f'./0/T_centered.gz',       f'./{base_index + i}/T_centered.gz')
-#     os.rename(f'./0/nuTilda_centered.gz', f'./{base_index + i}/nuTilda_centered.gz')
-# os.chdir(current_dir)
-
-# base_index = 11000
-# for i in range(num_modes):
-#     dafoam_instance.solver.writeAdjointFields('sol', base_index + i, np.ascontiguousarray(local_data["snapshots_local"][:, i]))
+prob                = CSDLAlphaProblem(problem_name=f'{problem_name}', simulator=sim)
+optimizer_choice    = 2 # Set to 1 for PySLSQP, 2 for OpenSQP, or 3 for InteriorPoint
+
+if optimizer_choice == 1:
+    # PySLSQP optimizer setup
+    solver_options = {'maxiter': 20,
+                    'iprint': 2,
+                    'readable_outputs': rank_outputs,
+                    'recording': recording_on_root_rank,
+                    'turn_off_outputs': turn_off_outputs_on_nonroot_rank}
+    optimizer   = PySLSQP(prob, solver_options=solver_options)
+    optimizer.solve()
+    optimizer.print_results()
+
+elif optimizer_choice == 2:
+    # OpenSQP optimizer setup
+    open_sqp_options = {'maxiter': 100,
+                        'readable_outputs': rank_outputs,
+                        'recording': recording_on_root_rank,
+                        'ls_max_step': 1.,
+                        'turn_off_outputs': turn_off_outputs_on_nonroot_rank,}
+                        #'hot_start_from':'/media/edward/DATA/Edward/AFRL_project/csdl_dafoam_workspace/airfoil_case/results/airfoil_setup_test/airfoil_setup_test_outputs/2026-02-03_16.02.02.618346/record.hdf5',
+                        #'hot_start_rtol':1e-3}
+    optimizer = OpenSQP(prob, **open_sqp_options)
+    optimizer.solve()
+    optimizer.print_results()
+
+elif optimizer_choice == 3:
+    # InteriorPoint optimizer setup
+    interior_point_options = {'maxiter': 100,
+                            'readable_outputs': rank_outputs,
+                            'recording': recording_on_root_rank,
+                            'ls_max_step': 1.,
+                            'turn_off_outputs': turn_off_outputs_on_nonroot_rank,
+                            'hot_start_from':'/media/edward/DATA/Edward/AFRL_project/csdl_dafoam_workspace/airfoil_case/results/airfoil_setup_test/airfoil_setup_test_outputs/2026-02-03_16.02.02.618346/record.hdf5',
+                            'hot_start_rtol':1e-3}
+    optimizer   = InteriorPoint(prob, **interior_point_options)
+    optimizer.solve()
+    optimizer.print_results()
+    
+else:
+    print(f'Check optimizer choice. {optimizer_choice} is not an option.')
