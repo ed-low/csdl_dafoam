@@ -126,6 +126,7 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
 
         # Set outputs
         dafoam_rom_states = self.create_output('dafoam_rom_states', (num_modes,))
+        self.basis_size   = num_modes
 
         return dafoam_rom_states
 
@@ -140,6 +141,21 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
         self.reference_state    = input_vals["reference_state"] if self.reference_state_is_csdl_var else self.reference_state
         self.weights            = np.ones_like(self.reference_state) if self.weights is None        else self.weights
 
+        # Make sure solver is updated with the most recent input values
+        dafoam_instance.set_solver_input(input_vals)
+
+        # Initial guess: warm start from previous solution if available, else zero
+        q0 = np.zeros(self.basis_size) #self._cached_q.copy() if self._cached_q is not None else np.zeros(self.basis_size)
+
+        q, reason = self._rom_newtwon_solve(initial_rom_state=q0)
+
+        if reason == 1:
+            output_vals["dafoam_rom_states"] = q
+
+        elif reason == -1 or reason == -2:
+            self.print0("Netwon solver failed. Setting DAFoam ROM states to NaNs.")
+            output_vals["dafoam_rom_states"] = np.nan * np.ones_like(q)
+
 
     # region apply_inverse_jacobian
     def apply_inverse_jacobian(self, input_vals, output_vals, d_outputs, d_residuals, mode):
@@ -148,7 +164,22 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
             raise NotImplementedError('forward mode has not been implemented for DAFoamROM')
         
         elif mode == 'rev':
-            raise NotImplementedError('reverse mode has not been implemented for DAFoamROM')
+            # Raise error in case cached Jacobian was not computed.
+            # TODO: Maybe make this just compute the Jacobian if that is the case?
+            if self._cached_J_r is None:
+                raise RuntimeError("Cached ROM Jacobian is None. ensure solve_residual_equations ran successfully before calling apply_inverse_jacobian.")
+            
+            J_romT = self._cached_J_r.T
+            v      = d_outputs["dafoam_rom_states"]
+
+            # TODO: Should I have this return NaNs instead of attempting a least-squares solve?
+            # TODO: Also, check if accumulation is necessary - that is, = vs +=. Accumulating for now 
+            try:
+                d_residuals["dafoam_rom_states"] += np.linalg.solve(J_romT, v)
+            except np.linalg.LinAlgError:
+                self.print0("Warning: ROM Jacobian is singular. Attempting least-squares solve.")
+                solution, _, _, _ = np.linalg.lstsq(J_romT, v, rcond=None)
+                d_residuals += solution
 
         else:
             raise ValueError(f'"{mode}" not recognized. Only support "fwd" and "rev" modes')
@@ -156,13 +187,110 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
 
     # region compute_jacvec_product
     def compute_jacvec_product(self, input_vals, output_vals, d_inputs, d_outputs, d_residuals, mode):
+        dafoam_instance = self.dafoam_instance
+
+        # We'll use cached values from the previous solve
+        # NOTE: Would it be best to use output_vals to get ROM state?
+        q = self._cached_q
+        w = self._cached_w
+
+        if not has_global_nan_or_inf(w, self.comm):
+            self.dafoam_instance.setStates(w)
+        else:
+            self.print0('DAFoamROM.compute_jacvec_product: Detected NaN(s) in input_vals. Skipping DAFoam setStates')
        
         # Can't do forward mode
         if mode == 'fwd':
             raise NotImplementedError('forward mode has not been implemented for DAFoamROM')
 
         elif mode == 'rev':
-            raise NotImplementedError('reverse mode has not been implemented for DAFoamROM')
+            if "dafoam_rom_states" not in d_residuals:
+                self.print0('DAFoamROM.compute_jacvec_product: no "dafoam_rom_states" detected in d_residuals. Continuing without assignment.')
+                return
+
+            lam = d_residuals["dafoam_rom_states"]
+
+            m   = self.weights
+            Psi = self.test_basis
+            Phi = self.pod_modes
+            s   = self.scaling
+
+            # Shared seed: M @ Psi @ lam (fom size, distributed)
+            seed = np.ascontiguousarray(m * (Psi @ lam))
+
+            # FOM inputs: mesh, flow DVs
+            input_dict = dafoam_instance.getOption("inputInfo")
+
+            for input_name in list(input_vals.keys()):
+                if input_name not in input_dict:
+                    continue # skip reconstruction inputs, handled below
+                if input_name not in d_inputs:
+                    continue # skip if not needed
+
+                input_type = input_dict[input_name]["type"]
+                jac_input  = input_vals[input_name].copy()
+                product    = np.zeros_like(jac_input)
+
+                dafoam_instance.solverAD.calcJacTVecProduct(
+                    input_name,
+                    input_type,
+                    jac_input,
+                    "aero_residuals",
+                    "residual",
+                    seed,
+                    product
+                )
+
+                d_inputs[input_name] += product
+
+                # Reconstruction inputs (these are handled if the POD reconstruction inputs are actually CSDL variables)
+                needs_reconstruction_sens = any(k in d_inputs for k in ["reference_state", "scaling", "pod_modes"])
+
+                if needs_reconstruction_sens:
+                    # This vector is shared among all of the sensitivites. Compute once here
+                    # J^T M Psi lam
+                    v_shared = self._jacT_vec_product(fom_state=w, vec=seed)
+
+                    # Compute contribution from the reference state variable
+                    # (∂r_rom/∂w_ref)^T lam = (Psi^T M ∂r/∂w ∂w/∂w_ref)^T lam = (Psi^T M J ∂w/∂w_ref)^T lam
+                    # ∂w/∂w_ref = I
+                    # (∂r_rom/∂w_ref)^T lam = (Psi^T M J)^T lam = J^T M Psi lam = v_shared
+                    if "reference_state" in d_inputs:
+                        d_inputs["reference_state"] += v_shared
+
+                    # Compute contribution from the scaling variable
+                    # (∂r_rom/∂s)^T lam = (Psi^T M ∂r/∂w ∂w/s)^T lam = (Psi^T M J ∂w/s)^T lam
+                    # ∂w/s = Phi q
+                    # (∂r_rom/∂s)^T lam = (Psi^T M J Phi q)^T lam = (Phi q) J^T M Psi lam = (Phi q) v_shared [Phi q is a vector, so transpose is dropped]
+                    if "reference_state" in d_inputs:
+                        Phi_q = Phi @ q # (n_local,)
+                        d_inputs["reference_state"] += Phi_q * v_shared
+
+                    # Compute contribution from the modes
+                    if "pod_modes" in d_inputs:
+                        # We have two paths: one from the projection, and one from the reconstruction
+                        # (∂r_rom/∂Phi)^T lam = [∂/∂Phi(Psi^T M R)] ^ T lam
+                        # Where Psi and R have Phi dependence
+                        # Being loose with notation here (since we have arrays)
+                        # ∂/∂Phi(Psi^T M R) = ∂/∂Phi(Psi^T) M R + Psi^T M ∂/∂Phi(R)
+                        #                    |----projection---| |-reconstruction--|
+
+                        # Path 1: reconstruction (this is shared by both Galerkin and LSPG)
+                        # [Psi^T M ∂/∂Phi(R)]^T lam
+                        # dw = S dPhi q
+                        d_inputs += s[:, None] * np.outer(v_shared, q)
+
+                        # Path 2: projection - Phi appears in Psi^T M R
+                        r = self._eval_fom_residual(fom_state=w)
+
+                        if self.rom_type == "galerkin":
+                            # In this case, Psi = Phi
+                            d_inputs["pod_modes"] += np.outer(m * r, lam)
+
+                        elif self.rom_type == "lspg":
+                            # In this case, Psi = J S Phi
+                            JT_r = self._jacT_vec_product(fom_state=w, vec=m * r)
+                            d_inputs["pod_modes"] += s[:, None] * np.outer(JT_r, lam)
         
         else:
             raise ValueError(f'"{mode}" not recognized. Only support "fwd" and "rev" modes')
@@ -175,7 +303,7 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
         Phi     = self.pod_modes
         w_ref   = self.reference_state
 
-        return w_ref + (s[:, None] * Phi) @ q
+        return w_ref + s * (Phi @ q)
     
 
     # region _eval_fom_residual
@@ -187,8 +315,8 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
         return dafoam_instance.getResiduals()
 
 
-    # region _project_to_reduced
-    def _project(self, distributed_val):
+    # region _project_and_reduce
+    def _project_and_reduce(self, distributed_val):
         comm = self.comm
         m    = self.weights
         Psi  = self.test_basis
@@ -235,8 +363,15 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
     def _jac_vec_product(self, fom_state, direction, fom_residual=None, step=1e-6):
         w = fom_state
         v = direction
-        h = step
 
+        # Scale h relative to the direction magnitude to avoid truncation/cancellation
+        v_norm_local  = np.dot(v, v)
+        v_norm_global = np.zeros(1)
+        self.comm.Allreduce(v_norm_local, v_norm_global, op=MPI.SUM)
+        v_norm = np.sqrt(v_norm_global[0])
+
+        h = step * v_norm if v_norm > 0 else step
+    
         # Use directional derivative fd approximation
         r0      = self._eval_fom_residual(fom_state=w) if fom_residual is None else fom_residual
         r_pert  = self._eval_fom_residual(fom_state=w + h * v)
@@ -297,11 +432,11 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
         w = self._reconstruct_fom_state(q)
         r = self._eval_fom_residual(w)
 
-        return self._project(distributed_vec=r)
+        return self._project_and_reduce(distributed_val=r)
         
 
     # region _eval_rom_jacobian_fd
-    def _compute_rom_jacobian(self, fom_state):
+    def _compute_rom_jacobian(self, fom_state, step=1e-6):
         Psi = self.test_basis
         Phi = self.pod_modes
         m   = self.weights
@@ -316,8 +451,8 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
                 self.comm.Allreduce(J_rom_local, J_rom, op=MPI.SUM)
 
             elif self.rom_type == "galerkin":
-                # _project already handles the reduction
-                J_rom = self._project(self._jac_mat_product(fom_state=w, matrix=s[:, None] * Phi))
+                # _project_and_reduce already handles the reduction
+                J_rom = self._project_and_reduce(self._jac_mat_product(fom_state=w, matrix=s[:, None] * Phi, step=step))
 
         elif self.jac_mode == "analytical":
             if self.rom_type == "lspg":
@@ -333,9 +468,108 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
 
 
     # region _rom_newtwon_solve
-    def _rom_newtwon_solve(self, q0, input_vales, modes):
-        raise NotImplementedError("to be implemented")
-    
+    def _rom_newtwon_solve(self, initial_rom_state):
+        DEFAULT_NEWTON_OPTIONS = {
+                                    'maxiter':          50,       # max Newton iterations
+                                    'tol_rel':          1e-6,     # relative residual tolerance
+                                    'tol_abs':          1e-10,    # absolute residual tolerance
+                                    'ls_alpha0':        1.0,      # initial line search step
+                                    'ls_rho':           0.5,      # backtrack factor
+                                    'ls_c1':            1e-4,     # Armijo sufficient decrease constant
+                                    'ls_maxiter':       10,       # max line search iterations
+                                    'jac_fd_step':      1e-6,     # FD step for Jacobian
+                                    'update_test_basis_every': 1, # how often to recompute Psi (every n iters)
+                                }
+        
+        opts = {**DEFAULT_NEWTON_OPTIONS, **(self.newton_options or {})}
+        q    = initial_rom_state.copy()
+        
+        # We'll return 1 if we have a successful search, -1 if the line search goes to minimum step, and -2
+        # if we reach max iterations without converging
+        reason = 0
+
+        jac_fd_step = opts["jac_fd_step"]
+
+        # Initial residual
+        w           = self._reconstruct_fom_state(q)
+        self._update_test_basis(fom_state=w, step=jac_fd_step)
+        r_rom       = self._eval_rom_residual(q)
+        r_rom_norm0 = np.linalg.norm(r_rom)
+        r_rom_norm  = r_rom_norm0
+
+        self.print0(f"{'Iter':>5} {'‖r_rom‖':>14} {'‖r_rom‖/‖r0‖':>14} {'alpha':>8}")
+        self.print0(f"{0:>5} {r_rom_norm0:>14.6e} {1.0:>14.6e} {'—':>8}")
+
+        J_rom = None
+
+        # Main loop
+        for k in range(opts["maxiter"]):
+
+            # Check convergence
+            if r_rom_norm < opts["tol_abs"]:
+                self.print0(f"Newton converged (absolute tolerance) at ateration {k}")
+                reason = 1
+                break
+            if r_rom_norm / r_rom_norm0 < opts["tol_rel"]:
+                self.print0(f"Newton converged (relative tolerance) at iteration {k}")
+                reason = 1
+                break
+
+            # Compute ROM Jacobian
+            w       = self._reconstruct_fom_state(q)
+            if k % opts["update_test_basis_every"] == 0:
+                    self._update_test_basis(fom_state=w, step=jac_fd_step)
+            J_rom   = self._compute_rom_jacobian(fom_state=w, step=jac_fd_step)
+
+            # Solve the reduced linear system. We'll do this on all ranks, redundantly for now 
+            # (if the basis size gets bigger, we may want to consider performing on root and then broadcasting
+            # or maybe even parallelizing this.)
+            try:
+                dq = np.linalg.solve(J_rom, -r_rom)
+            except np.linalg.LinAlgError:
+                self.print0("Warning: ROM Jacobian is singular. Attempting least-squares solve.")
+                dq, _, _, _ = np.linalg.lstsq(J_rom, -r_rom, rcond=None)
+
+            # Armijo backtracking line search
+            alpha       = opts["ls_alpha0"]
+            ls_success  = False
+
+            for ls_iter in range(opts["ls_maxiter"]):
+                q_trial             = q + alpha * dq
+                r_rom_trial         = self._eval_rom_residual(q_trial)
+                r_rom_norm_trial    = np.linalg.norm(r_rom_trial)
+
+                # Armijo condition
+                if r_rom_norm_trial <= (1.0 - opts['ls_c1'] * alpha) * r_rom_norm:
+                    ls_success  = True
+                    reason      = 1
+                    break
+
+                alpha *= opts['ls_rho']
+
+            if not ls_success:
+                self.print0(f"Warning: line search failed at iteration {k}. Taking minimum step.")
+                reason = -1
+
+            # Accept step
+            q           = q_trial
+            r_rom       = r_rom_trial
+            r_rom_norm  = r_rom_norm_trial
+
+            self.print0(f"{k+1:>5} {r_rom_norm:>14.6e} {r_rom_norm/r_rom_norm0:>14.6e} {alpha:>8.2e}")
+
+        else:
+            self.print0(f"Warning: Newton solver reached max iterations ({opts['maxiter']}) without converging.")
+            reason = -2
+
+
+        # Cache and return
+        self._cached_q   = q
+        self._cached_w   = self._reconstruct_fom_state(q)
+        self._cached_J_r = J_rom
+
+        return q, reason
+        
 
     # region _set_as_constant_or_input
     # Function with logic for determining if we have constant or variable inputs
@@ -353,7 +587,7 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
                 TypeError(f'{name} not assigned to ROM. Please pass {name} during initialization or evaluation.')
             else:
                 if name == "pod_modes":
-                    num_modes = variable.shape[1]
+                    num_modes = getattr(self, name).shape[1]
                 setattr(self, f"{name}_is_csdl_var", False)
         
         if name == "pod_modes":
