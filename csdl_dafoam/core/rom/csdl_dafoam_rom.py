@@ -428,6 +428,8 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
 
     # region _eval_rom_residual
     def _eval_rom_residual(self, rom_state):
+        assert self.test_basis is not None, \
+            "test_basis is None. Call _update_test_basis before _eval_rom_residual"
         q = rom_state
         w = self._reconstruct_fom_state(q)
         r = self._eval_fom_residual(w)
@@ -518,7 +520,7 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
             # Compute ROM Jacobian
             w       = self._reconstruct_fom_state(q)
             if k % opts["update_test_basis_every"] == 0:
-                    self._update_test_basis(fom_state=w, step=jac_fd_step)
+                self._update_test_basis(fom_state=w, step=jac_fd_step)
             J_rom   = self._compute_rom_jacobian(fom_state=w, step=jac_fd_step)
 
             # Solve the reduced linear system. We'll do this on all ranks, redundantly for now 
@@ -584,7 +586,7 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
             setattr(self, f"{name}_is_csdl_var", True)
         else:
             if getattr(self, name) is None:
-                TypeError(f'{name} not assigned to ROM. Please pass {name} during initialization or evaluation.')
+                raise TypeError(f'{name} not assigned to ROM. Please pass {name} during initialization or evaluation.')
             else:
                 if name == "pod_modes":
                     num_modes = getattr(self, name).shape[1]
