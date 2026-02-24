@@ -179,7 +179,7 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
             except np.linalg.LinAlgError:
                 self.print0("Warning: ROM Jacobian is singular. Attempting least-squares solve.")
                 solution, _, _, _ = np.linalg.lstsq(J_romT, v, rcond=None)
-                d_residuals += solution
+                d_residuals["dafoam_rom_states"] += solution
 
         else:
             raise ValueError(f'"{mode}" not recognized. Only support "fwd" and "rev" modes')
@@ -243,55 +243,55 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
 
                 d_inputs[input_name] += product
 
-                # Reconstruction inputs (these are handled if the POD reconstruction inputs are actually CSDL variables)
-                needs_reconstruction_sens = any(k in d_inputs for k in ["reference_state", "scaling", "pod_modes"])
+            # Reconstruction inputs (these are handled if the POD reconstruction inputs are actually CSDL variables)
+            needs_reconstruction_sens = any(k in d_inputs for k in ["reference_state", "scaling", "pod_modes"])
 
-                if needs_reconstruction_sens:
-                    # This vector is shared among all of the sensitivites. Compute once here
-                    # J^T M Psi lam
-                    v_shared = self._jacT_vec_product(fom_state=w, vec=seed)
+            if needs_reconstruction_sens:
+                # This vector is shared among all of the sensitivites. Compute once here
+                # J^T M Psi lam
+                v_shared = self._jacT_vec_product(fom_state=w, vec=seed)
 
-                    # Compute contribution from the reference state variable
-                    # (∂r_rom/∂w_ref)^T lam = (Psi^T M ∂r/∂w ∂w/∂w_ref)^T lam = (Psi^T M J ∂w/∂w_ref)^T lam
-                    # ∂w/∂w_ref = I
-                    # (∂r_rom/∂w_ref)^T lam = (Psi^T M J)^T lam = J^T M Psi lam = v_shared
-                    if "reference_state" in d_inputs:
-                        d_inputs["reference_state"] += v_shared
+                # Compute contribution from the reference state variable
+                # (∂r_rom/∂w_ref)^T lam = (Psi^T M ∂r/∂w ∂w/∂w_ref)^T lam = (Psi^T M J ∂w/∂w_ref)^T lam
+                # ∂w/∂w_ref = I
+                # (∂r_rom/∂w_ref)^T lam = (Psi^T M J)^T lam = J^T M Psi lam = v_shared
+                if "reference_state" in d_inputs:
+                    d_inputs["reference_state"] += v_shared
 
-                    # Compute contribution from the scaling variable
-                    # (∂r_rom/∂s)^T lam = (Psi^T M ∂r/∂w ∂w/s)^T lam = (Psi^T M J ∂w/s)^T lam
-                    # ∂w/s = Phi q
-                    # (∂r_rom/∂s)^T lam = (Psi^T M J Phi q)^T lam = (Phi q) J^T M Psi lam = (Phi q) v_shared [Phi q is a vector, so transpose is dropped]
-                    if "reference_state" in d_inputs:
-                        Phi_q = Phi @ q # (n_local,)
-                        d_inputs["reference_state"] += Phi_q * v_shared
+                # Compute contribution from the scaling variable
+                # (∂r_rom/∂s)^T lam = (Psi^T M ∂r/∂w ∂w/s)^T lam = (Psi^T M J ∂w/s)^T lam
+                # ∂w/s = Phi q
+                # (∂r_rom/∂s)^T lam = (Psi^T M J Phi q)^T lam = (Phi q) J^T M Psi lam = (Phi q) v_shared [Phi q is a vector, so transpose is dropped]
+                if "reference_state" in d_inputs:
+                    Phi_q = Phi @ q # (n_local,)
+                    d_inputs["reference_state"] += Phi_q * v_shared
 
-                    # Compute contribution from the modes
-                    if "pod_modes" in d_inputs:
-                        # We have two paths: one from the projection, and one from the reconstruction
-                        # (∂r_rom/∂Phi)^T lam = [∂/∂Phi(Psi^T M R)] ^ T lam
-                        # Where Psi and R have Phi dependence
-                        # Being loose with notation here (since we have arrays)
-                        # ∂/∂Phi(Psi^T M R) = ∂/∂Phi(Psi^T) M R + Psi^T M ∂/∂Phi(R)
-                        #                    |----projection---| |-reconstruction--|
+                # Compute contribution from the modes
+                if "pod_modes" in d_inputs:
+                    # We have two paths: one from the projection, and one from the reconstruction
+                    # (∂r_rom/∂Phi)^T lam = [∂/∂Phi(Psi^T M R)] ^ T lam
+                    # Where Psi and R have Phi dependence
+                    # Being loose with notation here (since we have arrays)
+                    # ∂/∂Phi(Psi^T M R) = ∂/∂Phi(Psi^T) M R + Psi^T M ∂/∂Phi(R)
+                    #                    |----projection---| |-reconstruction--|
 
-                        # Path 1: reconstruction (this is shared by both Galerkin and LSPG)
-                        # [Psi^T M ∂/∂Phi(R)]^T lam
-                        # dw = S dPhi q
-                        d_inputs += s[:, None] * np.outer(v_shared, q)
+                    # Path 1: reconstruction (this is shared by both Galerkin and LSPG)
+                    # [Psi^T M ∂/∂Phi(R)]^T lam
+                    # dw = S dPhi q
+                    d_inputs += s[:, None] * np.outer(v_shared, q)
 
-                        # Path 2: projection - Phi appears in Psi^T M R
-                        r = self._eval_fom_residual(fom_state=w)
+                    # Path 2: projection - Phi appears in Psi^T M R
+                    r = self._eval_fom_residual(fom_state=w)
 
-                        if self.rom_type == "galerkin":
-                            # In this case, Psi = Phi
-                            d_inputs["pod_modes"] += np.outer(m * r, lam)
+                    if self.rom_type == "galerkin":
+                        # In this case, Psi = Phi
+                        d_inputs["pod_modes"] += np.outer(m * r, lam)
 
-                        elif self.rom_type == "lspg":
-                            # In this case, Psi = J S Phi
-                            JT_r = self._jacT_vec_product(fom_state=w, vec=m * r)
-                            d_inputs["pod_modes"] += s[:, None] * np.outer(JT_r, lam)
-        
+                    elif self.rom_type == "lspg":
+                        # In this case, Psi = J S Phi
+                        JT_r = self._jacT_vec_product(fom_state=w, vec=m * r)
+                        d_inputs["pod_modes"] += s[:, None] * np.outer(JT_r, lam)
+    
         else:
             raise ValueError(f'"{mode}" not recognized. Only support "fwd" and "rev" modes')
         
