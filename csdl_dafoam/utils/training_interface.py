@@ -26,6 +26,7 @@ class TrainingDataInterface():
                  num_primary_samples=2,
                  num_secondary_samples=20,
                  random_state_seed=0,
+                 store_residuals=False,
                  h5_file_base_name="point",
                  gather_raw_files=True
                  ):
@@ -51,6 +52,7 @@ class TrainingDataInterface():
         self.dataset_keyword            = dataset_keyword
         self.num_primary_samples        = num_primary_samples
         self.num_secondary_samples      = num_secondary_samples
+        self.store_residuals            = store_residuals
         self.random_state_seed          = random_state_seed
         self.h5_file_base_name          = h5_file_base_name
         self.gather_raw_files           = gather_raw_files
@@ -245,6 +247,8 @@ class TrainingDataInterface():
             state_group     = sample_group.create_group("states")
             ref_group       = sample_group.create_group("reference_states")
             mesh_group      = sample_group.create_group("mesh")
+            if self.store_residuals:
+                res_group   = sample_group.create_group("residuals")
 
             for state_name, info in self.state_info.items():
                 state_type          = info["type"]
@@ -258,6 +262,10 @@ class TrainingDataInterface():
                 
                 state_group.create_dataset(state_name,                      (size, adj_num_secondary_samples),      dtype="f8")
                 state_group[state_name].attrs.create("addressing_type", state_type)
+
+                if self.store_residuals:
+                    res_group.create_dataset(state_name,                      (size, adj_num_secondary_samples),      dtype="f8")
+                    res_group[state_name].attrs.create("addressing_type", state_type)
 
                 if self.reference_patch is not None:
                     ref_group.create_dataset(f"{state_name}",           (adj_num_secondary_samples,),           dtype="f8")
@@ -301,16 +309,22 @@ class TrainingDataInterface():
     # region write_sample
     def write_sample(self, h5filepath, sample_idx):
         self.print0('Adding sample...')
-        states                                  = self.dafoam_instance.getStates()
-        cell_coords                             = self.dafoam_instance.getCellCentroids()
-        state_weights                           = self.dafoam_instance.getStateWeights()
-        state_reference_values                  = self.dafoam_instance.getPatchStateAverages(self.reference_patch) if self.reference_patch is not None else None
+        dafoam_instance = self.dafoam_instance
+        states                                  = dafoam_instance.getStates()
+        cell_coords                             = dafoam_instance.getCellCentroids()
+        state_weights                           = dafoam_instance.getStateWeights()
+        state_reference_values                  = dafoam_instance.getPatchStateAverages(self.reference_patch) if self.reference_patch is not None else None
+        if self.store_residuals:
+            residuals                           = dafoam_instance.getResiduals()
 
         with h5py.File(h5filepath, "a", driver="mpio", comm=self.comm) as f:
             sample_group    = f["samples"]
             state_group     = sample_group["states"]
             ref_group       = sample_group["reference_states"]
             mesh_group      = sample_group["mesh"]
+
+            if self.store_residuals:
+                res_group   = sample_group["residuals"]
 
             added_cell_volumes = False
             added_face_areas   = False
@@ -320,6 +334,10 @@ class TrainingDataInterface():
                 dset        = state_group[state_name]
                 indices     = info['indices']
                 state_type  = info['type']
+
+                if self.store_residuals:
+                    rset    = res_group[state_name]
+                    self._write_field_data_to_dataset(rset, residuals[indices], state_type, sample_idx)
 
                 if self.reference_patch is not None:
                     ref_group[state_name][sample_idx] = state_reference_values[state_name]
@@ -639,9 +657,35 @@ class TrainingDataInterface():
 
                     current["arrows"] = Arrows(coordinates, coordinates + arrow_scale * vec_data, c=color_map, thickness=0.1)
                     plt += current["arrows"]
+
+                    n_pts_per_arrow = current["arrows"].dataset.GetNumberOfPoints() // len(vec_mag)
+                    repeated_mag = np.repeat(vec_mag, n_pts_per_arrow)
+
+                    if center_colormap:
+                        m = np.max(np.abs(vec_mag))
+                        if m == 0:
+                            m = 1e-12
+                        current["arrows"].cmap(color_map, repeated_mag, vmin=-m, vmax=m)
+                        current["arrows"].mapper.SetScalarRange(-m, m)
+                    else:
+                        current["arrows"].cmap(color_map, repeated_mag)
+                        current["arrows"].mapper.SetScalarRange(vec_mag.min(), vec_mag.max())
+
+                    current["arrows"].mapper.lookup_table.SetRange(current["arrows"].mapper.scalar_range)
+                    current["arrows"].mapper.lookup_table.Build()
+
+                    plt.remove(current["arrows"].scalarbar)
+                    current["arrows"].add_scalarbar()
+                    plt += current["arrows"]
+                    plt += current["arrows"].scalarbar
+
+                    plt.remove(pts.scalarbar)
+
+
                 else:
                     scalar_field = gathered_vars_array[var][:, snap]
                     pts.pointdata[var] = scalar_field
+
 
                     if center_colormap:
                         m = np.max(np.abs(scalar_field))
@@ -650,7 +694,19 @@ class TrainingDataInterface():
                         pts.cmap(color_map, var, vmin=-m, vmax=m)
                     else:
                         pts.cmap(color_map, var)
-                        
+
+                    pts.mapper.lookup_table.SetRange(pts.mapper.scalar_range)
+                    pts.mapper.lookup_table.Build()
+
+                    # Remove old scalarbar and add a fresh one
+                    plt.remove(pts.scalarbar)
+                    pts.add_scalarbar()
+                    plt += pts.scalarbar
+                    
+                    # Remove the arrows scalarbar if it exists
+                    if current["arrows"] is not None:
+                        plt.remove(current["arrows"].scalarbar)
+                                        
 
             # Snapshot slider
             def snap_slider(widget, event):
