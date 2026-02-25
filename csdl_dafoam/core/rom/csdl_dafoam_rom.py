@@ -147,6 +147,44 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
         # Initial guess: warm start from previous solution if available, else zero
         q0 = np.zeros(self.basis_size) #self._cached_q.copy() if self._cached_q is not None else np.zeros(self.basis_size)
 
+        # Diagnostic: FOM residual at q=0 (reference state) for current inputs
+        w_ref_check = self._reconstruct_fom_state(np.zeros(self.basis_size))
+        self._update_test_basis(fom_state=w_ref_check)
+        r_ref_check = self._eval_fom_residual(w_ref_check)
+        self.print0(f"\n  Reference state check (q=0):")
+        self.print0(f"    ‖r_fom(w_ref)‖ = {np.linalg.norm(r_ref_check):.6e}")
+
+        # How well does the basis span the residual direction?
+        r_rom_check = self._project_and_reduce(r_ref_check)
+        self.print0(f"    ‖r_rom(w_ref)‖ = {np.linalg.norm(r_rom_check):.6e}")
+        self.print0(f"    ratio (projected/total) = {np.linalg.norm(r_rom_check)/max(np.linalg.norm(r_ref_check),1e-14):.4f}")
+
+        # In solve_residual_equations, add temporarily:
+        state_names, state_idx  = self.dafoam_instance.getStateVariableMap(includeComponentSuffix=False)
+        self.print0(f"\n  Weight vector breakdown:")
+        self.print0(f"  {'Variable':<16} {'mean(m_var)':>14} {'mean(m_var)/mean(m_T)':>22}")
+        m = self.weights
+
+        m_mean = {}
+        for state_name in state_names:
+            idx = state_idx == state_names.index(state_name)
+            m_var_local  = m[idx]
+            # Need global mean: sum and count across ranks
+            m_sum_local  = m_var_local.sum()
+            n_local      = len(idx)
+            m_sum_global = np.zeros(1)
+            n_global     = np.zeros(1)
+            m_sum_global = self.comm.allreduce(m_sum_local, op=MPI.SUM)
+            n_global     = self.comm.allreduce(n_local, op=MPI.SUM)
+            m_var_mean   = m_sum_global / max(n_global, 1)
+            
+            m_mean[state_name] = m_var_mean
+        
+        for state_name in state_names:
+            m_var_mean = m_mean[state_name]
+            ratio = m_mean[state_name] / m_mean["T"]
+            self.print0(f"  {state_name:<16} {m_var_mean:>14.6e} {ratio:>22.4e}")
+
         q, reason = self._rom_newtwon_solve(initial_rom_state=q0)
 
         if reason == 1:
@@ -262,7 +300,7 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
                 # (∂r_rom/∂s)^T lam = (Psi^T M ∂r/∂w ∂w/s)^T lam = (Psi^T M J ∂w/s)^T lam
                 # ∂w/s = Phi q
                 # (∂r_rom/∂s)^T lam = (Psi^T M J Phi q)^T lam = (Phi q) J^T M Psi lam = (Phi q) v_shared [Phi q is a vector, so transpose is dropped]
-                if "reference_state" in d_inputs:
+                if "scaling" in d_inputs:
                     Phi_q = Phi @ q # (n_local,)
                     d_inputs["reference_state"] += Phi_q * v_shared
 
@@ -285,7 +323,7 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
 
                     if self.rom_type == "galerkin":
                         # In this case, Psi = Phi
-                        d_inputs["pod_modes"] += np.outer(m * r, lam)
+                        d_inputs["pod_modes"] += np.outer(s * m * r, lam)
 
                     elif self.rom_type == "lspg":
                         # In this case, Psi = J S Phi
@@ -296,7 +334,7 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
             raise ValueError(f'"{mode}" not recognized. Only support "fwd" and "rev" modes')
         
 
-    # region _reconstruct_fom_state_reconstruct_fom_state
+    # region _reconstruct_fom_state
     def _reconstruct_fom_state(self, rom_state):
         q       = rom_state
         s       = self.scaling
@@ -416,12 +454,13 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
 
     # region _update_test_basis
     def _update_test_basis(self, fom_state, step=1e-6):
+        Phi = self.pod_modes
+        s   = self.scaling
+
         if self.rom_type == "galerkin":
-            self.test_basis = self.pod_modes
+            self.test_basis = s[:, None] * Phi
 
         elif self.rom_type == 'lspg':
-            Phi = self.pod_modes
-            s   = self.scaling
             w   = fom_state
             self.test_basis = self._jac_mat_product(fom_state=w, matrix=s[:, None] * Phi, step=step)
    
@@ -437,7 +476,7 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
         return self._project_and_reduce(distributed_val=r)
         
 
-    # region _eval_rom_jacobian_fd
+    # region _compute_rom_jacobian_fd
     def _compute_rom_jacobian(self, fom_state, step=1e-6):
         Psi = self.test_basis
         Phi = self.pod_modes
@@ -460,8 +499,8 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
             if self.rom_type == "lspg":
                 raise NotImplemented("Analytical Jacobian products are not supported for Least Squares Petrov-Galerkin.")
             
-            JT_MT_Phi = self._jacT_mat_product(fom_state=w, matrix=m[:, None] * Phi)
-            J_rom_local     = JT_MT_Phi.T @ (s[:, None] * Phi)
+            JT_SMT_Phi  = self._jacT_mat_product(fom_state=w, matrix=(s * m)[:, None] * Phi)
+            J_rom_local = JT_SMT_Phi.T @ (s[:, None] * Phi)
 
             J_rom = np.zeros_like(J_rom_local)
             self.comm.Allreduce(J_rom_local, J_rom, op=MPI.SUM)
@@ -481,6 +520,7 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
                                     'ls_maxiter':       10,       # max line search iterations
                                     'jac_fd_step':      1e-6,     # FD step for Jacobian
                                     'update_test_basis_every': 1, # how often to recompute Psi (every n iters)
+                                    'verbose':          True
                                 }
         
         opts = {**DEFAULT_NEWTON_OPTIONS, **(self.newton_options or {})}
@@ -491,6 +531,8 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
         reason = 0
 
         jac_fd_step = opts["jac_fd_step"]
+        verbose     = opts["verbose"]
+        W           = 60 # total header/footer width
 
         # Initial residual
         w           = self._reconstruct_fom_state(q)
@@ -499,8 +541,35 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
         r_rom_norm0 = np.linalg.norm(r_rom)
         r_rom_norm  = r_rom_norm0
 
-        self.print0(f"{'Iter':>5} {'‖r_rom‖':>14} {'‖r_rom‖/‖r0‖':>14} {'alpha':>8}")
-        self.print0(f"{0:>5} {r_rom_norm0:>14.6e} {1.0:>14.6e} {'—':>8}")
+        # FOM residual at initial state
+        r_fom_norm0 = np.linalg.norm(self._eval_fom_residual(w))
+
+        # Global norm of w (Allreduce needed since w is distributed)
+        w_norm_local  = np.dot(w, w)
+        w_norm_global = np.zeros(1)
+        self.comm.Allreduce(w_norm_local, w_norm_global, op=MPI.SUM)
+        w_norm = np.sqrt(w_norm_global[0])
+
+        if verbose:
+            self.print0(f"\n{'─'*W}")
+            self.print0(f"  DAFoamROM Newton Solve  [{self.rom_type.upper()} | jac: {self.jac_mode}]")
+            self.print0(f"{'─'*W}")
+            self.print0(f"  {'n_modes':<24} {len(q)}")
+            self.print0(f"  {'‖w‖ (initial)':<24} {w_norm:.6e}")
+            self.print0(f"  {'‖r_fom‖ (initial)':<24} {r_fom_norm0:.6e}")
+            self.print0(f"  {'‖r_rom‖ (initial)':<24} {r_rom_norm0:.6e}")
+            self.print0(f"  {'fd step':<24} {jac_fd_step:.2e}")
+            self.print0(f"  {'tol_rel / tol_abs':<24} {opts['tol_rel']:.1e} / {opts['tol_abs']:.1e}")
+            self.print0(f"{'─'*W}")
+            self.print0(
+                f"  {'Iter':>4}  {'‖r_rom‖':>12}  {'‖r_rom‖/‖r0‖':>12}  "
+                f"{'alpha':>8}  {'‖dq‖':>10}  {'‖q‖':>10}  {'cond(J)':>10}"
+            )
+            self.print0(f"  {'─'*4}  {'─'*12}  {'─'*12}  {'─'*8}  {'─'*10}  {'─'*10}  {'─'*10}")
+            self.print0(
+                f"  {0:>4}  {r_rom_norm0:>12.6e}  {1.0:>12.6e}  "
+                f"{'—':>8}  {'—':>10}  {np.linalg.norm(q):>10.4e}  {'—':>10}"
+        )
 
         J_rom = None
 
@@ -523,6 +592,8 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
                 self._update_test_basis(fom_state=w, step=jac_fd_step)
             J_rom   = self._compute_rom_jacobian(fom_state=w, step=jac_fd_step)
 
+            cond_J = np.linalg.cond(J_rom)
+
             # Solve the reduced linear system. We'll do this on all ranks, redundantly for now 
             # (if the basis size gets bigger, we may want to consider performing on root and then broadcasting
             # or maybe even parallelizing this.)
@@ -531,6 +602,9 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
             except np.linalg.LinAlgError:
                 self.print0("Warning: ROM Jacobian is singular. Attempting least-squares solve.")
                 dq, _, _, _ = np.linalg.lstsq(J_rom, -r_rom, rcond=None)
+
+            dq_norm = np.linalg.norm(dq)
+            q_norm  = np.linalg.norm(q)
 
             # Armijo backtracking line search
             alpha       = opts["ls_alpha0"]
@@ -549,6 +623,17 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
 
                 alpha *= opts['ls_rho']
 
+            ls_flag = "" if ls_success else "  ← LS failed"
+
+            if verbose:
+                self.print0(
+                    f"  {k+1:>4}  {r_rom_norm_trial:>12.6e}  "
+                    f"{r_rom_norm_trial/r_rom_norm0:>12.6e}  "
+                    f"{alpha:>8.2e}  {dq_norm:>10.4e}  "
+                    f"{q_norm:>10.4e}  {cond_J:>10.3e}"
+                    f"{ls_flag}"
+            )
+
             if not ls_success:
                 self.print0(f"Warning: line search failed at iteration {k}. Taking minimum step.")
                 reason = -1
@@ -558,12 +643,47 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
             r_rom       = r_rom_trial
             r_rom_norm  = r_rom_norm_trial
 
-            self.print0(f"{k+1:>5} {r_rom_norm:>14.6e} {r_rom_norm/r_rom_norm0:>14.6e} {alpha:>8.2e}")
-
         else:
             self.print0(f"Warning: Newton solver reached max iterations ({opts['maxiter']}) without converging.")
             reason = -2
 
+        if verbose:
+            w_final = self._reconstruct_fom_state(q)
+
+            # FOM residual at final state
+            r_fom_norm_final = np.linalg.norm(self._eval_fom_residual(w_final))
+
+            # Global norm of w_final
+            wf_norm_local  = np.dot(w_final, w_final)
+            wf_norm_global = np.zeros(1)
+            self.comm.Allreduce(wf_norm_local, wf_norm_global, op=MPI.SUM)
+            w_final_norm = np.sqrt(wf_norm_global[0])
+
+            # SA variable health check
+            var_names, var_idx  = self.dafoam_instance.getStateVariableMap(includeComponentSuffix=False)
+            sa_idx      = var_idx == var_names.index("nuTilda")
+            sa_negative = bool(self.comm.allreduce(int((w_final[sa_idx] < 0).any()), op=MPI.MAX))
+
+            reason_str = {1: "converged", -1: "line search failed", -2: "max iterations"}.get(reason, "unknown")
+
+            self.print0(f"{'─'*W}")
+            self.print0(f"  {'Exit reason':<24} {reason_str}")
+            self.print0(f"  {'‖r_rom‖ (final)':<24} {r_rom_norm:.6e}")
+            self.print0(f"  {'‖r_rom‖/‖r0‖ (final)':<24} {r_rom_norm/r_rom_norm0:.6e}")
+            self.print0(f"  {'‖r_fom‖ (final)':<24} {r_fom_norm_final:.6e}")
+            self.print0(f"  {'‖r_fom‖/‖r0‖':<24} {r_fom_norm_final/r_fom_norm0:.6e}")
+            self.print0(f"  {'‖q‖ (final)':<24} {np.linalg.norm(q):.6e}")
+            self.print0(f"  {'‖w‖ (final)':<24} {w_final_norm:.6e}")
+            self.print0(f"  {'SA var negative?':<24} {'YES ⚠' if sa_negative else 'no'}")
+            self.print0(f"  {'‖r_fom‖/‖r_rom‖':<24} {r_fom_norm_final / max(r_rom_norm, 1e-14):.6e}")
+
+            # Also print the projection quality: how much of r_fom is captured by Psi^T M
+            r_final     = self._eval_fom_residual(w_final)
+            r_proj_norm = np.linalg.norm(self._project_and_reduce(r_final))
+            self.print0(f"  {'‖Psi^T M r_fom‖':<24} {r_proj_norm:.6e}  (should ≈ ‖r_rom‖ final)")
+            self.print0(f"  {'‖r_fom‖ captured':<24} {r_proj_norm / max(r_fom_norm_final, 1e-14) * 100:.1f}%")
+
+            self.print0(f"{'─'*W}\n")
 
         # Cache and return
         self._cached_q   = q
