@@ -118,9 +118,10 @@ class DAFoamSolver(csdl.experimental.CustomImplicitOperation):
         # Revert solver to last successful primal state (to help with convergence on next iteration)
         # (This helps when we had an unconverged run last - placing here instead of at end in unconverged
         #  scenario allows us to still used the unconverged results from the solver if necessary) 
-        if (self.last_time_converged is False and self.disable_successful_primal_state_save is False) or self.always_use_same_ic:
+        if (self.last_time_converged and self.disable_successful_primal_state_save is False) or self.always_use_same_ic:
             if dafoam_instance.rank == 0:
-                print('Initializing DAFoam solver with last saved primal state')  
+                if (self.last_time_converged and self.disable_successful_primal_state_save is False):
+                    print('Initializing DAFoam solver with last saved primal state')  
             dafoam_instance.setStates(np.copy(self.saved_states))
 
         # Run primal
