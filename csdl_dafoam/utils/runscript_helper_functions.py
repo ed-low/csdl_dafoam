@@ -144,12 +144,14 @@ def hash_array_tol(arr: np.ndarray, tol: float = 1e-8, length: int = 16) -> str:
     Returns:
         str: A truncated SHA-256 hash of the rounded array.
     """
-    # Round the array to the given tolerance
-    rounded = np.round(arr / tol) * tol
-    # Hash the byte representation of the rounded array
-    byte_repr = rounded.astype(np.float64).tobytes()
-    full_hash = hashlib.sha256(byte_repr).hexdigest()
-    return full_hash[:length]
+    scaled = np.rint(arr / tol).astype(np.int64)
+    scaled = np.ascontiguousarray(scaled)
+
+    hasher = hashlib.sha256()
+    hasher.update(np.array(arr.shape, dtype=np.int64).tobytes())
+    hasher.update(scaled.tobytes())
+
+    return hasher.hexdigest()[:length]
 
 
 

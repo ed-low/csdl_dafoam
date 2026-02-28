@@ -412,7 +412,7 @@ class TrainingDataInterface():
 
     #region _setup_indices_and_state_maps_and_names
     def _setup_indices_state_info_and_global_counts(self):
-        self.print0('Setting up state map and processor addresing...', end=" ")
+        self.print0('Setting up state map and processor addressing...', end=" ")
 
         state_names, state_map     = self.dafoam_instance.getStateVariableMap(includeComponentSuffix=False)
 
