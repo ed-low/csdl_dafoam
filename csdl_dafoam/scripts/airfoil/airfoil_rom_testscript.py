@@ -50,7 +50,7 @@ print_runscript_info()
 # region USER INPUT
 # ===============================
 # Keyword for optimization name (optimization results folder will be saved with this name in dafoam directory)
-problem_name              = 'training_test'
+problem_name              = 'rom_test'
 
 # Geometry
 geometry_directory        =  os.path.join(os.getcwd(), 'airfoil_geometry/')
@@ -79,6 +79,7 @@ da_options = {
     "designSurfaces": ["wing"],
     "solverName": "DARhoSimpleCFoam",
     "primalMinResTol": 1.0e-8,
+    "primalVarBounds": {"pMin": 5000, "rhoMin": 0.05},
     "primalBC": {
         "U0": {"variable": "U", "patches": ["inout"], "value": [U0, 0.0, 0.0]},
         "p0": {"variable": "p", "patches": ["inout"], "value": [p0]},
@@ -159,7 +160,7 @@ mesh_options = {
 # region Training data options
 # ===============================
 # Storage options
-dataset_keyword       = 'airfoil_training'
+dataset_keyword       = 'training_data'
 storage_location      = Path(dafoam_directory)
 
 
@@ -188,7 +189,7 @@ x_surf_dafoam_initial_indices) = gather_array_to_rank0(x_surf_dafoam_initial_mpi
 
 # Get hash for surface mesh projection file read/write (broadcast to other ranks)
 if rank == 0:
-    x_surf_hash = hash_array_tol(x_surf_dafoam_initial)
+    x_surf_hash = hash_array_tol(x_surf_dafoam_initial, tol=1e-8)
 else:
     x_surf_hash = None
 
@@ -221,7 +222,7 @@ if surface_mesh_projection_file_path.is_file():
 
 else:
     if rank == 0:
-        print('No projected surface mesh file found.')
+        print(f'No projected surface mesh file found at {surface_mesh_projection_file_path}')
         try:
             # ORIGINAL CODE
             # with Timer('projecting on surface mesh'):
@@ -369,20 +370,54 @@ with csdl.experimental.mpi.enter_mpi_region(rank, comm) as mpi_region:
     weights     = np.array(np.concatenate([data["pod"]["weights"][state_var] for state_var in state_info.keys()]))
     reference_state = np.array(np.concatenate([data["pod"]["reference_state"][state_var] for state_var in state_info.keys()]))
 
-    print(f"Rank {rank} modes: {pod_modes}")
-    print(f"Rank {rank} scaling: {scaling}")
-    print(f"Rank {rank} weights: {weights}")
-    print(f"Rank {rank} reference_state: {reference_state}")
+    residual_scaling_by_state = {}
+    rms_values = {}
+
+    for state_var, info in state_info.items():
+        res = data["samples"]["residuals"][state_var][:, 0]
+
+        # Correct global RMS
+        sum_sq   = comm.allreduce(np.sum(res ** 2), op=MPI.SUM)
+        n_global = comm.allreduce(np.size(res),     op=MPI.SUM)
+        rms      = np.sqrt(sum_sq / n_global)
+
+        rms_values[state_var] = rms
+        if rank == 0:
+            print(f"{state_var} rms: {rms}")
+
+    # Apply floor: no variable can be more than floor_factor times smaller than the max
+    global_max   = max(rms_values.values())
+    floor_factor = 1e-1  # tune: keeps m_eff ratio <= 1e4 (or 1e8 for LSPG after squaring)
+    floor        = floor_factor * global_max
+
+    for state_var, info in state_info.items():
+        clipped = max(rms_values[state_var], floor)
+        res     = data["samples"]["residuals"][state_var][:, 0]
+        residual_scaling_by_state[state_var] = np.ones_like(res) * clipped
+        if rank == 0 and clipped != rms_values[state_var]:
+            print(f"  {state_var}: clipped {rms_values[state_var]:.3e} -> {clipped:.3e}")
+
+    residual_scaling = np.concatenate([
+        residual_scaling_by_state[state_var] for state_var in state_info.keys()
+])
 
     # DAFoamSolver Implicit component setup and evaluation
-    dafoam_rom           = DAFoamROM(dafoam_instance, pod_modes=pod_modes, reference_state=reference_state, weights=weights, scaling=scaling, rom_type='galerkin')
+    dafoam_rom           = DAFoamROM(dafoam_instance, 
+                                     pod_modes=pod_modes, 
+                                     reference_state=reference_state, 
+                                     weights=weights, 
+                                     scaling=scaling, 
+                                     residual_scaling=residual_scaling, 
+                                     rom_type='lspg',
+                                     exclude_from_projection=["T", "phi", "nuTilda"],
+                                     newton_options={"jac_fd_step": 1e-8, "verbose" : 3})
     dafoam_rom_states    = dafoam_rom.evaluate(dafoam_input_variables_group)
 
     # Reconstruct state
-    dafoam_state_estimate = reference_state + scaling[:, None] * pod_modes @ dafoam_rom_states
+    dafoam_state_estimate = reference_state + scaling * (pod_modes @ dafoam_rom_states)
 
     # DAFoamFunctions Explicit component setup and evaluation
-    dafoam_functions = DAFoamFunctions(dafoam_instance)
+    dafoam_functions = DAFoamFunctions(dafoam_instance, disable_jacvec_normalization=True)
     dafoam_function_outputs = dafoam_functions.evaluate(dafoam_state_estimate, 
                                                         dafoam_input_variables_group)
 
@@ -398,7 +433,8 @@ with csdl.experimental.mpi.enter_mpi_region(rank, comm) as mpi_region:
 # 2: Minimize CD wrt angle-of-attack, wing shape (thickness/camber ffd), constrained by CL=0.5
 # 3: Maximize CL/CD wrt angle-of-attack, wing shape (thickness/camber ffd)
 # 4: Minimize D wrt angle-of-attack (test case)
-optimization_case = 3
+# 5: Maximize CL/CD wrt wing shape (thickness/camber ffd)
+optimization_case = 5
 
 
 if optimization_case == 1:
@@ -439,7 +475,7 @@ elif optimization_case == 3:
     drag = dafoam_function_outputs.drag
 
     # Design variables
-    # flight_conditions_group.angle_of_attack_deg.set_as_design_variable(lower=0, upper=10, scaler=1./10)
+    flight_conditions_group.angle_of_attack_deg.set_as_design_variable(lower=0, upper=10, scaler=1./10)
     percent_change_in_thickness_dof.set_as_design_variable(lower=-10, upper=10, scaler=1./10)
     normalized_percent_camber_change_dof.set_as_design_variable(lower=-10, upper=10, scaler=1./10)
 
@@ -457,6 +493,19 @@ elif optimization_case == 4:
 
     # Objectives
     objective_fun = drag
+    objective_fun.set_as_objective()
+
+
+elif optimization_case == 5:
+    lift = dafoam_function_outputs.lift
+    drag = dafoam_function_outputs.drag
+
+    # Design variables
+    percent_change_in_thickness_dof.set_as_design_variable(lower=-10, upper=10, scaler=1./10)
+    normalized_percent_camber_change_dof.set_as_design_variable(lower=-10, upper=10, scaler=1./10)
+
+    # Objectives
+    objective_fun = -lift/drag
     objective_fun.set_as_objective()
 
 
@@ -481,7 +530,7 @@ rank_outputs                     = ['x'] if rank == 0 else []
 
 # Optimization solver setup and run
 prob                = CSDLAlphaProblem(problem_name=f'{problem_name}', simulator=sim)
-optimizer_choice    = 2 # Set to 1 for PySLSQP, 2 for OpenSQP, or 3 for InteriorPoint
+optimizer_choice    = 3 # Set to 1 for PySLSQP, 2 for OpenSQP, or 3 for InteriorPoint
 
 if optimizer_choice == 1:
     # PySLSQP optimizer setup
@@ -501,8 +550,6 @@ elif optimizer_choice == 2:
                         'recording': recording_on_root_rank,
                         'ls_max_step': 1.,
                         'turn_off_outputs': turn_off_outputs_on_nonroot_rank,}
-                        #'hot_start_from':'/media/edward/DATA/Edward/AFRL_project/csdl_dafoam_workspace/airfoil_case/results/airfoil_setup_test/airfoil_setup_test_outputs/2026-02-03_16.02.02.618346/record.hdf5',
-                        #'hot_start_rtol':1e-3}
     optimizer = OpenSQP(prob, **open_sqp_options)
     optimizer.solve()
     optimizer.print_results()
@@ -513,12 +560,55 @@ elif optimizer_choice == 3:
                             'readable_outputs': rank_outputs,
                             'recording': recording_on_root_rank,
                             'ls_max_step': 1.,
-                            'turn_off_outputs': turn_off_outputs_on_nonroot_rank,
-                            'hot_start_from':'/media/edward/DATA/Edward/AFRL_project/csdl_dafoam_workspace/airfoil_case/results/airfoil_setup_test/airfoil_setup_test_outputs/2026-02-03_16.02.02.618346/record.hdf5',
-                            'hot_start_rtol':1e-3}
+                            'turn_off_outputs': turn_off_outputs_on_nonroot_rank}
     optimizer   = InteriorPoint(prob, **interior_point_options)
     optimizer.solve()
     optimizer.print_results()
     
 else:
     print(f'Check optimizer choice. {optimizer_choice} is not an option.')
+
+
+
+
+# # Used this to test the component
+# from csdl_dafoam.utils.csdl_test_functions import test_jacvec_product, test_idempotence, test_inverse_jacobian
+# import matplotlib.pyplot as plt
+# np.random.seed(0)
+
+# test_component = dafoam_rom
+
+# inputs  = {k: vv.value for k, vv in test_component.input_dict.items()}
+# v       = {k: np.random.rand(*vv.value.shape)*vv.value for k, vv in test_component.output_dict.items()}
+# w       = {k: np.random.rand(*vv.value.shape)*vv.value for k, vv in test_component.input_dict.items()}
+
+# for key in w.keys():
+#     if key != "aero_vol_coords":
+#         w[key] = 0 * w[key]
+
+# print(f'Inputs: {inputs}')
+# print(f'v: {v}')
+# print(f'w: {w}')
+
+# eps_test_vals = [1e-3, 1e-4, 1e-5, 1e-6, 1e-7, 1e-8, 1e-9, 1e-10]
+# err = np.zeros_like(eps_test_vals)
+# i = 0
+# for eps in eps_test_vals:
+#     lhs, rhs, err[i] = test_jacvec_product(test_component, inputs, v, w, eps=eps)
+#     i += 1 
+
+# plt.rcParams['text.usetex'] = True
+# plt.figure()
+# # ax = plt.subplot(2, 1, 1)
+
+# plt.loglog(eps_test_vals, err)
+# plt.title(r'jacvec_product vs FD ($w^T J^T v = v^T J w$)')
+# plt.xlabel(r'Stepsize, $\epsilon$')
+# plt.ylabel(r'Error, $\frac{lhs - rhs}{rhs}$')
+# plt.grid(visible=True)
+# plt.show(block=False)
+
+# if rank == 0:
+#     input('Press ENTER to continue...')
+# else:
+#     quiet_barrier(comm)

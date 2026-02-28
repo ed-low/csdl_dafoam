@@ -50,7 +50,7 @@ os.environ["PETSC_OPTIONS"] = "-malloc_debug"
 # region USER INPUT
 # ===============================
 # Keyword for optimization name (optimization results folder will be saved with this name)
-problem_name              = 'training_test'
+problem_name              = 'rom_test'
 
 # Geometry
 geometry_directory        =  Path.cwd()/'airfoil_geometry'
@@ -157,14 +157,14 @@ mesh_options = {
 # region Training options
 # ===============================
 # Storage options
-dataset_keyword       = 'airfoil_training'
+dataset_keyword       = 'training_data_extremes'
 storage_location      = dafoam_directory
 
 # Sampling options
 # grassmann_variables indicates the variables which correspond to points on the Grassmann manifold
 # snapshot_variables indicates the variables which correspond to "snapshots" or realizations
 num_grassmann_samples     = 2
-num_snapshot_samples      = 100
+num_snapshot_samples      = 300
 random_state_seed         = 0
 
 
@@ -372,12 +372,12 @@ grassmann_vars_and_limits = {
 snapshot_vars_and_limits = {
     percent_change_in_thickness_dof: {
         'name': '%_thickness_change',
-        'range': [-10, 10],
+        'range': [-50, 20],
         'ref_value': 0, 
     },
     normalized_percent_camber_change_dof: {
         'name': '%_camber_change',
-        'range': [-10, 10],
+        'range': [-50, 50],
         'ref_value': 0, 
     }
 }
@@ -400,7 +400,8 @@ data_generator = TrainingDataInterface(dafoam_instance=dafoam_instance,
                                             reference_patch="inout", 
                                             primary_variables=grassmann_vars_and_limits, 
                                             secondary_variables=snapshot_vars_and_limits,
-                                            non_sampled_variables=important_non_sampled_variables, 
+                                            non_sampled_variables=important_non_sampled_variables,
+                                            store_residuals=True, 
                                             storage_location=storage_location, 
                                             dataset_keyword=dataset_keyword,
                                             num_primary_samples=num_grassmann_samples,
