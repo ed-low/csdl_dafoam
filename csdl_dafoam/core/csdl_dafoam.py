@@ -46,7 +46,7 @@ def instantiateDAFoam(options, comm, run_directory=None, mesh_options=None):
 
 # region DAFOAMSOLVER
 class DAFoamSolver(csdl.experimental.CustomImplicitOperation):
-    def __init__(self, dafoam_instance, disable_successful_primal_state_save=False, always_use_same_ic=False):
+    def __init__(self, dafoam_instance, disable_successful_primal_state_save=False, always_use_same_ic=False, disable_inverse_jacobian_normalization=False):
         super().__init__()
 
         self.dafoam_instance    = dafoam_instance
@@ -77,6 +77,9 @@ class DAFoamSolver(csdl.experimental.CustomImplicitOperation):
         # Use the same initial condition for all primal solves
         # (May be useful for checking apply_inverse_jacobian)
         self.always_use_same_ic = always_use_same_ic
+
+        # Been using this to compare the inverse jacobian to a finite difference using evaluate_residuals
+        self.disable_inverse_jacobian_normalization = disable_inverse_jacobian_normalization
         
 
     # region evaluate
@@ -201,7 +204,12 @@ class DAFoamSolver(csdl.experimental.CustomImplicitOperation):
                 return
 
             # convert the array to vector
-            dFdW = dafoam_instance.array2Vec(dFdWArray)
+            if self.disable_inverse_jacobian_normalization:
+                S    = dafoam_instance.getStateScalingFactors()
+                dFdW = dafoam_instance.array2Vec(dFdWArray * S)
+            else:
+                dFdW = dafoam_instance.array2Vec(dFdWArray)
+            
 
             # run coloring
             if self.dafoam_instance.getOption("adjUseColoring") and self.runColoring:
@@ -398,7 +406,6 @@ class DAFoamSolver(csdl.experimental.CustomImplicitOperation):
     # region evaluate_residuals
     def evaluate_residuals(self, input_vals, output_vals, residual_vals):
         dafoam_instance = self.dafoam_instance
-
         dafoam_instance.set_solver_input(input_vals)
         dafoam_instance.setStates(output_vals["dafoam_solver_states"])
         residual_vals["dafoam_solver_states"] = dafoam_instance.getResiduals()
