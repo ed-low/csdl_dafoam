@@ -485,7 +485,10 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
         w = fom_state
         dafoam_instance = self.dafoam_instance
         dafoam_instance.setStates(w)
-        return dafoam_instance.getResiduals()
+        res_scale_factors = dafoam_instance.getStateWeights()
+        res_scale_factors[self.state_indices["phi"]] =  1 / res_scale_factors[self.state_indices["phi"]]
+        res_scale_factors[self.state_indices["T"]]  /= 1005
+        return dafoam_instance.getResiduals() #* res_scale_factors
 
 
     # region _project_and_reduce
@@ -570,7 +573,7 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
             product,
             )
         
-        return product
+        return product/dafoam_instance.getStateScalingFactors()
     
 
     # region _jacT_mat_product

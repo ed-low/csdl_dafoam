@@ -426,7 +426,7 @@ with csdl.experimental.mpi.enter_mpi_region(rank, comm) as mpi_region:
     dafoam_function_outputs = dafoam_functions.evaluate(dafoam_solver_states, 
                                                         dafoam_input_variables_group)
     
-    dafoam_functions_rom = DAFoamFunctions(dafoam_instance_rom)
+    dafoam_functions_rom = DAFoamFunctions(dafoam_instance_rom, disable_jacvec_normalization=True)
     dafoam_function_rom_outputs = dafoam_functions_rom.evaluate(dafoam_state_estimate, 
                                                         dafoam_input_variables_group)
 
@@ -517,7 +517,7 @@ elif optimization_case == 5:
     normalized_percent_camber_change_dof.set_as_design_variable(lower=-10, upper=10, scaler=1./10)
 
     # Objectives
-    objective_fun = -(lift + lift_rom)/(drag + drag_rom)
+    objective_fun = -0.5 * (lift / drag  + lift_rom / drag_rom)
     objective_fun.set_as_objective()
 
 

@@ -399,7 +399,7 @@ with csdl.experimental.mpi.enter_mpi_region(rank, comm) as mpi_region:
 
     residual_scaling = np.concatenate([
         residual_scaling_by_state[state_var] for state_var in state_info.keys()
-])
+    ])
 
     # DAFoamSolver Implicit component setup and evaluation
     dafoam_rom           = DAFoamROM(dafoam_instance, 
@@ -407,9 +407,10 @@ with csdl.experimental.mpi.enter_mpi_region(rank, comm) as mpi_region:
                                      reference_state=reference_state, 
                                      weights=weights, 
                                      scaling=scaling, 
-                                     residual_scaling=residual_scaling, 
-                                     rom_type='lspg',
-                                     exclude_from_projection=["T", "phi", "nuTilda"],
+                                     residual_scaling=None,#residual_scaling, 
+                                     rom_type='galerkin',
+                                     jac_mode="analytical",
+                                     exclude_from_projection=None, #["T", "phi", "nuTilda"],
                                      newton_options={"jac_fd_step": 1e-8, "verbose" : 3})
     dafoam_rom_states    = dafoam_rom.evaluate(dafoam_input_variables_group)
 
@@ -522,93 +523,67 @@ recorder.stop()
 # ===============================
 sim = csdl.experimental.PySimulator(recorder)
 
-# Only allow visualization and modopt output files on the root rank
-visualize_on_this_rank           = True  if rank == 0 and not is_headless() else False
-turn_off_outputs_on_nonroot_rank = False if rank == 0 else True
-recording_on_root_rank           = True  if rank == 0 else False
-rank_outputs                     = ['x'] if rank == 0 else []
 
-# Optimization solver setup and run
-prob                = CSDLAlphaProblem(problem_name=f'{problem_name}', simulator=sim)
-optimizer_choice    = 3 # Set to 1 for PySLSQP, 2 for OpenSQP, or 3 for InteriorPoint
 
-if optimizer_choice == 1:
-    # PySLSQP optimizer setup
-    solver_options = {'maxiter': 20,
-                    'iprint': 2,
-                    'readable_outputs': rank_outputs,
-                    'recording': recording_on_root_rank,
-                    'turn_off_outputs': turn_off_outputs_on_nonroot_rank}
-    optimizer   = PySLSQP(prob, solver_options=solver_options)
-    optimizer.solve()
-    optimizer.print_results()
 
-elif optimizer_choice == 2:
-    # OpenSQP optimizer setup
-    open_sqp_options = {'maxiter': 100,
-                        'readable_outputs': rank_outputs,
-                        'recording': recording_on_root_rank,
-                        'ls_max_step': 1.,
-                        'turn_off_outputs': turn_off_outputs_on_nonroot_rank,}
-    optimizer = OpenSQP(prob, **open_sqp_options)
-    optimizer.solve()
-    optimizer.print_results()
+# ===============================
+# region OPTIMIZER
+# ===============================
+# # Only allow visualization and modopt output files on the root rank
+# visualize_on_this_rank           = True  if rank == 0 and not is_headless() else False
+# turn_off_outputs_on_nonroot_rank = False if rank == 0 else True
+# recording_on_root_rank           = True  if rank == 0 else False
+# rank_outputs                     = ['x'] if rank == 0 else []
 
-elif optimizer_choice == 3:
-    # InteriorPoint optimizer setup
-    interior_point_options = {'maxiter': 100,
-                            'readable_outputs': rank_outputs,
-                            'recording': recording_on_root_rank,
-                            'ls_max_step': 1.,
-                            'turn_off_outputs': turn_off_outputs_on_nonroot_rank}
-    optimizer   = InteriorPoint(prob, **interior_point_options)
-    optimizer.solve()
-    optimizer.print_results()
+# # Optimization solver setup and run
+# prob                = CSDLAlphaProblem(problem_name=f'{problem_name}', simulator=sim)
+# optimizer_choice    = 3 # Set to 1 for PySLSQP, 2 for OpenSQP, or 3 for InteriorPoint
+
+# if optimizer_choice == 1:
+#     # PySLSQP optimizer setup
+#     solver_options = {'maxiter': 20,
+#                     'iprint': 2,
+#                     'readable_outputs': rank_outputs,
+#                     'recording': recording_on_root_rank,
+#                     'turn_off_outputs': turn_off_outputs_on_nonroot_rank}
+#     optimizer   = PySLSQP(prob, solver_options=solver_options)
+#     optimizer.solve()
+#     optimizer.print_results()
+
+# elif optimizer_choice == 2:
+#     # OpenSQP optimizer setup
+#     open_sqp_options = {'maxiter': 100,
+#                         'readable_outputs': rank_outputs,
+#                         'recording': recording_on_root_rank,
+#                         'ls_max_step': 1.,
+#                         'turn_off_outputs': turn_off_outputs_on_nonroot_rank,}
+#     optimizer = OpenSQP(prob, **open_sqp_options)
+#     optimizer.solve()
+#     optimizer.print_results()
+
+# elif optimizer_choice == 3:
+#     # InteriorPoint optimizer setup
+#     interior_point_options = {'maxiter': 100,
+#                             'readable_outputs': rank_outputs,
+#                             'recording': recording_on_root_rank,
+#                             'ls_max_step': 1.,
+#                             'turn_off_outputs': turn_off_outputs_on_nonroot_rank}
+#     optimizer   = InteriorPoint(prob, **interior_point_options)
+#     optimizer.solve()
+#     optimizer.print_results()
     
-else:
-    print(f'Check optimizer choice. {optimizer_choice} is not an option.')
-
-
-
-
-# # Used this to test the component
-# from csdl_dafoam.utils.csdl_test_functions import test_jacvec_product, test_idempotence, test_inverse_jacobian
-# import matplotlib.pyplot as plt
-# np.random.seed(0)
-
-# test_component = dafoam_rom
-
-# inputs  = {k: vv.value for k, vv in test_component.input_dict.items()}
-# v       = {k: np.random.rand(*vv.value.shape)*vv.value for k, vv in test_component.output_dict.items()}
-# w       = {k: np.random.rand(*vv.value.shape)*vv.value for k, vv in test_component.input_dict.items()}
-
-# for key in w.keys():
-#     if key != "aero_vol_coords":
-#         w[key] = 0 * w[key]
-
-# print(f'Inputs: {inputs}')
-# print(f'v: {v}')
-# print(f'w: {w}')
-
-# eps_test_vals = [1e-3, 1e-4, 1e-5, 1e-6, 1e-7, 1e-8, 1e-9, 1e-10]
-# err = np.zeros_like(eps_test_vals)
-# i = 0
-# for eps in eps_test_vals:
-#     lhs, rhs, err[i] = test_jacvec_product(test_component, inputs, v, w, eps=eps)
-#     i += 1 
-
-# plt.rcParams['text.usetex'] = True
-# plt.figure()
-# # ax = plt.subplot(2, 1, 1)
-
-# plt.loglog(eps_test_vals, err)
-# plt.title(r'jacvec_product vs FD ($w^T J^T v = v^T J w$)')
-# plt.xlabel(r'Stepsize, $\epsilon$')
-# plt.ylabel(r'Error, $\frac{lhs - rhs}{rhs}$')
-# plt.grid(visible=True)
-# plt.show(block=False)
-
-# if rank == 0:
-#     input('Press ENTER to continue...')
 # else:
-#     quiet_barrier(comm)
+#     print(f'Check optimizer choice. {optimizer_choice} is not an option.')
+
+
+
+
+# ===============================
+# region COMPONENT TESTS
+# ===============================
+from csdl_dafoam.utils.csdl_test_functions import CustomComponentChecks
+import matplotlib.pyplot as plt
+
+component_testing = CustomComponentChecks(dafoam_rom, comm=comm)
+component_testing.run_inverse_jacobian_fd_sweep(eps_test_values=10. ** np.array(range(-2, -10, -1)))
+component_testing.run_jacvec_fd_sweep(eps_test_values=10. ** np.array(range(-10, -2)))

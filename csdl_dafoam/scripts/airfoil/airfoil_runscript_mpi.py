@@ -77,6 +77,7 @@ da_options = {
     "designSurfaces": ["wing"],
     "solverName": "DARhoSimpleCFoam",
     "primalMinResTol": 1.0e-8,
+    "primalMinResTolDiff": 1.0e2,#1.0e2,
     "primalVarBounds": {"pMin": 5000, "rhoMin": 0.05},
     "primalBC": {
         "U0": {"variable": "U", "patches": ["inout"], "value": [U0, 0.0, 0.0]},
@@ -458,52 +459,103 @@ recorder.stop()
 # ===============================
 sim = csdl.experimental.PySimulator(recorder)
 
-# Only allow visualization and modopt output files on the root rank
-visualize_on_this_rank           = True  if rank == 0 and not is_headless() else False
-turn_off_outputs_on_nonroot_rank = False if rank == 0 else True
-recording_on_root_rank           = True  if rank == 0 else False
-rank_outputs                     = ['x'] if rank == 0 else []
 
-# Optimization solver setup and run
-prob                = CSDLAlphaProblem(problem_name=f'{problem_name}', simulator=sim)
-optimizer_choice    = 3 # Set to 1 for PySLSQP, 2 for OpenSQP, or 3 for InteriorPoint
 
-if optimizer_choice == 1:
-    # PySLSQP optimizer setup
-    solver_options = {'maxiter': 20,
-                    'iprint': 2,
-                    'readable_outputs': rank_outputs,
-                    'recording': recording_on_root_rank,
-                    'turn_off_outputs': turn_off_outputs_on_nonroot_rank}
-    optimizer   = PySLSQP(prob, solver_options=solver_options)
-    optimizer.solve()
-    optimizer.print_results()
+# # ===============================
+# # region OPTIMIZER
+# # ===============================
+# # Only allow visualization and modopt output files on the root rank
+# visualize_on_this_rank           = True  if rank == 0 and not is_headless() else False
+# turn_off_outputs_on_nonroot_rank = False if rank == 0 else True
+# recording_on_root_rank           = True  if rank == 0 else False
+# rank_outputs                     = ['x'] if rank == 0 else []
 
-elif optimizer_choice == 2:
-    # OpenSQP optimizer setup
-    open_sqp_options = {'maxiter': 100,
-                        'readable_outputs': rank_outputs,
-                        'recording': recording_on_root_rank,
-                        'ls_max_step': 1.,
-                        'turn_off_outputs': turn_off_outputs_on_nonroot_rank,}
-                        #'hot_start_from':'/media/edward/DATA/Edward/AFRL_project/csdl_dafoam_workspace/airfoil_case/results/airfoil_setup_test/airfoil_setup_test_outputs/2026-02-03_16.02.02.618346/record.hdf5',
-                        #'hot_start_rtol':1e-3}
-    optimizer = OpenSQP(prob, **open_sqp_options)
-    optimizer.solve()
-    optimizer.print_results()
+# # Optimization solver setup and run
+# prob                = CSDLAlphaProblem(problem_name=f'{problem_name}', simulator=sim)
+# optimizer_choice    = 3 # Set to 1 for PySLSQP, 2 for OpenSQP, or 3 for InteriorPoint
 
-elif optimizer_choice == 3:
-    # InteriorPoint optimizer setup
-    interior_point_options = {'maxiter': 100,
-                            'readable_outputs': rank_outputs,
-                            'recording': recording_on_root_rank,
-                            'ls_max_step': 1.,
-                            'turn_off_outputs': turn_off_outputs_on_nonroot_rank,
-                            # 'hot_start_from':'/media/edward/DATA/Edward/AFRL_project/csdl_dafoam_workspace/airfoil_case/results/airfoil_setup_test/airfoil_setup_test_outputs/2026-02-03_16.02.02.618346/record.hdf5',
-                            'hot_start_rtol':1e-3}
-    optimizer   = InteriorPoint(prob, **interior_point_options)
-    optimizer.solve()
-    optimizer.print_results()
+# if optimizer_choice == 1:
+#     # PySLSQP optimizer setup
+#     solver_options = {'maxiter': 20,
+#                     'iprint': 2,
+#                     'readable_outputs': rank_outputs,
+#                     'recording': recording_on_root_rank,
+#                     'turn_off_outputs': turn_off_outputs_on_nonroot_rank}
+#     optimizer   = PySLSQP(prob, solver_options=solver_options)
+#     optimizer.solve()
+#     optimizer.print_results()
+
+# elif optimizer_choice == 2:
+#     # OpenSQP optimizer setup
+#     open_sqp_options = {'maxiter': 100,
+#                         'readable_outputs': rank_outputs,
+#                         'recording': recording_on_root_rank,
+#                         'ls_max_step': 1.,
+#                         'turn_off_outputs': turn_off_outputs_on_nonroot_rank,}
+#                         #'hot_start_from':'/media/edward/DATA/Edward/AFRL_project/csdl_dafoam_workspace/airfoil_case/results/airfoil_setup_test/airfoil_setup_test_outputs/2026-02-03_16.02.02.618346/record.hdf5',
+#                         #'hot_start_rtol':1e-3}
+#     optimizer = OpenSQP(prob, **open_sqp_options)
+#     optimizer.solve()
+#     optimizer.print_results()
+
+# elif optimizer_choice == 3:
+#     # InteriorPoint optimizer setup
+#     interior_point_options = {'maxiter': 100,
+#                             'readable_outputs': rank_outputs,
+#                             'recording': recording_on_root_rank,
+#                             'ls_max_step': 1.,
+#                             'turn_off_outputs': turn_off_outputs_on_nonroot_rank,
+#                             # 'hot_start_from':'/media/edward/DATA/Edward/AFRL_project/csdl_dafoam_workspace/airfoil_case/results/airfoil_setup_test/airfoil_setup_test_outputs/2026-02-03_16.02.02.618346/record.hdf5',
+#                             'hot_start_rtol':1e-3}
+#     optimizer   = InteriorPoint(prob, **interior_point_options)
+#     optimizer.solve()
+#     optimizer.print_results()
     
-else:
-    print(f'Check optimizer choice. {optimizer_choice} is not an option.')
+# else:
+#     print(f'Check optimizer choice. {optimizer_choice} is not an option.')
+
+
+
+
+# ===============================
+# region COMPONENT TESTS
+# ===============================
+from csdl_dafoam.utils.csdl_test_functions import CustomComponentChecks#, test_jacvec_product, test_idempotence, test_inverse_jacobian
+import matplotlib.pyplot as plt
+
+
+
+component_testing = CustomComponentChecks(dafoam_solver, comm=comm)
+component_testing.run_inverse_jacobian_fd_sweep(eps_test_values=10. ** np.array(range(-10, -2)), random_scalar=1)
+component_testing.run_jacvec_fd_sweep(eps_test_values=10. ** np.array(range(-10, -2)))
+
+# test_component = dafoam_solver
+
+# # test_idempotence(test_component, inputs)
+# # input('Press ENTER to continue...')
+
+# # test_inverse_jacobian(test_component, inputs, {name: 2*vv for name, vv in v.items()}, eps=1e-4)
+
+
+# eps_test_vals = [1e-3, 1e-4, 1e-5, 1e-6, 1e-7, 1e-8, 1e-9, 1e-10]
+# err = np.zeros_like(eps_test_vals)
+# i = 0
+# for eps in eps_test_vals:
+#     lhs, rhs, err[i] = test_jacvec_product(component=test_component, eps=eps, comm=comm, random_seed=0)
+#     i += 1 
+
+# plt.rcParams['text.usetex'] = True
+# plt.figure()
+# # ax = plt.subplot(2, 1, 1)
+
+# plt.loglog(eps_test_vals, err)
+# plt.title(r'jacvec_product vs FD ($w^T J^T v = v^T J w$)')
+# plt.xlabel(r'Stepsize, $\epsilon$')
+# plt.ylabel(r'Error, $\frac{lhs - rhs}{rhs}$')
+# plt.grid(visible=True)
+# plt.show()
+
+# if rank == 0:
+#     input('Press ENTER to continue...')
+
+# quiet_barrier(comm)
