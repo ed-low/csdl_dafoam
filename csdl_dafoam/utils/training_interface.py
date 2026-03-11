@@ -10,6 +10,7 @@ from mpi4py import MPI
 from vedo import Arrows, Points, Plotter, Text2D
 from csdl_dafoam.utils.runscript_helper_functions import quiet_barrier
 from csdl_dafoam.utils.standard_atmosphere_model import compute_ambient_conditions_group
+import matplotlib.pyplot as plt
 
 
 # region TRAININGDATAINTERFACE
@@ -32,9 +33,9 @@ class TrainingDataInterface():
                  ):
         
         # TODO: See if there is DAFoam API to get whether a variable is volVectorStates, volScalarStates, modelStates, or surfaceScalarStates.
-        # We'll just define here for the rhoSimpleFoam case for now. Can add to here if necessary for other models
-        self.solver_variable_storage_type = {"centroid_coordinates":    "volVectorStates", # We'll say that the cell coordinates match the volume vector state form
-                                             "cell_volumes":            "volScalarStates",
+        # We'll just define here for the rhoSimpleCFoam case for now. Can add to here if necessary for other models
+        self.solver_variable_storage_type = {"centroid_coordinates":    "volVectorStates", # These first 3 entries are for cell/face information, but they match
+                                             "cell_volumes":            "volScalarStates", # the given state ordering
                                              "face_areas":              "surfaceScalarStates",
                                              "U":                       "volVectorStates",
                                              "p":                       "volScalarStates",
@@ -118,7 +119,7 @@ class TrainingDataInterface():
         default_pod_options = {"inner_product":"reference",
                                "centering":"reference",
                                "scaling":"reference",
-                               "new_file":separate_pod_file}
+                               "new_h5_file":separate_pod_file}
         
         # Assign default pod options to user supplied if not present
         pod_options = {} if pod_options is None else pod_options
@@ -192,6 +193,28 @@ class TrainingDataInterface():
 
                 # Primal solve
                 sim.run()
+
+                # We'll do a check to see if the first primal solve of the primary point failed
+                # If so, we'll retry by running with a new initial condition taken from 
+                # the freestream value (reference patch).
+                if secondary_idx == 0 and dafoam_instance.primalFail and self.reference_patch is not None:
+
+                    self.print0("Initial solution failed to converge for this primary sample configuration. Trying again with new initial condition...")
+
+                    # Get the values from the reference patch
+                    state_reference_values = dafoam_instance.getPatchStateAverages(self.reference_patch, returnVector=True)
+                    state_reference_values.pop("phi")
+
+                    # Set these values as initial condition
+                    dafoam_instance.setOption("primalInitCondition", state_reference_values)
+                    dafoam_instance.updateDAOption()
+                    dafoam_instance.setPrimalInitialConditions()
+
+                    # Set flag as not fail so that DAFoamSolver won't reassign last successful solution as IC
+                    dafoam_instance.primalFail = 0
+
+                    # Try running again
+                    sim.run()
 
                 self.write_sample(h5file_path, secondary_idx)
 
@@ -314,6 +337,7 @@ class TrainingDataInterface():
         cell_coords                             = dafoam_instance.getCellCentroids()
         state_weights                           = dafoam_instance.getStateWeights()
         state_reference_values                  = dafoam_instance.getPatchStateAverages(self.reference_patch) if self.reference_patch is not None else None
+
         if self.store_residuals:
             residuals                           = dafoam_instance.getResiduals()
 
@@ -592,6 +616,547 @@ class TrainingDataInterface():
         return data
     
 
+    # region _compute_pod_modes
+    def _compute_pod_modes(self, h5filepath, inner_product=None, centering='mean', scaling="reference", write_h5=True, new_h5_file=True, new_file_suffix="modes", write_modes_using_write_adjoint_fields=False):
+        
+        # Option to pass a dict containing similar data structure as what would be read from the load_h5
+        # This is currently an internal option and kind of sketchy - should update to a proper interface
+        # and options to expose to user.
+        # TODO: replace with valid option/method to pass in data instead of using h5file
+        if isinstance(h5filepath, dict):
+            data_dict   = h5filepath["data"]
+            metadata    = h5filepath["metadata"]
+
+            # Expecting data_dict to look like:
+            # h5filepath = {
+            #               "data": {
+            #                        "states":  {
+            #                                    "U": float_array
+            #                                    "P": float_array
+            #                                    ...
+            #                                   }
+            #                        "mesh":    {
+            #                                    "cell_volumes": float_array
+            #                                    "face_areas": float_array
+            #                                   }
+            #                        "reference_states": {
+            #                                              "U": float_array
+            #                                              "P": float_array
+            #                                              ...
+            #                                             }
+            #               "metadata: { 
+            #                            "secondary_variables": {"_attrs" : {"first_sample_is_ref": bool}}
+            #                            "_attrs": {num_secondary_samples" : int}
+            #                           }
+            #               }
+        
+        else:
+            # data, metadata  = self.read_h5_file(h5filepath=h5filepath, return_metadata=True, visualize_data=False)
+            data_dict       = self.load_h5(h5file_path=h5filepath, group_to_read="samples", only_distributed_data=False)
+            metadata        = self.load_h5(h5file_path=h5filepath, group_to_read="parameters", only_distributed_data=False)
+
+        reference_state     = {}
+        weights             = {}
+        scaling_values      = {}
+
+        for state_var, info in self.state_info.items():
+            state_data = data_dict["states"][state_var]
+            state_type = info["type"]
+
+            # Centering methods (centering)
+            # 1. (None) No centering - will keep states as they are
+            # 2. ('mean') Mean centered. Will take the mean of the snapshots and subtract that from each snapshot
+            # 3. ('reference') Will use the reference sample in the file if it exists
+            # 4. (dict) User supplied reference
+            if centering is None:
+                reference_state[state_var] = np.zeros_like(state_data[:, 0])
+
+            elif isinstance(centering, str):
+                if centering == 'mean':
+                    reference_state[state_var] = np.mean(state_data, axis=1)
+
+                elif centering == 'reference':
+                    if not metadata["secondary_variables"]["_attrs"]["first_sample_is_reference"]:
+                        self.print0("WARNING: Using first sample as reference state, even though it seems the dataset was not sampled this way.")
+                    reference_state[state_var]      = state_data[:, 0]
+                    data_dict["states"][state_var]  = state_data[:, 1:]
+
+            elif isinstance(centering, dict):
+                # TODO: Add check to see if keys and dimensions match up
+                reference_state[state_var] = centering[state_var]
+
+            else:
+                raise TypeError(f'"{centering}" is not a valid centering method. ')
+        
+            # Weighting methods (inner_product)
+            # 1. (None) No weighting applied. Will use ones
+            # 2. ("reference") Generate the weights from the cell volumes and face areas of the first sample
+            # 4. (dict) User supplied weights
+            if inner_product is None:
+                weights = None
+        
+            elif isinstance(inner_product, str):        
+                if inner_product == "reference":
+                    # We only consider the weights for the reference state (first sample) for now
+                    if state_type == "volVectorStates":
+                        weights[state_var] = np.repeat(data_dict["mesh"]['cell_volumes'][:, 0], repeats=3, axis=0)
+                    elif state_type == 'volScalarStates' or state_type == "modelStates":
+                        weights[state_var] = data_dict["mesh"]['cell_volumes'][:, 0]
+                    elif state_type == "surfaceScalarStates":
+                        weights[state_var] = data_dict["mesh"]['face_areas'][:, 0]
+                    else:
+                        raise TypeError(f"State type of {state_type} not recognized. May need to be implemented?")
+                        
+                else:
+                    raise NotImplementedError(f"Inner product weight of type {inner_product} has not yet been implemented")
+            
+            elif isinstance(inner_product, dict):
+                # TODO: Add check to see if keys and dimensions match up
+                weights[state_var] = inner_product[state_var]
+                
+            else:
+                assert np.asarray(inner_product).shape == np.asarray(reference_state[state_var]).shape, "Supplied inner_product weight vector seems to be incompatible?"
+            
+            # Scaling methods (scaling)
+            # 1. (None) No scaling applied to the data. Terms like pressure will most likely dominate
+            # 2. ('reference') Will use the reference value found in the file (if it exists)
+            # 3. (dict) Will use the supplied scaling value. Must be a dictionary whose keys are state names (as seen by OpenFOAM - 'p', 'T', etc), and entries are scalar values
+            if scaling is None:
+                scaling_values[state_var] = np.ones_like(centering[state_var])
+
+            elif scaling == 'reference':
+                if "reference_states" in data_dict.keys():
+                    reference_states = data_dict["reference_states"]
+                    if f'{state_var}' in reference_states:
+                        if state_var != "phi":
+                            scaling_values[state_var] = reference_states[state_var][0]
+                        else:
+                            scaling_values[state_var] = 1 #data["face_areas"][:, 0] # Use face areas for phi weighting
+                    else:
+                        raise TypeError(f'Reference value not found for {state_var} in dataset during POD compute setup.')
+                else:
+                    raise TypeError(f'Reference values not found in dataset during POD compute setup.')
+                    
+            elif isinstance(scaling, dict):
+                # TODO: Add check to see if keys and dimensions match up  
+                scaling_values[state_var] = scaling[state_var]
+                    
+            else:
+                raise TypeError("Not a valid scaling method. Please supply None, 'reference', or a dict with the proper entries.")
+            
+            # Rescaling data for POD computation
+            # if state_var == "phi":
+            #     data[state_var] = 1/scaling_values[state_var][:, None] * (data[state_var] - reference_state[state_var][:, None])
+            # else:
+            data_dict["states"][state_var] = 1/scaling_values[state_var] * (data_dict["states"][state_var] - reference_state[state_var][:, None])
+        
+        # Only need state data and number of samples for POD computation
+        data                = data_dict["states"]
+
+        # Number of sample correction
+        data["num_samples"] = data[next(iter(data))].shape[1] # Get the number of columns of first state entry
+
+        # Actual POD computation
+        local_modes, singular_values = self._method_of_snapshots(data, weights)
+
+        if write_h5:
+            # Change file path name if new file requested
+            outfilepath = Path(h5filepath)
+            if new_h5_file:
+                outfilepath = outfilepath.with_name(outfilepath.stem + f'_{new_file_suffix}' + outfilepath.suffix)
+            
+            with h5py.File(outfilepath, "a", driver="mpio", comm=self.comm) as f:
+                pod_group       = f.create_group("pod")
+                mode_group      = pod_group.create_group("modes")
+                reference_group = pod_group.create_group("reference_state")
+                if weights is not None:
+                    weights_group   = pod_group.create_group("weights")
+                scaling_group   = pod_group.create_group("scaling")
+
+                for state_var, info in self.state_info.items():
+                    state_type  = info["type"]
+                    num_modes   = local_modes[state_var].shape[1]
+                    if      state_type == "volScalarStates" or state_type == "modelStates": num_rows = self.num_cells_global
+                    elif    state_type == "volVectorStates":                                num_rows = 3 * self.num_cells_global
+                    elif    state_type == "surfaceScalarStates":                            num_rows = self.num_faces_no_proc_boundaries_global
+
+                    mode_group.create_dataset(state_var,        (num_rows, num_modes),              dtype="f8")
+                    self._write_field_data_to_dataset(mode_group[state_var], local_modes[state_var], state_type)
+                    mode_group[state_var].attrs.create("addressing_type", state_type)
+
+                    reference_group.create_dataset(state_var,   (num_rows, ),                       dtype="f8")
+                    self._write_field_data_to_dataset(reference_group[state_var], reference_state[state_var], state_type)
+                    reference_group[state_var].attrs.create("addressing_type", state_type)
+
+                    if weights is not None:
+                        weights_group.create_dataset(state_var, (num_rows, ),                       dtype="f8")
+                        self._write_field_data_to_dataset(weights_group[state_var], weights[state_var], state_type)
+                        weights_group[state_var].attrs.create("addressing_type", state_type)
+                    
+                    if scaling is not None:
+                        scaling_group.create_dataset(state_var,     data=scaling_values[state_var], dtype="f8")
+
+                pod_group.create_dataset('singular_values',     data=singular_values,               dtype="f8")
+
+        if write_modes_using_write_adjoint_fields:
+            for i in range(singular_values.size):
+                state_vec = np.concatenate([local_modes[state_var][:, i] for state_var in self.state_info.keys()])
+                self.dafoam_instance.solver.writeAdjointFields("pod_mode", i+1, state_vec, True)
+
+        return local_modes, reference_state, weights, scaling_values
+        
+
+    # region _method_of_snapshots
+    def _method_of_snapshots(self, local_data, local_weights):
+        comm = self.comm
+        rank = self.rank
+
+        # Method of snapshots (referenced https://willcox-research-group.github.io/rom-operator-inference-Python3/_modules/opinf/basis/_pod.html#method_of_snapshots)
+        min_thresh      = 1e-15
+        if isinstance(local_data, dict):
+            n_snapshots     = local_data["num_samples"]
+            local_gramian   = np.zeros((n_snapshots, n_snapshots))
+            for state_var in self.state_info.keys():
+                if local_weights is None:
+                    local_gramian += local_data[state_var].T @ local_data[state_var]
+                else:
+                    local_gramian += local_data[state_var].T @ (local_weights[state_var][:, None] * local_data[state_var])   
+        else:
+            n_snapshots     = local_data.shape[1]
+            if local_weights is None:
+                local_gramian   = local_data.T @ local_data
+            else:
+                local_gramian   = local_data.T @ (local_weights[:, None] * local_data)
+
+        total_gramian   = np.zeros_like(local_gramian) if rank == 0 else None
+        comm.Reduce(local_gramian, total_gramian, op=MPI.SUM, root=0)
+
+        if rank == 0:
+
+            # # DEBUG
+            # print(f"Total Gramian diagonal: {np.diag(total_gramian)}")
+            # print(f"Total Gramian sum: {np.sum(total_gramian)}")
+            # ########
+
+            eigvals, eigvecs = np.linalg.eigh(total_gramian)
+
+            # Re-order (largest to smallest).
+            eigvals     = eigvals[::-1]
+            eigvecs     = eigvecs[:, ::-1]
+
+            # By definition the Gramian is symmetric positive semi-definite.
+            # If any eigenvalues are smaller than zero, they are only measuring
+            # numerical error and can be truncated.
+            positives   = eigvals > max(min_thresh, abs(np.min(eigvals)))
+            eigvecs     = eigvecs[:, positives]
+            eigvals     = eigvals[positives]
+            s_vals      = np.sqrt(eigvals) # * n_global_states)
+
+        quiet_barrier(comm)
+
+        # Broadcast eigenvalues/vectors and singular values
+        if rank == 0:
+            n_retained_modes = eigvals.size
+        else:
+            n_retained_modes = None
+        n_retained_modes = comm.bcast(n_retained_modes, root=0)
+
+        # ALL ranks need to allocate buffers, including rank 0!
+        eigvals_bcast = np.empty((n_retained_modes, ),                dtype=np.float64)
+        eigvecs_bcast = np.empty((n_snapshots, n_retained_modes),     dtype=np.float64)
+        s_vals_bcast  = np.empty((n_retained_modes, ),                dtype=np.float64)
+
+        # Copy from rank 0's computed values into broadcast buffer
+        if rank == 0:
+            eigvals_bcast[:] = eigvals
+            eigvecs_bcast[:] = eigvecs
+            s_vals_bcast[:]  = s_vals
+
+        comm.Bcast([eigvals_bcast, MPI.DOUBLE], root=0)
+        comm.Bcast([eigvecs_bcast, MPI.DOUBLE], root=0)
+        comm.Bcast([s_vals_bcast,  MPI.DOUBLE], root=0)
+
+        # Use the broadcast versions
+        eigvals = eigvals_bcast
+        eigvecs = eigvecs_bcast
+        s_vals = s_vals_bcast
+
+        # # DEBUG
+        # print(f"Rank {self.rank}: First eigenvector sum = {np.sum(eigvecs[:, 0])}")
+        # print(f"Rank {self.rank}: First eigenvalue = {eigvals[0]}")
+        ###
+
+        # Rescale and square root eigenvalues to get singular values.
+        if isinstance(local_data, dict):
+            local_modes = {}
+            for state_var in self.state_info.keys():
+                local_modes[state_var] = local_data[state_var] @ (eigvecs / s_vals)
+        else:
+            local_modes = local_data @ (eigvecs / s_vals)
+
+        return local_modes, s_vals
+    
+
+    # region _leave_one_out_test
+    def _leave_one_out_test(self, h5filepath, num_modes=None, pod_options={}):
+        data_dict       = self.load_h5(h5file_path=h5filepath, group_to_read="samples", only_distributed_data=False)
+        metadata        = self.load_h5(h5file_path=h5filepath, group_to_read="parameters", only_distributed_data=False)
+
+        first_sample_is_ref = metadata["secondary_variables"]["_attrs"]["first_sample_is_reference"]
+        num_samples         = metadata["_attrs"]["num_secondary_samples"]
+
+
+        # We'll copy the states, just so we don't have to worry about accidentally deleting
+        # TODO: improve memory management by reducing the amount of copies floating around
+        data_dict["original_states"] = data_dict["states"].copy()
+
+        supply_dict     = {"data": data_dict, "metadata": metadata}
+        
+        out_state       = {} # This will be our left out state
+        remaining_state = {}
+        e               = np.zeros((num_samples - first_sample_is_ref,))
+
+        # Main loop for leave one out. Will loop through all snapshots and perform POD without the current snapshot and compute projection error
+        for read_index in range(first_sample_is_ref, num_samples):
+            
+            for state_var, info in self.state_info.items():
+                state_data                      = data_dict["original_states"][state_var].copy()
+                out_state[state_var]            = state_data[:, read_index]
+                remaining_state[state_var]      = np.delete(state_data, read_index, axis=1)
+                supply_dict["data"]["states"]   = remaining_state
+
+            local_modes, reference_state, weights, scaling_values = self._compute_pod_modes(supply_dict, **pod_options, write_h5=False)
+
+            '''
+            For reference:
+            Let's say CFD snapshots are stored in U. Before computing the POD we scale the state:
+            X = S^{-1} * (U - u_ref)
+            where S is a diagonal scaling matrix. POD is performed on X using a weighted inner product defined by diagonal matrix M.
+
+            The POD modes satisfy:
+            Phi^T * M * Phi = I
+
+            Reconstruction of a physical state is
+            u ~ u_ref + S * Phi * a
+
+            Define the scaled state
+            x = S^{-1} * (u - u_ref)
+
+            Projection onto the POD space is done in the scaled coordinates:
+            a      = Phi^T * M * x
+            x_hat  = Phi * a
+
+            Transforming back to the physical state gives
+            u_hat = u_ref + S * x^hat
+                  = u_ref + S * Phi * Phi^T * M * S^{-1} * (u - u_ref)
+
+            Projection error is measured in the same weighted norm used for POD:
+            ||x||_M = sqrt( x^T * M * x )
+
+            Relative projection error for snapshot i:
+            e_i = ||x_i - x_hat_i||_M / ||x_i||_M
+
+            where
+            x_i     = S^{-1} * (u_i - u_ref)
+            x_hat_i = Phi * Phi^T * M * x_i
+            '''
+            # We need to adjust the index here for the case where the first data index was the reference
+            i = read_index - first_sample_is_ref
+
+            # vectorize everything:
+            Phi     = np.concatenate([local_modes[var]      for var in self.state_info.keys()], axis=0)
+            u_i     = np.concatenate([out_state[var]        for var in self.state_info.keys()], axis=0)
+            u_ref   = np.concatenate([reference_state[var]  for var in self.state_info.keys()], axis=0)   
+            m       = np.concatenate([weights[var]          for var in self.state_info.keys()], axis=0)
+            s       = np.concatenate([scaling_values[var] * np.ones_like(out_state[var]) for var in self.state_info.keys()], axis=0)  
+
+            # Retain given number of modes
+            num_modes = Phi.shape[1] if num_modes is None else num_modes
+            Phi       = Phi[:, 0:num_modes]
+
+            # Local projection and global reduction
+            x_i         = 1 / s * (u_i - u_ref)
+            local_a     = Phi.T @ (m * x_i)
+            global_a    = self.comm.allreduce(local_a, op=MPI.SUM)
+
+            # Reconstruct local state and difference
+            x_hat       = Phi @ global_a
+            x_diff      = x_hat - x_i
+            
+            # Compute norms of scaled data under weighted norm (used for POD)
+            norm_x_diff = np.sqrt(self.comm.allreduce(np.sum((x_diff * m * x_diff)), op=MPI.SUM))
+            norm_x_i    = np.sqrt(self.comm.allreduce(np.sum((x_i * m * x_i)),       op=MPI.SUM))
+
+            # Relative error
+            e_i         = norm_x_diff / norm_x_i
+            e[i]        = e_i
+
+            self.print0(f"Projection error for leave-one-out of sample {i}: {e_i:.4e}")
+
+        # Print out configurations with largest error
+        error_sort_indices = np.argsort(e)
+
+        self.print0(f"Configurations with largest error:")
+        for i in error_sort_indices[-5:]:
+            self.print0(i)
+            for param, configs in metadata["secondary_variables"].items():
+                if param == "_attrs":
+                    continue
+                self.print0(f"     {param}: {configs[i, :]}")
+            self.print0(f"     Projection error: {e[i]}")
+
+        from scipy.spatial import distance
+        from sklearn.neighbors import NearestNeighbors
+        import matplotlib as mpl
+
+        if self.rank == 0:
+            plt.figure()
+            plt.semilogy(e[error_sort_indices])
+            plt.xlabel("Sample")
+            plt.ylabel("Error (||x_i - x_hat_i||_M / ||x_i||_M)")
+            
+            all_configs = np.concatenate(
+                            [configs[first_sample_is_ref:, :] for param, configs in metadata["secondary_variables"].items() if param != "_attrs"],
+                            axis=1
+                        )
+            
+            lower_bounds = np.min(all_configs, axis=0)
+            upper_bounds = np.max(all_configs, axis=0)
+            all_configs_norm = (all_configs - lower_bounds) / (upper_bounds - lower_bounds)
+
+            
+            norm = mpl.colors.Normalize(vmin=e.min(), vmax=e.max())
+            cmap = plt.cm.Reds
+
+            plt.figure()
+            print(f"all_configs_norm.shape = {all_configs_norm.shape}")
+            print(f"e.shape = {e.shape}")
+            for i in error_sort_indices:
+                plt.plot(all_configs_norm[i, :], color=cmap(norm(e[i])), alpha=0.7)
+
+            
+            mu          = all_configs.mean(axis=0)
+            Sigma_inv   = np.linalg.inv(np.cov(all_configs, rowvar=False))
+            d           = np.array([distance.mahalanobis(x, mu, Sigma_inv) for x in all_configs])
+
+            plt.figure()
+            plt.scatter(d, e)
+            plt.xlabel(f"Mahalanobis distance")
+            plt.ylabel(f"Projection error")
+
+            k = 5  # number of neighbors
+            nbrs = NearestNeighbors(n_neighbors=k+1, algorithm='auto').fit(all_configs)
+            distances, indices = nbrs.kneighbors(all_configs)
+            # skip the first column (distance to itself = 0)
+            d_knn = distances[:, 1:].mean(axis=1)
+            plt.figure()
+            plt.scatter(d_knn, e)
+            plt.xlabel(f"K-nearest neighbor distance (k = {k})")
+            plt.ylabel(f"Projection error")
+
+            plt.figure()
+            plt.scatter(d, d_knn, c=e)
+            plt.xlabel(f"K-nearest neighbor distance (k = {k})")
+            plt.ylabel(f"Mahalanobis distance")
+            plt.show()
+            
+        quiet_barrier(self.comm)
+
+
+
+
+
+            
+
+
+
+        
+
+
+
+    # region _write_field_data_to_dataset
+    def _write_field_data_to_dataset(self, dset, data, field_type, column_idx=None):
+
+        cell_global_indices                     = self.cell_global_indices
+        cell_vector_global_indices              = self.cell_vector_global_indices
+        face_masked_sorted_global_indices       = self.face_masked_sorted_global_indices
+        face_masked_sorting_indices             = self.face_masked_sorting_indices
+        face_proc_boundary_mask                 = self.face_proc_boundary_mask
+        
+        if field_type == "volScalarStates" or field_type == "modelStates":
+            if column_idx is None:
+                dset[cell_global_indices]                           = data
+            else:
+                dset[cell_global_indices, column_idx]               = data
+
+        elif field_type == "volVectorStates":
+            if column_idx is None:
+                dset[cell_vector_global_indices]                    = data
+            else:
+                dset[cell_vector_global_indices, column_idx]        = data
+
+        elif field_type == "surfaceScalarStates":
+            if column_idx is None:
+                dset[face_masked_sorted_global_indices]             = data[face_proc_boundary_mask][face_masked_sorting_indices]
+            else:
+                dset[face_masked_sorted_global_indices, column_idx] = data[face_proc_boundary_mask][face_masked_sorting_indices]
+
+        else:
+            raise NotImplementedError(f"Unknown state type, {field_type}. Might need to be added to solver_variable_storage_type?")
+        
+
+    # region _read_field_data_from_dataset
+    def _read_field_data_from_dataset(self, dset, field_type, column_idx=None):
+
+        cell_global_indices                     = self.cell_global_indices
+        cell_vector_global_indices              = self.cell_vector_global_indices
+        face_global_indices                     = self.face_global_indices
+
+        # Have to recover the proper mapping for the faces
+        negative_indices                            = self.face_global_indices < 0
+        positive_face_global_indices_zero_indexed   = (np.abs(face_global_indices) - 1)
+        negative_mask                               = np.ones_like(face_global_indices)
+        negative_mask[negative_indices]             = -1
+
+        positive_face_zero_indexed_ordered_indices = np.argsort(positive_face_global_indices_zero_indexed)
+
+        if field_type == "volScalarStates" or field_type == "modelStates":
+            data = dset[cell_global_indices]
+
+        elif field_type == "volVectorStates":
+            data = dset[cell_vector_global_indices]
+
+        elif field_type == "surfaceScalarStates":
+            if column_idx is None:
+                if dset.ndim > 1:
+                    num_columns     = dset.shape[1]
+                    local_data      = np.zeros((self.num_faces, num_columns))
+                else:
+                    local_data      = np.zeros((self.num_faces, ))
+            else:
+                local_data     = np.zeros((self.num_faces,))
+            
+            if dset.ndim > 1:
+                dset_sorted                                             = dset[positive_face_global_indices_zero_indexed[positive_face_zero_indexed_ordered_indices], :]
+            else:
+                dset_sorted                                             = dset[positive_face_global_indices_zero_indexed[positive_face_zero_indexed_ordered_indices]]
+            negative_mask_sorted                                        = negative_mask[positive_face_zero_indexed_ordered_indices]
+
+            if dset.ndim > 1:
+                local_data_sorted                                           = negative_mask_sorted[:, None] * dset_sorted 
+                local_data[positive_face_zero_indexed_ordered_indices, :]   = local_data_sorted
+            else:
+                local_data_sorted                                           = negative_mask_sorted * dset_sorted 
+                local_data[positive_face_zero_indexed_ordered_indices]      = local_data_sorted
+
+            data                                                        = local_data
+
+        else:
+            raise NotImplementedError(f"Unknown state type, {field_type}. Might need to be added to solver_variable_storage_type?")
+
+        return data
+    
+
     # region _visualize_imported_data
     def _visualize_imported_data(self, data, input_coordinates, center_colormap=False):
         current     = {"var": "p", "snap":0, "arrows":None}
@@ -742,333 +1307,3 @@ class TrainingDataInterface():
             plt.show(pts)
         
         quiet_barrier(self.comm)
-
-
-    # region _compute_pod_modes
-    def _compute_pod_modes(self, h5filepath, inner_product=None, centering='mean', scaling="reference", new_file=True, write_modes_using_write_adjoint_fields=False):
-
-        # data, metadata  = self.read_h5_file(h5filepath=h5filepath, return_metadata=True, visualize_data=False)
-        data_dict       = self.load_h5(h5file_path=h5filepath, group_to_read="samples", only_distributed_data=False)
-        metadata        = self.load_h5(h5file_path=h5filepath, group_to_read="parameters", only_distributed_data=False)
-
-        reference_state     = {}
-        weights             = {}
-        scaling_values      = {}
-
-        for state_var, info in self.state_info.items():
-            state_data = data_dict["states"][state_var]
-            state_type = info["type"]
-
-            # Centering methods (centering)
-            # 1. (None) No centering - will keep states as they are
-            # 2. ('mean') Mean centered. Will take the mean of the snapshots and subtract that from each snapshot
-            # 3. ('reference') Will use the reference sample in the file if it exists
-            # 4. (dict) User supplied reference
-            if centering is None:
-                reference_state[state_var] = np.zeros_like(state_data[:, 0])
-
-            elif isinstance(centering, str):
-                if centering == 'mean':
-                    reference_state[state_var] = np.mean(state_data, axis=1)
-
-                elif centering == 'reference':
-                    if not metadata["secondary_variables"]["_attrs"]["first_sample_is_reference"]:
-                        self.print0("WARNING: Using first sample as reference state, even though it seems the dataset was not sampled this way.")
-                    reference_state[state_var]      = state_data[:, 0]
-                    data_dict["states"][state_var]  = state_data[:, 1:]
-
-            elif isinstance(centering, dict):
-                # TODO: Add check to see if keys and dimensions match up
-                reference_state[state_var] = centering[state_var]
-
-            else:
-                raise TypeError(f'"{centering}" is not a valid centering method. ')
-        
-            # Weighting methods (inner_product)
-            # 1. (None) No weighting applied. Will use ones
-            # 2. ("reference") Generate the weights from the cell volumes and face areas of the first sample
-            # 4. (dict) User supplied weights
-            if inner_product is None:
-                weights = None
-        
-            elif isinstance(inner_product, str):        
-                if inner_product == "reference":
-                    # We only consider the weights for the reference state (first sample) for now
-                    if state_type == "volVectorStates":
-                        weights[state_var] = np.repeat(data_dict["mesh"]['cell_volumes'][:, 0], repeats=3, axis=0)
-                    elif state_type == 'volScalarStates' or state_type == "modelStates":
-                        weights[state_var] = data_dict["mesh"]['cell_volumes'][:, 0]
-                    elif state_type == "surfaceScalarStates":
-                        weights[state_var] = data_dict["mesh"]['face_areas'][:, 0]
-                    else:
-                        raise TypeError(f"State type of {state_type} not recognized. May need to be implemented?")
-                        
-                else:
-                    raise NotImplementedError(f"Inner product weight of type {inner_product} has not yet been implemented")
-            
-            elif isinstance(inner_product, dict):
-                # TODO: Add check to see if keys and dimensions match up
-                weights[state_var] = inner_product[state_var]
-                
-            else:
-                assert np.asarray(inner_product).shape == np.asarray(reference_state[state_var]).shape, "Supplied inner_product weight vector seems to be incompatible?"
-            
-            # Scaling methods (scaling)
-            # 1. (None) No scaling applied to the data. Terms like pressure will most likely dominate
-            # 2. ('reference') Will use the reference value found in the file (if it exists)
-            # 3. (dict) Will use the supplied scaling value. Must be a dictionary whose keys are state names (as seen by OpenFOAM - 'p', 'T', etc), and entries are scalar values
-            if scaling is None:
-                scaling_values[state_var] = np.ones_like(centering[state_var])
-
-            elif scaling == 'reference':
-                if "reference_states" in data_dict.keys():
-                    reference_states = data_dict["reference_states"]
-                    if f'{state_var}' in reference_states:
-                        if state_var != "phi":
-                            scaling_values[state_var] = reference_states[state_var][0]
-                        else:
-                            scaling_values[state_var] = 1 #data["face_areas"][:, 0] # Use face areas for phi weighting
-                    else:
-                        raise TypeError(f'Reference value not found for {state_var} in dataset during POD compute setup.')
-                else:
-                    raise TypeError(f'Reference values not found in dataset during POD compute setup.')
-                    
-            elif isinstance(scaling, dict):
-                # TODO: Add check to see if keys and dimensions match up  
-                scaling_values[state_var] = scaling[state_var]
-                    
-            else:
-                raise TypeError("Not a valid scaling method. Please supply None, 'reference', or a dict with the proper entries.")
-            
-            # Rescaling data for POD computation
-            # if state_var == "phi":
-            #     data[state_var] = 1/scaling_values[state_var][:, None] * (data[state_var] - reference_state[state_var][:, None])
-            # else:
-            data_dict["states"][state_var] = 1/scaling_values[state_var] * (data_dict["states"][state_var] - reference_state[state_var][:, None])
-        
-        # Only need state data and number of samples for POD computation
-        data                = data_dict["states"]
-
-        # Number of sample correction
-        num_samples         = metadata["_attrs"]["num_secondary_samples"]
-        data["num_samples"] = num_samples - 1 if centering == "reference" else num_samples
-
-        # Actual POD computation
-        local_modes, singular_values = self._method_of_snapshots(data, weights)
-
-        # Change file path name if new file requested
-        outfilepath = Path(h5filepath)
-        if new_file:
-            outfilepath = outfilepath.with_name(outfilepath.stem + '_modes' + outfilepath.suffix)
-
-        with h5py.File(outfilepath, "a", driver="mpio", comm=self.comm) as f:
-            pod_group       = f.create_group("pod")
-            mode_group      = pod_group.create_group("modes")
-            reference_group = pod_group.create_group("reference_state")
-            if weights is not None:
-                weights_group   = pod_group.create_group("weights")
-            scaling_group   = pod_group.create_group("scaling")
-
-            for state_var, info in self.state_info.items():
-                state_type  = info["type"]
-                num_modes   = local_modes[state_var].shape[1]
-                if      state_type == "volScalarStates" or state_type == "modelStates": num_rows = self.num_cells_global
-                elif    state_type == "volVectorStates":                                num_rows = 3 * self.num_cells_global
-                elif    state_type == "surfaceScalarStates":                            num_rows = self.num_faces_no_proc_boundaries_global
-
-                mode_group.create_dataset(state_var,        (num_rows, num_modes),              dtype="f8")
-                self._write_field_data_to_dataset(mode_group[state_var], local_modes[state_var], state_type)
-                mode_group[state_var].attrs.create("addressing_type", state_type)
-
-                reference_group.create_dataset(state_var,   (num_rows, ),                       dtype="f8")
-                self._write_field_data_to_dataset(reference_group[state_var], reference_state[state_var], state_type)
-                reference_group[state_var].attrs.create("addressing_type", state_type)
-
-                if weights is not None:
-                    weights_group.create_dataset(state_var, (num_rows, ),                       dtype="f8")
-                    self._write_field_data_to_dataset(weights_group[state_var], weights[state_var], state_type)
-                    weights_group[state_var].attrs.create("addressing_type", state_type)
-                
-                if scaling is not None:
-                    scaling_group.create_dataset(state_var,     data=scaling_values[state_var], dtype="f8")
-
-            pod_group.create_dataset('singular_values',     data=singular_values,               dtype="f8")
-
-        if write_modes_using_write_adjoint_fields:
-            for i in range(singular_values.size):
-                state_vec = np.concatenate([local_modes[state_var][:, i] for state_var in self.state_info.keys()])
-                self.dafoam_instance.solver.writeAdjointFields("pod_mode", i+1, state_vec)
-    
-
-    # region _method_of_snapshots
-    def _method_of_snapshots(self, local_data, local_weights):
-        comm = self.comm
-        rank = self.rank
-
-        # Method of snapshots (referenced https://willcox-research-group.github.io/rom-operator-inference-Python3/_modules/opinf/basis/_pod.html#method_of_snapshots)
-        min_thresh      = 1e-15
-        if isinstance(local_data, dict):
-            n_snapshots     = local_data["num_samples"]
-            local_gramian   = np.zeros((n_snapshots, n_snapshots))
-            for state_var in self.state_info.keys():
-                if local_weights is None:
-                    local_gramian += local_data[state_var].T @ local_data[state_var]
-                else:   
-                    local_gramian += local_data[state_var].T @ (local_weights[state_var][:, None] * local_data[state_var])   
-        else:
-            n_snapshots     = local_data.shape[1]
-            if local_weights is None:
-                local_gramian   = local_data.T @ local_data
-            else:
-                local_gramian   = local_data.T @ (local_weights[:, None] * local_data)
-
-        total_gramian   = np.zeros_like(local_gramian) if rank == 0 else None
-        comm.Reduce(local_gramian, total_gramian, op=MPI.SUM, root=0)
-
-        if rank == 0:
-
-            # DEBUG
-            print(f"Total Gramian diagonal: {np.diag(total_gramian)}")
-            print(f"Total Gramian sum: {np.sum(total_gramian)}")
-            ########
-
-            eigvals, eigvecs = np.linalg.eigh(total_gramian)
-
-            # Re-order (largest to smallest).
-            eigvals     = eigvals[::-1]
-            eigvecs     = eigvecs[:, ::-1]
-
-            # By definition the Gramian is symmetric positive semi-definite.
-            # If any eigenvalues are smaller than zero, they are only measuring
-            # numerical error and can be truncated.
-            positives   = eigvals > max(min_thresh, abs(np.min(eigvals)))
-            eigvecs     = eigvecs[:, positives]
-            eigvals     = eigvals[positives]
-            s_vals      = np.sqrt(eigvals) # * n_global_states)
-
-        quiet_barrier(comm)
-
-        # Broadcast eigenvalues/vectors and singular values
-        if rank == 0:
-            n_retained_modes = eigvals.size
-        else:
-            n_retained_modes = None
-        n_retained_modes = comm.bcast(n_retained_modes, root=0)
-
-        # ALL ranks need to allocate buffers, including rank 0!
-        eigvals_bcast = np.empty((n_retained_modes, ),                dtype=np.float64)
-        eigvecs_bcast = np.empty((n_snapshots, n_retained_modes),     dtype=np.float64)
-        s_vals_bcast  = np.empty((n_retained_modes, ),                dtype=np.float64)
-
-        # Copy from rank 0's computed values into broadcast buffer
-        if rank == 0:
-            eigvals_bcast[:] = eigvals
-            eigvecs_bcast[:] = eigvecs
-            s_vals_bcast[:]  = s_vals
-
-        comm.Bcast([eigvals_bcast, MPI.DOUBLE], root=0)
-        comm.Bcast([eigvecs_bcast, MPI.DOUBLE], root=0)
-        comm.Bcast([s_vals_bcast,  MPI.DOUBLE], root=0)
-
-        # Use the broadcast versions
-        eigvals = eigvals_bcast
-        eigvecs = eigvecs_bcast
-        s_vals = s_vals_bcast
-
-        # DEBUG
-        print(f"Rank {self.rank}: First eigenvector sum = {np.sum(eigvecs[:, 0])}")
-        print(f"Rank {self.rank}: First eigenvalue = {eigvals[0]}")
-        ###
-
-        # Rescale and square root eigenvalues to get singular values.
-        if isinstance(local_data, dict):
-            local_modes = {}
-            for state_var in self.state_info.keys():
-                local_modes[state_var] = local_data[state_var] @ (eigvecs / s_vals)
-        else:
-            local_modes = local_data @ (eigvecs / s_vals)
-
-        return local_modes, s_vals
-
-
-    # region _write_field_data_to_dataset
-    def _write_field_data_to_dataset(self, dset, data, field_type, column_idx=None):
-
-        cell_global_indices                     = self.cell_global_indices
-        cell_vector_global_indices              = self.cell_vector_global_indices
-        face_masked_sorted_global_indices       = self.face_masked_sorted_global_indices
-        face_masked_sorting_indices             = self.face_masked_sorting_indices
-        face_proc_boundary_mask                 = self.face_proc_boundary_mask
-        
-        if field_type == "volScalarStates" or field_type == "modelStates":
-            if column_idx is None:
-                dset[cell_global_indices]                           = data
-            else:
-                dset[cell_global_indices, column_idx]               = data
-
-        elif field_type == "volVectorStates":
-            if column_idx is None:
-                dset[cell_vector_global_indices]                    = data
-            else:
-                dset[cell_vector_global_indices, column_idx]        = data
-
-        elif field_type == "surfaceScalarStates":
-            if column_idx is None:
-                dset[face_masked_sorted_global_indices]             = data[face_proc_boundary_mask][face_masked_sorting_indices]
-            else:
-                dset[face_masked_sorted_global_indices, column_idx] = data[face_proc_boundary_mask][face_masked_sorting_indices]
-
-        else:
-            raise NotImplementedError(f"Unknown state type, {field_type}. Might need to be added to solver_variable_storage_type?")
-        
-
-    # region _read_field_data_from_dataset
-    def _read_field_data_from_dataset(self, dset, field_type, column_idx=None):
-
-        cell_global_indices                     = self.cell_global_indices
-        cell_vector_global_indices              = self.cell_vector_global_indices
-        face_global_indices                     = self.face_global_indices
-
-        # Have to recover the proper mapping for the faces
-        negative_indices                            = self.face_global_indices < 0
-        positive_face_global_indices_zero_indexed   = (np.abs(face_global_indices) - 1)
-        negative_mask                               = np.ones_like(face_global_indices)
-        negative_mask[negative_indices]             = -1
-
-        positive_face_zero_indexed_ordered_indices = np.argsort(positive_face_global_indices_zero_indexed)
-
-        if field_type == "volScalarStates" or field_type == "modelStates":
-            data = dset[cell_global_indices]
-
-        elif field_type == "volVectorStates":
-            data = dset[cell_vector_global_indices]
-
-        elif field_type == "surfaceScalarStates":
-            if column_idx is None:
-                if dset.ndim > 1:
-                    num_columns     = dset.shape[1]
-                    local_data      = np.zeros((self.num_faces, num_columns))
-                else:
-                    local_data      = np.zeros((self.num_faces, ))
-            else:
-                local_data     = np.zeros((self.num_faces,))
-            
-            if dset.ndim > 1:
-                dset_sorted                                             = dset[positive_face_global_indices_zero_indexed[positive_face_zero_indexed_ordered_indices], :]
-            else:
-                dset_sorted                                             = dset[positive_face_global_indices_zero_indexed[positive_face_zero_indexed_ordered_indices]]
-            negative_mask_sorted                                        = negative_mask[positive_face_zero_indexed_ordered_indices]
-
-            if dset.ndim > 1:
-                local_data_sorted                                           = negative_mask_sorted[:, None] * dset_sorted 
-                local_data[positive_face_zero_indexed_ordered_indices, :]   = local_data_sorted
-            else:
-                local_data_sorted                                           = negative_mask_sorted * dset_sorted 
-                local_data[positive_face_zero_indexed_ordered_indices]      = local_data_sorted
-
-            data                                                        = local_data
-
-        else:
-            raise NotImplementedError(f"Unknown state type, {field_type}. Might need to be added to solver_variable_storage_type?")
-
-        return data
