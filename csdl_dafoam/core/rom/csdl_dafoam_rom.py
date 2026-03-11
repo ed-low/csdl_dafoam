@@ -62,12 +62,15 @@ In summary:
 #                         'maxiter':          50,       # max Newton iterations
 #                         'tol_rel':          1e-6,     # relative residual tolerance
 #                         'tol_abs':          1e-10,    # absolute residual tolerance
+#                         'tol_step_rel':     1e-8,     # Newton will consider converged if the stepsize vs state magnitudes reach this tolerance
 #                         'ls_alpha0':        1.0,      # initial line search step
 #                         'ls_rho':           0.5,      # backtrack factor
 #                         'ls_c1':            1e-4,     # Armijo sufficient decrease constant
 #                         'ls_maxiter':       10,       # max line search iterations
+#                         'ls_freeze_basis':  True,     # Whether or not to freeze the trial basis for the line search (disabling will increase cost)
 #                         'jac_fd_step':      1e-6,     # FD step for Jacobian
 #                         'update_test_basis_every': 1, # how often to recompute Psi (every n iters)
+#                         'min_newton_steps:  1,        # force the newton solver to take this many steps, even if initially converged
 #                         'verbose': {
 #                                     'level':          1,       # 0=silent, 1=standard, 2=diagnostic, 3=expensive
 #                                     'progress':       True,    # per-iteration table (Level 1)
@@ -97,6 +100,10 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
         param_sens_mode='galerkin_adjoint', # or 'fd'
         newton_options=None,     # maxiter, tol, line search params, fd eps
         exclude_from_projection=None, # list of strings indicating variables to ignore during ROM computation
+        use_normalized_residuals=True,
+        apply_temperature_residual_fix=True,
+        temperature_residual_cp_val=1005.,
+        write_residuals_with_solutions=False,
     ):
         super().__init__()
         self.dafoam_instance = dafoam_instance
@@ -113,6 +120,8 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
         self.rom_type           = self._check_if_in_list(rom_type,          ["galerkin", "lspg"])
         self.jac_mode           = self._check_if_in_list(jac_mode,          ["fd", "analytical"])
         self.param_sens_mode    = self._check_if_in_list(param_sens_mode,   ["galerkin_adjoint", "fd"])
+
+        self.use_normalized_residuals   = use_normalized_residuals
         
         # Merge user newton options, then resolve verbose once
         self.newton_options             = self._init_newton_options(newton_options)
@@ -123,6 +132,14 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
         self.pod_modes_is_csdl_var       = None
         self.reference_state_is_csdl_var = None
         self.scaling_is_csdl_var         = None
+        self.checked_basis_orthogonality = None
+
+        # Temperature residual fixes
+        self.apply_temperature_residual_fix = apply_temperature_residual_fix
+        self.temperature_residual_cp_val    = temperature_residual_cp_val
+
+        # File I/O
+        self.write_residuals_with_solutions = write_residuals_with_solutions
 
         # DAFoam
         self.n_local_states = dafoam_instance.getNLocalAdjointStates()
@@ -176,11 +193,17 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
         self.scaling            = input_vals["scaling"]         if self.scaling_is_csdl_var             else self.scaling
         self.reference_state    = input_vals["reference_state"] if self.reference_state_is_csdl_var     else self.reference_state
         self.weights            = np.ones_like(self.reference_state) if self.weights is None            else self.weights
-        s_r                     = np.ones_like(self.reference_state) if self.residual_scaling is None   else self.residual_scaling
+        self.residual_scaling   = np.ones_like(self.reference_state) if self.residual_scaling is None   else self.residual_scaling
+
         if self.rom_type == 'galerkin':
-            self._m_eff = self.weights / s_r           # M R^{-1}
+            self._m_eff = self.weights / self.residual_scaling           # M R^{-1}
         elif self.rom_type == 'lspg':
-            self._m_eff = self.weights / (s_r ** 2)    # R^{-1} M R^{-1}
+            self._m_eff = self.weights / (self.residual_scaling ** 2)    # R^{-1} M R^{-1}
+
+        # Check orthogonaliy (only once if constant basis)
+        if self.pod_modes_is_csdl_var or self.checked_basis_orthogonality:
+            self._check_basis_orthogonality()
+            self.checked_basis_orthogonality = True
 
         # Zero out excluded variables in m_eff (e.g. T for incompressible SA)
         if self.exclude_from_projection:
@@ -189,7 +212,7 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
                 if exclude_var not in var_names:
                     self.print0(f"Warning: '{exclude_var}' not found in state variable map. Skipping.")
                     continue
-                local_mask           = var_idx == var_names.index(exclude_var)
+                local_mask              = var_idx == var_names.index(exclude_var)
                 self._m_eff[local_mask] = 0.0
 
         # Make sure solver is updated with the most recent input values
@@ -199,15 +222,17 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
         # TODO: See if there is a best warm start option
         q0 = self._cached_q.copy() if self._cached_q is not None else np.zeros(self.basis_size)
 
-        q, reason = self._rom_newtwon_solve(initial_rom_state=q0)
+        q, reason = self._rom_newton_solve(initial_rom_state=q0)
 
-        if reason == 1:
+        if reason > 0:
             output_vals["dafoam_rom_states"] = q
 
-        elif reason == -1 or reason == -2:
+        elif reason < 0:
             self.print0("Newton solver failed. Setting DAFoam ROM states to NaNs.")
             output_vals["dafoam_rom_states"] = np.nan * np.ones_like(q)
 
+        else:
+            output_vals["dafoam_rom_states"] = q
 
     # region apply_inverse_jacobian
     def apply_inverse_jacobian(self, input_vals, output_vals, d_outputs, d_residuals, mode):
@@ -237,10 +262,14 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
             raise ValueError(f'"{mode}" not recognized. Only support "fwd" and "rev" modes')
         
         # Write state to file
-        self.dafoam_instance.solver.writeAdjointFields("solution", 1 + (self.solution_iter + 1) / 10000, self._cached_w, True)
+        leading_integer = 1
+        self.dafoam_instance.solver.writeAdjointFields("", leading_integer + (self.solution_iter + 1) / 10000, self._cached_w, True)
+        if self.write_residuals_with_solutions:
+            current_residual = self._eval_fom_residual(self._cached_w)
+            self.dafoam_instance.solver.writeAdjointFields("res_", leading_integer + (self.solution_iter + 1) / 10000, current_residual, True)
         mesh = np.zeros_like(self.dafoam_instance.xv.flatten())
         self.dafoam_instance.solver.getOFMeshPoints(mesh)
-        self.dafoam_instance.solver.writeMeshPoints(mesh, 1 + (self.solution_iter + 1) / 10000)
+        self.dafoam_instance.solver.writeMeshPoints(mesh, leading_integer + (self.solution_iter + 1) / 10000)
         self.solution_iter += 1
 
 
@@ -275,7 +304,19 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
             s   = self.scaling
 
             # Shared seed: M @ Psi @ lam (fom size, distributed)
-            seed = np.ascontiguousarray(m * (Psi @ lam))
+            seed        = np.ascontiguousarray(m * (Psi @ lam))
+            seed_norm   = seed.copy()
+            
+            # Prescale for temperature residual fix
+            if self.apply_temperature_residual_fix:
+                seed_norm[self.state_indices["T"]] /= self.temperature_residual_cp_val
+
+            # TODO: Assuming that the dafoam_instance always has normalizeResiduals for all states
+            # Maybe add some logic to make this more robust for the case that this is not true?
+            if not self.use_normalized_residuals:
+                res_scale_factors = dafoam_instance.getStateWeights()
+                res_scale_factors[self.state_indices["T"]] /= 1005.
+                seed_norm *= res_scale_factors
 
             # FOM inputs: mesh, flow DVs
             input_dict = dafoam_instance.getOption("inputInfo")
@@ -296,7 +337,7 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
                     jac_input,
                     "aero_residuals",
                     "residual",
-                    seed,
+                    seed_norm,
                     product
                 )
 
@@ -362,13 +403,15 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
         residual_vals["dafoam_rom_states"] = self._eval_rom_residual(rom_state=q)
         
     
-    # region _rom_newtwon_solve
-    def _rom_newtwon_solve(self, initial_rom_state):
+    # region _rom_newton_solve
+    def _rom_newton_solve(self, initial_rom_state):
         opts            = self.newton_options
         verb            = opts["verbose"]
 
         # Initialize some values
         q               = initial_rom_state.copy()
+        dq              = np.inf
+        alpha           = opts["ls_alpha0"]
         J_rom           = None
         reason          = 0 # Will return 1 for successful solution, 2 for success with failed line search, -2 for max iterations
         ls_success      = True  # assume success until line search runs
@@ -394,28 +437,35 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
         for k in range(opts["maxiter"]):
 
             # Check convergence
-            if r_rom_norm < opts["tol_abs"] or r_rom_norm / r_rom_norm_ref < opts["tol_rel"]:
-                if verb['progress']:
-                    self.print0(f"Newton converged (absolute tolerance) at iteration {k}")
-                
-                if verb['progress']:
-                    self.print0(f"Newton converged (relative tolerance) at iteration {k}")
-                
-                # Compute the reduced jacobian if we converged before running anything
-                if k == 0:
-                    J_rom = self._compute_rom_jacobian(fom_state=w, step=jac_fd_step)
-                    
-                reason = 1 if ls_success else 2
-                break
+            residual_converged = r_rom_norm < opts["tol_abs"] or r_rom_norm / r_rom_norm_ref < opts["tol_rel"]
+            step_converged     = np.linalg.norm(dq) * alpha / max(np.linalg.norm(q), 1e-14) < opts.get("tol_step_rel", 1e-8)
 
-            # Compute ROM Jacobian
+            if residual_converged or (step_converged and ls_success):
+                if k >= opts["min_newton_steps"]:
+                    if verb['progress']:
+                        if residual_converged:
+                            if r_rom_norm < opts["tol_abs"]:
+                                self.print0(f"Newton converged (absolute tolerance)...")
+                            elif r_rom_norm / r_rom_norm_ref < opts["tol_rel"]:
+                                self.print0(f"Newton converged (relative tolerance)...")
+                        if step_converged:
+                            self.print0(f"Netwon converged (step tolerance {np.linalg.norm(dq) * alpha / max(np.linalg.norm(q), 1e-14)} < {opts.get('tol_step_rel', 1e-8)})...")
+                    
+                    # Update the reduced jacobian to latest state
+                    J_rom = self._compute_rom_jacobian(fom_state=w, step=jac_fd_step)
+                        
+                    reason = 1 if ls_success else 2
+                    break
+                
+
+            # Compute ROM Jacobian (only rebuild on successful steps)
             w = self._reconstruct_fom_state(q)
-            if k % opts["update_test_basis_every"] == 0:
-                self._update_test_basis(fom_state=w, step=jac_fd_step)
-            J_rom = self._compute_rom_jacobian(fom_state=w, step=jac_fd_step)
+            if ls_success:  # ls_success from previous iteration
+                if k % opts["update_test_basis_every"] == 0:
+                    self._update_test_basis(fom_state=w, step=jac_fd_step)
+                J_rom = self._compute_rom_jacobian(fom_state=w, step=jac_fd_step)
 
             # Linear solve
-            # We'll do this on all ranks, redundantly for now (consider solve on root->broadcast, parallelize)
             try:
                 dq = np.linalg.solve(J_rom, -r_rom)
             except np.linalg.LinAlgError:
@@ -437,13 +487,15 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
             self.print0(f"Warning: Newton solver reached max iterations ({opts['maxiter']}) without converging.")
             reason = -2
 
-        if verb["footer"]:
-            self._print_solve_footer(q, r_rom_norm, r_rom_norm_ref, reason, verb)
-
         # Cache and return
         self._cached_q   = q
         self._cached_w   = self._reconstruct_fom_state(q)
         self._cached_J_r = J_rom
+
+        # if verb["footer"]:
+        #     self._print_solve_footer(q, r_rom_norm, r_rom_norm_ref, reason, verb)
+
+        self._print_diagnostics(q, dq, r_rom, r_rom_norm, r_rom_norm_ref, reason, opts)
 
         return q, reason
     
@@ -456,6 +508,9 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
 
         for ls_iter in range(opts["ls_maxiter"]):
             q_trial             = q + alpha * dq
+            if not opts["ls_freeze_basis"]:
+                w_trial             = self._reconstruct_fom_state(q_trial)
+                self._update_test_basis(fom_state=w_trial, step=opts["jac_fd_step"])
             r_rom_trial         = self._eval_rom_residual(q_trial)
             r_rom_norm_trial    = np.linalg.norm(r_rom_trial)
 
@@ -484,11 +539,23 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
         # This assumes we have already set the inputs! Should generally be the case
         w = fom_state
         dafoam_instance = self.dafoam_instance
+        
+        w_old = dafoam_instance.getStates()
         dafoam_instance.setStates(w)
-        res_scale_factors = dafoam_instance.getStateWeights()
-        res_scale_factors[self.state_indices["phi"]] =  1 / res_scale_factors[self.state_indices["phi"]]
-        res_scale_factors[self.state_indices["T"]]  /= 1005
-        return dafoam_instance.getResiduals() #* res_scale_factors
+        residuals = dafoam_instance.getResiduals()
+        dafoam_instance.setStates(w_old)
+
+        if self.apply_temperature_residual_fix:
+            residuals[self.state_indices["T"]] /= self.temperature_residual_cp_val
+
+        # TODO: Assuming that the dafoam_instance always has normalizeResiduals for all states
+        # Maybe add some logic to make this more robust for the case that this is not true?
+        if not self.use_normalized_residuals:
+            res_scale_factors = dafoam_instance.getStateWeights()
+            # res_scale_factors[self.state_indices["T"]] /= 1005.
+            residuals         = residuals * res_scale_factors
+
+        return residuals
 
 
     # region _project_and_reduce
@@ -530,27 +597,37 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
 
         for i in range(n_cols):
             v        = M[:, i]
-            JM[:, i] = self._jac_vec_product(fom_state=w, direction=v, fom_residual=r0, step=step)
+            JM[:, i] = self._jac_vec_product(fom_state=w, direction=v, fom_residual=r0, step=step, reset_state=False)
+
+        self.dafoam_instance.setStates(w)  # reset OF state to w (due to perturbation step in _jac_vec_product)
 
         return JM
 
 
     # region _jac_vec_product
-    def _jac_vec_product(self, fom_state, direction, fom_residual=None, step=1e-6):
+    def _jac_vec_product(self, fom_state, direction, fom_residual=None, step=1e-6, reset_state=True):
         w = fom_state
         v = direction
-
+        
         # Scale h relative to the direction magnitude to avoid truncation/cancellation
+        # TODO: Maybe make the 
         v_norm_local  = np.dot(v, v)
         v_norm_global = np.zeros(1)
         self.comm.Allreduce(v_norm_local, v_norm_global, op=MPI.SUM)
         v_norm = np.sqrt(v_norm_global[0])
 
         h = step * v_norm if v_norm > 0 else step
+
+        # h = step
     
         # Use directional derivative fd approximation
         r0      = self._eval_fom_residual(fom_state=w) if fom_residual is None else fom_residual
         r_pert  = self._eval_fom_residual(fom_state=w + h * v)
+
+        # Return the dafoam states back to original state
+        # We'd set this to false in the case of using _jac_mad_product
+        if reset_state:
+            self.dafoam_instance.setStates(w)
 
         return (r_pert - r0) / h
 
@@ -563,6 +640,11 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
 
         seed    = np.ascontiguousarray(v)
         product = np.zeros_like(seed)
+        
+        # Prescale (for temperature residual fix)
+        if self.apply_temperature_residual_fix:
+            product[self.state_indices["T"]] /= self.temperature_residual_cp_val
+
         dafoam_instance.solverAD.calcJacTVecProduct(
             'dafoam_solver_states',
             "stateVar",
@@ -573,7 +655,13 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
             product,
             )
         
-        return product/dafoam_instance.getStateScalingFactors()
+        # TODO: Assuming that the dafoam_instance always has normalizeResiduals for all states
+        # Maybe add some logic to make this more robust for the case that this is not true?
+        if not self.use_normalized_residuals:
+            res_scale_factors = dafoam_instance.getStateWeights()
+            product *= res_scale_factors
+        
+        return product / dafoam_instance.getStateScalingFactors()
     
 
     # region _jacT_mat_product
@@ -683,13 +771,16 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
             'maxiter':                  50,
             'tol_rel':                  1e-6,
             'tol_abs':                  1e-10,
+            'tol_step_rel':             1e-8,
             'ls_alpha0':                1.0,
             'ls_rho':                   0.5,
             'ls_c1':                    1e-4,
             'ls_maxiter':               10,
+            'ls_freeze_basis':          True,
             'jac_fd_step':              1e-6,
             'update_test_basis_every':  1,
             'verbose':                  1,
+            'min_newton_steps':         1,
         }
         opts            = {**DEFAULT_NEWTON_OPTIONS, **(user_options or {})}
 
@@ -746,7 +837,7 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
             + (f"  {'-'*10}" if verb.get('numerics') else "")
         )
         self.print0(
-            f"  {0:>4}  {np.linalg.norm(q0):>12.6e}  {1.0:>16.6e}  "
+            f"  {0:>4}  {np.linalg.norm(r_rom_norm_ref):>12.6e}  {1.0:>16.6e}  "
             f"{'-':>8}  {'-':>10}  {np.linalg.norm(q0):>10.4e}"
             + (f"  {'-':>10}" if verb.get('numerics') else "")
         )
@@ -770,214 +861,367 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
         )
 
 
+    # region _check_basis_orthogonality
+    def _check_basis_orthogonality(self):
+        """
+        Always called at solver initialization, regardless of verbosity.
+        Checks Phi^T M Phi = I under the POD inner product weight.
+        Prints one line: PASS or WARNING.
+        """
+        Phi = self.pod_modes
+        m   = self.weights        # M inner product weights (not M_eff)
+        n   = self.basis_size
+
+        # Gram matrix: G_ij = Phi_i^T M Phi_j
+        G_local = Phi.T @ (m[:, None] * Phi)
+        G       = np.zeros_like(G_local)
+        self.comm.Allreduce(G_local, G, op=MPI.SUM)
+
+        ortho_error = np.linalg.norm(G - np.eye(n), 'fro')
+        tol         = 1e-10
+
+        if ortho_error < tol:
+            self.print0(
+                f"  Basis orthogonality check (‖Phi^T M Phi - I‖_F):  "
+                f"PASS ({ortho_error:.2e})"
+            )
+        else:
+            self.print0(
+                f"  Basis orthogonality check (‖Phi^T M Phi - I‖_F):  "
+                f"WARNING ({ortho_error:.2e}) -- downstream math may be affected"
+            )
+
+
+    # region _print_diagnostics
+    def _print_diagnostics(self, q, dq, r_rom, r_rom_norm, r_rom_norm_ref, reason, opts):
+        """
+        Orchestrator for all diagnostic output. Calls each section
+        conditionally based on verbosity level.
+
+        Verbosity structure:
+            level >= 1: footer   (exit reason, r_rom ratio, q norm, SA flag)
+            level >= 2: residuals, numerics, basis_quality
+            level >= 3: basis_expensive (mode contributions)
+        """
+        verb = opts["verbose"]
+
+        if verb.get("footer"):
+            self._print_solve_footer(q, r_rom_norm, r_rom_norm_ref, reason, opts)
+
+        if verb.get("residuals"):
+            self._print_residuals(opts)
+
+        if verb.get("numerics"):
+            self._print_numerics(q, dq, r_rom, r_rom_norm, opts)
+
+        if verb.get("basis_quality"):
+            self._print_basis_quality(opts)
+
+        if verb.get("basis_expensive"):
+            self._print_mode_contributions(q, opts)
+
+
     # region _print_solve_footer
-    def _print_solve_footer(self, q, r_rom_norm, r_rom_norm_ref, reason, verb):
-        W          = 68 # Divider width
+    def _print_solve_footer(self, q, r_rom_norm, r_rom_norm_ref, reason, opts):
+        """
+        Level 1 footer. Always cheap — no FOM residual evaluations.
+        Uses self._cached_w for SA check.
+        """
+        W          = 68
         reason_str = {
             1:  "converged",
-            2: "converged with failed line search",
-            -1: "max iterations",
+            2:  "converged with failed line search",
+            -2: "max iterations",
             0:  "unknown"
         }.get(reason, "unknown")
 
-        # Level 1: always printed in footer
-        w_final     = self._reconstruct_fom_state(q)
+        w_final     = self._cached_w
         sa_negative = (
-                        bool(self.comm.allreduce(int((w_final[self.state_indices["nuTilda"]] < 0).any()), op=MPI.MAX))
-                        if "nuTilda" in self.state_indices
-                        else False
-                    )
+            bool(self.comm.allreduce(
+                int((w_final[self.state_indices["nuTilda"]] < 0).any()), op=MPI.MAX
+            ))
+            if "nuTilda" in self.state_indices
+            else False
+        )
 
-        self.print0(f"{'-'*W}")
+        self.print0(f"\n{'-'*W}")
         self.print0(f"  {'Exit reason':<32} {reason_str}")
-        self.print0(f"  {'‖r_rom‖ (final)':<32} {r_rom_norm:.6e}")
-        self.print0(f"  {'‖r_rom‖/‖r_ref‖ (final)':<32} "
-                    f"{r_rom_norm/max(r_rom_norm_ref,1e-14):.6e}")
-        self.print0(f"  {'‖q‖ (final)':<32} {np.linalg.norm(q):.6e}")
+        self.print0(f"  {'‖r_rom‖/‖r_rom_ref‖':<32} {r_rom_norm/max(r_rom_norm_ref, 1e-14):.6e}")
+        self.print0(f"  {'‖q‖':<32} {np.linalg.norm(q):.6e}")
         self.print0(f"  {'SA var negative?':<32} {'**YES**' if sa_negative else 'no'}")
+        self.print0(f"{'-'*W}")
 
-        # Level 2: residuals category
-        if verb.get('residuals'):
-            r_fom_final      = self._eval_fom_residual(w_final)
-            r_fom_norm_final = np.sqrt(self.comm.allreduce(np.dot(r_fom_final, r_fom_final), op=MPI.SUM))
-            self.print0(f"  {'-'*66}")
-            self.print0(f"  {'‖r_fom‖ (final)':<32} {r_fom_norm_final:.6e}")
-            self._print_per_variable_residuals(r_fom_final)
 
-        # Level 2: basis quality category
-        if verb.get('basis_quality'):
-            self._print_basis_quality(q, w_final, r_fom=r_fom_final if verb.get('residuals') else None)
+    # region _print_residuals
+    def _print_residuals(self, opts):
+        """
+        Level 2 residuals. Evaluates FOM residual at both w_final and w_ref.
+        Prints global norms, ratio, and per-variable breakdown.
+        Flags variables where ROM solution is worse than reference (**).
+        """
+        W = 68
 
-        if verb.get('numerics') and self._cached_J_r is not None:
-            r_rom      = self._eval_rom_residual(q)
-            self._print_jacobian_summary(
-                J_rom      = self._cached_J_r,
-                q          = q,
-                r_rom      = r_rom,
-                r_rom_norm = np.linalg.norm(r_rom),
-                opts       = self.newton_options,
+        w_final = self._cached_w
+
+        # Evaluate FOM residuals
+        r_fom_final = self._eval_fom_residual(w_final)
+        r_fom_ref   = self._eval_fom_residual(self.reference_state)
+
+        # Global norms
+        r_fom_final_norm = np.sqrt(self.comm.allreduce(np.dot(r_fom_final, r_fom_final), op=MPI.SUM))
+        r_fom_ref_norm   = np.sqrt(self.comm.allreduce(np.dot(r_fom_ref,   r_fom_ref),   op=MPI.SUM))
+        ratio_global     = r_fom_final_norm / max(r_fom_ref_norm, 1e-14)
+
+        # Warn if reference residual is near zero
+        if r_fom_ref_norm < 1e-14:
+            self.print0(
+                f"  WARNING: ‖r_fom_ref‖ near zero -- "
+                f"design point may match reference condition"
             )
 
-        # Level 3: mode contributions
-        if verb.get('basis_expensive'):
-            w_final = w_final if w_final is not None else self._reconstruct_fom_state(q)
-            self._print_mode_contributions(q, w_final)
-            self._print_orthogonality_check()
+        self.print0(f"\n{'-'*W}")
+        self.print0(f"  FOM Residuals")
+        self.print0(f"{'-'*W}")
 
-        self.print0(f"{'-'*W}\n")
-
-
-    # region _print_per_variable_residuals
-    def _print_per_variable_residuals(self, r_fom):
-        # Level 2 output - residuals category
-        r_norm_total  = np.sqrt(self.comm.allreduce(np.dot(r_fom, r_fom), op=MPI.SUM))
-
-        self.print0(f"  {'Variable':<16} {'‖r_var‖':>14}  {'fraction':>10}")
-        self.print0(f"  {'-'*16} {'-'*14}  {'-'*10}")
+        # Per-variable table
+        self.print0(f"\n  {'Variable':<16} {'‖r_ref‖':>14}  {'‖r_final‖':>14}  {'ratio':>10}")
+        self.print0(f"  {'-'*16} {'-'*14}  {'-'*14}  {'-'*10}")
 
         for var_name, indices in self.state_indices.items():
-            r_var       = r_fom[indices]
-            r_var_norm  = np.sqrt(self.comm.allreduce(np.dot(r_var, r_var), op=MPI.SUM))
-            fraction    = r_var_norm / max(r_norm_total, 1e-14)
-            self.print0(f"  {var_name:<16} {r_var_norm:>14.6e}  {fraction:>10.4f}")
+            r_ref_var   = r_fom_ref[indices]
+            r_final_var = r_fom_final[indices]
 
-    
-    # region _print_basis_quality
-    def _print_basis_quality(self, q, w_final, r_fom=None):
-        # Level 2 output - basis quality category
-        r_fom      = r_fom if r_fom is not None else self._eval_fom_residual(w_final)
-        r_fom_norm = np.sqrt(self.comm.allreduce(np.dot(r_fom, r_fom), op=MPI.SUM))
-        r_proj     = self._project_and_reduce(r_fom)
-        r_proj_norm = np.linalg.norm(r_proj)
-        capture    = r_proj_norm / max(r_fom_norm, 1e-14)
+            r_ref_norm   = np.sqrt(self.comm.allreduce(np.dot(r_ref_var,   r_ref_var),   op=MPI.SUM))
+            r_final_norm = np.sqrt(self.comm.allreduce(np.dot(r_final_var, r_final_var), op=MPI.SUM))
+            ratio        = r_final_norm / max(r_ref_norm, 1e-14)
+            flag         = "  **" if ratio > 1.0 else ""
 
-        self.print0(f"  {'-'*66}")
-        self.print0(f"  {'‖r_fom‖ captured by Psi':<32} {capture*100:.1f}%")
-        self.print0(f"  {'‖q‖ (final)':<32} {np.linalg.norm(q):.6e}")
+            self.print0(
+                f"  {var_name:<16} {r_ref_norm:>14.6e}  {r_final_norm:>14.6e}  {ratio:>10.4e}{flag}"
+            )
 
-        if hasattr(self, 'q_max_training') and self.q_max_training is not None:
-            ratio = np.linalg.norm(q) / max(self.q_max_training, 1e-14)
-            self.print0(f"  {'‖q‖/‖q‖_train_max':<32} {ratio:.4f}")
+        self.print0(
+            f"  {'TOTAL':<16} {r_fom_ref_norm:>14.6e}  "
+            f"{r_fom_final_norm:>14.6e}  {ratio_global:>10.4e}"
+        )
+        self.print0(f"{'-'*W}")
 
 
-    # region _print_jacobian_summary
-    def _print_jacobian_summary(self, J_rom, q=None, r_rom=None, r_rom_norm=None, opts=None):
-        # Level 2 output - numerics category.
-        W = 56
-        self.print0(f"  {'-'*W}")
-        self.print0(f"  Jacobian Summary")
-        self.print0(f"  {'-'*W}")
+    # region _print_numerics
+    def _print_numerics(self, q, dq, r_rom, r_rom_norm, opts):
+        """
+        Level 2 numerics. SVD summary of final Jacobian + FD accuracy check.
+        FD accuracy poor => warning only, not a convergence criterion.
+        """
+        W     = 68
+        J_rom = self._cached_J_r
 
-        # --- SVD-based quantities (always computed here) ---
-        svd_vals = np.linalg.svd(J_rom, compute_uv=False)
+        if J_rom is None:
+            self.print0(f"  WARNING: No cached Jacobian available for numerics summary")
+            return
+
+        # SVD
+        svd_vals  = np.linalg.svd(J_rom, compute_uv=False)
         sigma_max = svd_vals[0]
         sigma_min = svd_vals[-1]
         cond      = sigma_max / max(sigma_min, 1e-14)
-        eff_rank  = np.sum(svd_vals > sigma_max * 1e-10)
+        eff_rank  = int(np.sum(svd_vals > sigma_max * 1e-10))
 
+        self.print0(f"\n{'-'*W}")
+        self.print0(f"  Jacobian Summary (final iteration)")
+        self.print0(f"{'-'*W}")
         self.print0(f"  {'cond(J_rom)':<36} {cond:.4e}")
         self.print0(f"  {'sigma_max / sigma_min':<36} {sigma_max:.4e} / {sigma_min:.4e}")
         self.print0(f"  {'effective rank':<36} {eff_rank} / {len(svd_vals)}")
         self.print0(f"  {'‖J_rom‖ (Frobenius)':<36} {np.linalg.norm(J_rom, 'fro'):.4e}")
 
-        # Estimate ‖J_rom^{-1}‖ via smallest singular value
-        J_inv_norm_est = 1.0 / max(sigma_min, 1e-14)
-        self.print0(f"  {'‖J_rom^(-1)‖ (est. via sigma_min)':<36} {J_inv_norm_est:.4e}")
+        # Always print 5 smallest singular values - most diagnostic for ill-conditioning
+        n_small = min(5, len(svd_vals))
+        self.print0(f"  Smallest {n_small} singular values:")
+        for i, v in enumerate(svd_vals[-n_small:][::-1]):
+            self.print0(f"    s_{len(svd_vals)-1-i:02d} = {v:.5e}")
 
-        # Print all singular values if basis is small enough to be readable
-        if len(svd_vals) <= 30:
-            self.print0(f"  Singular values:")
-            for i, v in enumerate(svd_vals):
-                self.print0(f"  s{i:02} = {v:.5e}")
+        # Adjoint check
+        self.print0(f"\n  Quick Consistency Check (should be small values)")
+        self.print0(f"  {'-'*40}")
+        self.print0(f"  {'||J dq + r||':<36} {np.linalg.norm(J_rom.dot(dq) + r_rom):.4e}")
 
-        # --- FD Jacobian accuracy check ---
-        # Perturb q in a random direction, compare predicted vs actual r_rom change
-        # Cost: one _eval_rom_residual call
-        if all(x is not None for x in [q, r_rom, r_rom_norm, opts]):
-            self.print0(f"  {'-'*W}")
-            self.print0(f"  Jacobian FD accuracy check:")
+        u = np.random.randn(J_rom.shape[1])
+        v = np.random.randn(J_rom.shape[0])
+        lhs = v @ (J_rom.dot(u))
+        rhs = u @ (J_rom.T.dot(v))
+        self.print0(f"  {'||lhs - rhs|| / ||rhs||':<36} {abs(lhs - rhs)/abs(rhs)}")
+        self.print0(f"  {'Where':<36}")
+        self.print0(f"  {'    lhs = v^T J u':<36} {lhs}")
+        self.print0(f"  {'    rhs = u^T J^T v':<36} {rhs}")
 
-            rng      = np.random.default_rng(seed=42)    # fixed seed for reproducibility
-            dq_test  = rng.standard_normal(len(q))
-            dq_test /= max(np.linalg.norm(dq_test), 1e-14)
-            eps      = opts.get('jac_fd_step', 1e-6) * max(r_rom_norm, 1.0)
+        # FD accuracy check
+        self.print0(f"\n  FD Accuracy Check")
+        self.print0(f"  {'-'*40}")
 
-            # Predicted change via J_rom
-            dr_pred  = J_rom @ (eps * dq_test)
+        rng      = np.random.default_rng(seed=42)
+        dq_test  = rng.standard_normal(len(q))
+        dq_test /= max(np.linalg.norm(dq_test), 1e-14)
+        eps      = opts.get('jac_fd_step', 1e-6) * max(r_rom_norm, 1.0)
 
-            # Actual change via residual evaluation
-            r_pert   = self._eval_rom_residual(q + eps * dq_test)
-            dr_actual = r_pert - r_rom
+        dr_pred   = J_rom @ (eps * dq_test)
+        r_pert    = self._eval_rom_residual(q + eps * dq_test)
+        dr_actual = r_pert - r_rom
 
-            pred_norm   = np.linalg.norm(dr_pred)
-            actual_norm = np.linalg.norm(dr_actual)
-            abs_err     = np.linalg.norm(dr_pred - dr_actual)
-            rel_err     = abs_err / max(actual_norm, 1e-14)
+        abs_err = np.linalg.norm(dr_pred - dr_actual)
+        rel_err = abs_err / max(np.linalg.norm(dr_actual), 1e-14)
 
-            self.print0(f"  {'‖J dq‖ (predicted)':<36} {pred_norm:.4e}")
-            self.print0(f"  {'‖Δr_rom‖ (actual)':<36} {actual_norm:.4e}")
-            self.print0(f"  {'absolute error':<36} {abs_err:.4e}")
-            self.print0(f"  {'relative error':<36} {rel_err:.4e}")
+        self.print0(f"  {'‖J dq‖ (predicted)':<36} {np.linalg.norm(dr_pred):.4e}")
+        self.print0(f"  {'‖Δr_rom‖ (actual)':<36} {np.linalg.norm(dr_actual):.4e}")
+        self.print0(f"  {'absolute error':<36} {abs_err:.4e}")
+        self.print0(f"  {'relative error':<36} {rel_err:.4e}")
 
-            if rel_err < 1e-2:
-                self.print0(f"  {'Jacobian quality':<36} good")
-            elif rel_err < 1e-1:
-                self.print0(f"  {'Jacobian quality':<36} acceptable")
-            else:
-                self.print0(f"  {'Jacobian quality':<36} poor ⚠  (consider reducing jac_fd_step)")
-        
+        if rel_err < 1e-2:
+            self.print0(f"  {'Jacobian quality':<36} good")
+        elif rel_err < 1e-1:
+            self.print0(f"  {'Jacobian quality':<36} acceptable")
+        else:
+            self.print0(f"  {'Jacobian quality':<36} poor  ** consider reducing jac_fd_step **")
 
-    # region _print_mode_contributions
-    def _print_mode_contributions(self, q, w_final):
-        #Level 3 output - which modes contribute to the residual projection
-        r_fom  = self._eval_fom_residual(w_final)
-        m      = self._m_eff
-        s      = self.scaling
-        Psi    = self.test_basis
+        self.print0(f"{'-'*W}")
 
-        self.print0(f"  {'-'*56}")
-        self.print0(f"  Mode contributions to r_rom:")
-        self.print0(f"  {'Mode':>6}  {'|<Psi_i, r>|':>14}  {'q_i':>12}  {'active':>8}")
-        self.print0(f"  {'-'*6}  {'-'*14}  {'-'*12}  {'-'*8}")
 
-        contribs = []
-        for i in range(self.basis_size):
-            psi_i        = Psi[:, i]                          # i-th test basis vector (S Phi_i)
-            proj_local   = np.dot(psi_i * m, r_fom)
-            proj_global  = np.zeros(1)
-            self.comm.Allreduce(proj_local, proj_global, op=MPI.SUM)
-            contribs.append(abs(proj_global[0]))
+    # region _print_basis_quality
+    def _print_basis_quality(self, opts):
+        """
+        Level 2 basis quality.
+        - cond(G): condition of Gram matrix Psi^T M_eff Psi
+        - Residual capture: fraction of r_fom lying in span(Psi) under M_eff norm
+        - Per-variable reconstruction: actual (using converged q) vs best-fit
+            (independent q_v per variable), plus gap between them
+        Note: projection uses full Gram solve, not assuming Psi is orthonormal.
+        """
+        W       = 68
+        Psi     = self.test_basis
+        m       = self._m_eff
+        Phi     = self.pod_modes
+        S       = self.scaling
+        w_final = self._cached_w
+        q       = self._cached_q
 
-        total = max(sum(contribs), 1e-14)
-        for i, contrib in enumerate(contribs):
-            active = "yes" if abs(q[i]) > 1e-14 else "-"
-            self.print0(
-                f"  {i+1:>6}  {contrib:>14.4e}  {q[i]:>12.4e}  {active:>8}"
-            )
-        self.print0(f"  {'-'*56}")
-
-    
-    # region _print_orthogonality_check
-    def _print_orthogonality_check(self):
-        # Level 3 - verify Phi^T M Phi = I under current inner product
-        Phi = self.pod_modes
-        s   = self.scaling
-        m   = self.weights
-        n   = self.basis_size
-
-        # Build Gram matrix: G_ij = (S Phi_i)^T M (S Phi_j) = local sum, then Allreduce
-        G_local = Phi.T @ (m[:, None] * Phi)  # (n, n)
+        # --- Gram matrix G = Psi^T M_eff Psi ---
+        G_local = Psi.T @ (m[:, None] * Psi)
         G       = np.zeros_like(G_local)
         self.comm.Allreduce(G_local, G, op=MPI.SUM)
 
-        residual     = G - np.eye(n)
-        ortho_error  = np.linalg.norm(residual, 'fro')
-        diag_error   = np.max(np.abs(np.diag(G) - 1.0))
-        offdiag_error = np.max(np.abs(residual - np.diag(np.diag(residual))))
+        cond_G = np.linalg.cond(G)
 
-        self.print0(f"  {'-'*56}")
-        self.print0(f"  M-orthogonality check  (‖Phi^T M Phi - I‖_F):")
-        self.print0(f"  {'‖G - I‖_F':<32} {ortho_error:.4e}")
-        self.print0(f"  {'max diag error':<32} {diag_error:.4e}")
-        self.print0(f"  {'max off-diag error':<32} {offdiag_error:.4e}")
-        self.print0(f"  {'basis orthonormal?':<32} {'yes' if ortho_error < 1e-10 else '**NO**'}")
+        # --- Residual capture ---
+        r_fom  = self._eval_fom_residual(w_final)
+        rhs    = self._project_and_reduce(r_fom)    # Psi^T M_eff r_fom
+        c      = np.linalg.solve(G, rhs)            # (Psi^T M_eff Psi)^{-1} Psi^T M_eff r_fom
+        r_proj = Psi @ c                            # projected residual
+
+        r_orth = r_fom - r_proj
+
+        r_fom_norm_sq  = self.comm.allreduce(np.dot(r_fom,  m * r_fom),  op=MPI.SUM)
+        r_orth_norm_sq = self.comm.allreduce(np.dot(r_orth, m * r_orth), op=MPI.SUM)
+
+        r_fom_M_norm  = np.sqrt(max(r_fom_norm_sq,  0.0))
+        r_orth_M_norm = np.sqrt(max(r_orth_norm_sq, 0.0))
+        capture       = 1.0 - r_orth_M_norm / max(r_fom_M_norm, 1e-14)
+
+        self.print0(f"\n{'-'*W}")
+        self.print0(f"  Basis Quality")
+        self.print0(f"{'-'*W}")
+        self.print0(f"  {'cond(G)  (Psi^T M_eff Psi)':<36} {cond_G:.4e}")
+        self.print0(f"  {'residual capture':<36} {capture*100:.3f}%")
+
+        # --- Per-variable reconstruction table ---
+        self.print0(f"\n  {'Variable':<16} {'e_actual':>12}  {'e_bestfit':>12}  {'gap':>12}")
+        self.print0(f"  {'-'*16} {'-'*12}  {'-'*12}  {'-'*12}")
+
+        w_delta = w_final - self.reference_state
+        SPhi    = S[:, None] * Phi      # S Phi, full field
+
+        for var_name, indices in self.state_indices.items():
+            w_v    = w_delta[indices]
+            SPhi_v = SPhi[indices, :]   # S Phi restricted to variable v
+
+            # Global norm of w_v
+            w_v_norm_sq = self.comm.allreduce(np.dot(w_v, w_v), op=MPI.SUM)
+            w_v_norm    = np.sqrt(max(w_v_norm_sq, 0.0))
+
+            # --- Actual reconstruction error (using converged q) ---
+            w_v_recon_actual = SPhi_v @ q
+            err_actual_sq    = self.comm.allreduce(
+                np.dot(w_v - w_v_recon_actual, w_v - w_v_recon_actual), op=MPI.SUM
+            )
+            e_actual = np.sqrt(max(err_actual_sq, 0.0)) / max(w_v_norm, 1e-14)
+
+            # --- Best-fit reconstruction error (independent q_v per variable) ---
+            G_v_local   = SPhi_v.T @ SPhi_v
+            G_v         = np.zeros_like(G_v_local)
+            self.comm.Allreduce(G_v_local, G_v, op=MPI.SUM)
+
+            rhs_v_local = SPhi_v.T @ w_v
+            rhs_v       = np.zeros_like(rhs_v_local)
+            self.comm.Allreduce(rhs_v_local, rhs_v, op=MPI.SUM)
+
+            q_v          = np.linalg.solve(G_v, rhs_v)
+            w_v_recon_bf = SPhi_v @ q_v
+            err_bf_sq    = self.comm.allreduce(
+                np.dot(w_v - w_v_recon_bf, w_v - w_v_recon_bf), op=MPI.SUM
+            )
+            e_bestfit = np.sqrt(max(err_bf_sq, 0.0)) / max(w_v_norm, 1e-14)
+
+            gap = e_actual - e_bestfit
+
+            self.print0(
+                f"  {var_name:<16} {e_actual:>12.4e}  {e_bestfit:>12.4e}  {gap:>12.4e}"
+            )
+
+        self.print0(f"{'-'*W}")
+
+
+    # region _print_mode_contributions
+    def _print_mode_contributions(self, q, opts):
+        """
+        Level 3 mode contributions.
+        Decoupled residual projection coefficients: c = G^{-1} Psi^T M_eff r_fom
+        Printed alongside converged q_i and ratio |c_i|/|q_i|.
+        Computes r_fom fresh (independent of level 2).
+        """
+        W       = 68
+        Psi     = self.test_basis
+        m       = self._m_eff
+        w_final = self._cached_w
+
+        # Evaluate FOM residual fresh
+        r_fom = self._eval_fom_residual(w_final)
+
+        # Gram matrix
+        G_local = Psi.T @ (m[:, None] * Psi)
+        G       = np.zeros_like(G_local)
+        self.comm.Allreduce(G_local, G, op=MPI.SUM)
+
+        # Decoupled mode contributions: c = G^{-1} Psi^T M_eff r_fom
+        rhs = self._project_and_reduce(r_fom)   # Psi^T M_eff r_fom
+        c   = np.linalg.solve(G, rhs)           # decoupled coefficients
+
+        self.print0(f"\n{'-'*W}")
+        self.print0(f"  Mode Contributions")
+        self.print0(f"{'-'*W}")
+        self.print0(
+            f"  {'Mode':>6}  {'|c_i| (decoupled)':>18}  {'q_i':>12}  {'|c_i|/|q_i|':>14}"
+        )
+        self.print0(
+            f"  {'-'*6}  {'-'*18}  {'-'*12}  {'-'*14}"
+        )
+
+        for i in range(self.basis_size):
+            abs_ci    = abs(c[i])
+            qi        = q[i]
+            abs_qi    = abs(qi)
+            ratio_str = f"{abs_ci/abs_qi:>14.4e}" if abs_qi > 1e-14 else f"{'--':>14}"
+
+            self.print0(
+                f"  {i+1:>6}  {abs_ci:>18.4e}  {qi:>12.4e}  {ratio_str}"
+            )
+
+        self.print0(f"{'-'*W}")
