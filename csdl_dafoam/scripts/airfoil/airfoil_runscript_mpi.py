@@ -361,7 +361,7 @@ with csdl.experimental.mpi.enter_mpi_region(rank, comm) as mpi_region:
     outputDict = dafoam_instance.getOption("function")
     for outputName in outputDict.keys():
         mpi_region.set_as_global_output(getattr(dafoam_function_outputs, outputName))
-    # mpi_region.set_as_global_output(dafoam_function_outputs.drag)
+    # mpi_region.set_as_global_output(dafoam_function_outputs.drag).
 
 
 # region Optimization problem selection
@@ -523,39 +523,10 @@ sim = csdl.experimental.PySimulator(recorder)
 from csdl_dafoam.utils.csdl_test_functions import CustomComponentChecks#, test_jacvec_product, test_idempotence, test_inverse_jacobian
 import matplotlib.pyplot as plt
 
+solver_tester = CustomComponentChecks(dafoam_solver, comm=comm)
+solver_tester.run_inverse_jacobian_fd_sweep(eps_test_values=10. ** np.array(range(-10, -2)), random_scalar=1)
+solver_tester.run_jacvec_fd_sweep(eps_test_values=10. ** np.array(range(-10, -2)))
 
-
-component_testing = CustomComponentChecks(dafoam_solver, comm=comm)
-component_testing.run_inverse_jacobian_fd_sweep(eps_test_values=10. ** np.array(range(-10, -2)), random_scalar=1)
-component_testing.run_jacvec_fd_sweep(eps_test_values=10. ** np.array(range(-10, -2)))
-
-# test_component = dafoam_solver
-
-# # test_idempotence(test_component, inputs)
-# # input('Press ENTER to continue...')
-
-# # test_inverse_jacobian(test_component, inputs, {name: 2*vv for name, vv in v.items()}, eps=1e-4)
-
-
-# eps_test_vals = [1e-3, 1e-4, 1e-5, 1e-6, 1e-7, 1e-8, 1e-9, 1e-10]
-# err = np.zeros_like(eps_test_vals)
-# i = 0
-# for eps in eps_test_vals:
-#     lhs, rhs, err[i] = test_jacvec_product(component=test_component, eps=eps, comm=comm, random_seed=0)
-#     i += 1 
-
-# plt.rcParams['text.usetex'] = True
-# plt.figure()
-# # ax = plt.subplot(2, 1, 1)
-
-# plt.loglog(eps_test_vals, err)
-# plt.title(r'jacvec_product vs FD ($w^T J^T v = v^T J w$)')
-# plt.xlabel(r'Stepsize, $\epsilon$')
-# plt.ylabel(r'Error, $\frac{lhs - rhs}{rhs}$')
-# plt.grid(visible=True)
-# plt.show()
-
-# if rank == 0:
-#     input('Press ENTER to continue...')
-
-# quiet_barrier(comm)
+# # Don't forget to disable_jacvec_normalization for the functions component for the jacvec_test
+# functions_tester = CustomComponentChecks(dafoam_functions, comm=comm)
+# functions_tester.run_jacvec_fd_sweep(eps_test_values=10. ** np.array(range(-10, -2)))

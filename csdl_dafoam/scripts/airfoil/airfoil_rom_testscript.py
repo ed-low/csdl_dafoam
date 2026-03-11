@@ -50,7 +50,7 @@ print_runscript_info()
 # region USER INPUT
 # ===============================
 # Keyword for optimization name (optimization results folder will be saved with this name in dafoam directory)
-problem_name              = 'rom_test'
+problem_name              = 'rom_test2'
 
 # Geometry
 geometry_directory        =  os.path.join(os.getcwd(), 'airfoil_geometry/')
@@ -160,7 +160,7 @@ mesh_options = {
 # region Training data options
 # ===============================
 # Storage options
-dataset_keyword       = 'training_data'
+dataset_keyword       = 'training_data2'
 storage_location      = Path(dafoam_directory)
 
 
@@ -199,6 +199,18 @@ x_surf_hash = comm.bcast(x_surf_hash, root=0)
 geometry_pickle_file_path         = Path(geometry_directory)/geometry_pickle_file_name
 stp_file_path                     = Path(geometry_directory)/stp_file_name
 surface_mesh_projection_file_path = Path(dafoam_directory)/f'projected_surface_mesh_{x_surf_hash}.pickle'
+
+# Manually obtaining the file for now
+# POD Data import
+data_generator = TrainingDataInterface(dafoam_instance=dafoam_instance, 
+                                        storage_location=storage_location, 
+                                        dataset_keyword=dataset_keyword,
+                                        h5_file_base_name="point")
+
+data = data_generator.load_h5(Path(storage_location)/dataset_keyword/"point_0.h5", only_distributed_data=False)
+
+data_generator._leave_one_out_test(Path(storage_location)/dataset_keyword/"point_0.h5", 20, 
+                                   {"inner_product": "reference", "centering": "reference", "scaling": "reference"})
 
 
 # ===============================
@@ -328,8 +340,8 @@ i0, i1          = x_surf_dafoam_initial_indices[rank]
 # Flight condition variables
 flight_conditions_group                 = csdl.VariableGroup()
 flight_conditions_group.mach_number     = csdl.Variable(value=0.7, name="mach_number")
-flight_conditions_group.angle_of_attack_deg = csdl.Variable(value=aoa0, name="angle_of_attack_deg")
-flight_conditions_group.altitude_m      = csdl.Variable(value=1.194e+4, name="altitude (m)")
+flight_conditions_group.angle_of_attack_deg = csdl.Variable(value=data["parameters"]["primary_variables"]["angle_of_attack_deg"], name="angle_of_attack_deg")
+flight_conditions_group.altitude_m      = csdl.Variable(value=data["parameters"]["primary_variables"]["altitude_m"], name="altitude (m)")
 
 # Atmospheric condition variables
 ambient_conditions_group = sam.compute_ambient_conditions_group(flight_conditions_group.altitude_m)
@@ -353,28 +365,24 @@ with csdl.experimental.mpi.enter_mpi_region(rank, comm) as mpi_region:
                                                                 ambient_conditions_group, 
                                                                 flight_conditions_group,
                                                                 x_vol_dafoam)
-    
-    # POD Data import
-    data_generator = TrainingDataInterface(dafoam_instance=dafoam_instance, 
-                                            storage_location=storage_location, 
-                                            dataset_keyword=dataset_keyword,
-                                            h5_file_base_name="point")
-
-    # Manually obtaining the file for now
-    data = data_generator.load_h5(Path(storage_location)/dataset_keyword/"point_0.h5", only_distributed_data=False)
 
     # Assemble POD modes and relevant vectors:
     state_info  = data_generator.state_info # Get our state variable names
-    pod_modes   = np.array(np.concatenate([data["pod"]["modes"][state_var] for state_var in state_info.keys()], axis=0))[:, 0:20]
+    pod_modes   = np.array(np.concatenate([data["pod"]["modes"][state_var] for state_var in state_info.keys()], axis=0))[:, 0:17]
     scaling     = np.array(np.concatenate([data["pod"]["scaling"][state_var] * np.ones((np.size(state_info[state_var]["indices"]),)) for state_var in state_info.keys()]))
     weights     = np.array(np.concatenate([data["pod"]["weights"][state_var] for state_var in state_info.keys()]))
     reference_state = np.array(np.concatenate([data["pod"]["reference_state"][state_var] for state_var in state_info.keys()]))
+
+
 
     residual_scaling_by_state = {}
     rms_values = {}
 
     for state_var, info in state_info.items():
         res = data["samples"]["residuals"][state_var][:, 0]
+
+        if state_var == "T":
+            res /= 1005.
 
         # Correct global RMS
         sum_sq   = comm.allreduce(np.sum(res ** 2), op=MPI.SUM)
@@ -401,6 +409,9 @@ with csdl.experimental.mpi.enter_mpi_region(rank, comm) as mpi_region:
         residual_scaling_by_state[state_var] for state_var in state_info.keys()
     ])
 
+    # residual_scaling = dafoam_instance.getStateWeights()
+    # residual_scaling[state_info["T"]["indices"]] /= 1005.
+
     # DAFoamSolver Implicit component setup and evaluation
     dafoam_rom           = DAFoamROM(dafoam_instance, 
                                      pod_modes=pod_modes, 
@@ -408,10 +419,13 @@ with csdl.experimental.mpi.enter_mpi_region(rank, comm) as mpi_region:
                                      weights=weights, 
                                      scaling=scaling, 
                                      residual_scaling=None,#residual_scaling, 
-                                     rom_type='galerkin',
-                                     jac_mode="analytical",
-                                     exclude_from_projection=None, #["T", "phi", "nuTilda"],
-                                     newton_options={"jac_fd_step": 1e-8, "verbose" : 3})
+                                     rom_type="lspg",
+                                     jac_mode="fd",
+                                     exclude_from_projection=None,#["nuTilda", "phi"], #["T", "phi", "nuTilda"],
+                                     newton_options={"jac_fd_step": 1e-8, "verbose" : 3, "tol_rel": 1e-8, 'ls_freeze_basis': True},
+                                     use_normalized_residuals=True,
+                                     write_residuals_with_solutions=True)
+    
     dafoam_rom_states    = dafoam_rom.evaluate(dafoam_input_variables_group)
 
     # Reconstruct state
@@ -502,8 +516,8 @@ elif optimization_case == 5:
     drag = dafoam_function_outputs.drag
 
     # Design variables
-    percent_change_in_thickness_dof.set_as_design_variable(lower=-10, upper=10, scaler=1./10)
-    normalized_percent_camber_change_dof.set_as_design_variable(lower=-10, upper=10, scaler=1./10)
+    percent_change_in_thickness_dof.set_as_design_variable(lower=-5, upper=5, scaler=1./5) #(lower=-10, upper=10, scaler=1./10)
+    normalized_percent_camber_change_dof.set_as_design_variable(lower=-5, upper=5, scaler=1./5) #(lower=-10, upper=10, scaler=1./10)
 
     # Objectives
     objective_fun = -lift/drag
@@ -529,51 +543,51 @@ sim = csdl.experimental.PySimulator(recorder)
 # ===============================
 # region OPTIMIZER
 # ===============================
-# # Only allow visualization and modopt output files on the root rank
-# visualize_on_this_rank           = True  if rank == 0 and not is_headless() else False
-# turn_off_outputs_on_nonroot_rank = False if rank == 0 else True
-# recording_on_root_rank           = True  if rank == 0 else False
-# rank_outputs                     = ['x'] if rank == 0 else []
+# Only allow visualization and modopt output files on the root rank
+visualize_on_this_rank           = True  if rank == 0 and not is_headless() else False
+turn_off_outputs_on_nonroot_rank = False if rank == 0 else True
+recording_on_root_rank           = True  if rank == 0 else False
+rank_outputs                     = ['x'] if rank == 0 else []
 
-# # Optimization solver setup and run
-# prob                = CSDLAlphaProblem(problem_name=f'{problem_name}', simulator=sim)
-# optimizer_choice    = 3 # Set to 1 for PySLSQP, 2 for OpenSQP, or 3 for InteriorPoint
+# Optimization solver setup and run
+prob                = CSDLAlphaProblem(problem_name=f'{problem_name}', simulator=sim)
+optimizer_choice    = 3 # Set to 1 for PySLSQP, 2 for OpenSQP, or 3 for InteriorPoint
 
-# if optimizer_choice == 1:
-#     # PySLSQP optimizer setup
-#     solver_options = {'maxiter': 20,
-#                     'iprint': 2,
-#                     'readable_outputs': rank_outputs,
-#                     'recording': recording_on_root_rank,
-#                     'turn_off_outputs': turn_off_outputs_on_nonroot_rank}
-#     optimizer   = PySLSQP(prob, solver_options=solver_options)
-#     optimizer.solve()
-#     optimizer.print_results()
+if optimizer_choice == 1:
+    # PySLSQP optimizer setup
+    solver_options = {'maxiter': 20,
+                    'iprint': 2,
+                    'readable_outputs': rank_outputs,
+                    'recording': recording_on_root_rank,
+                    'turn_off_outputs': turn_off_outputs_on_nonroot_rank}
+    optimizer   = PySLSQP(prob, solver_options=solver_options)
+    optimizer.solve()
+    optimizer.print_results()
 
-# elif optimizer_choice == 2:
-#     # OpenSQP optimizer setup
-#     open_sqp_options = {'maxiter': 100,
-#                         'readable_outputs': rank_outputs,
-#                         'recording': recording_on_root_rank,
-#                         'ls_max_step': 1.,
-#                         'turn_off_outputs': turn_off_outputs_on_nonroot_rank,}
-#     optimizer = OpenSQP(prob, **open_sqp_options)
-#     optimizer.solve()
-#     optimizer.print_results()
+elif optimizer_choice == 2:
+    # OpenSQP optimizer setup
+    open_sqp_options = {'maxiter': 100,
+                        'readable_outputs': rank_outputs,
+                        'recording': recording_on_root_rank,
+                        'ls_max_step': 1.,
+                        'turn_off_outputs': turn_off_outputs_on_nonroot_rank,}
+    optimizer = OpenSQP(prob, **open_sqp_options)
+    optimizer.solve()
+    optimizer.print_results()
 
-# elif optimizer_choice == 3:
-#     # InteriorPoint optimizer setup
-#     interior_point_options = {'maxiter': 100,
-#                             'readable_outputs': rank_outputs,
-#                             'recording': recording_on_root_rank,
-#                             'ls_max_step': 1.,
-#                             'turn_off_outputs': turn_off_outputs_on_nonroot_rank}
-#     optimizer   = InteriorPoint(prob, **interior_point_options)
-#     optimizer.solve()
-#     optimizer.print_results()
+elif optimizer_choice == 3:
+    # InteriorPoint optimizer setup
+    interior_point_options = {'maxiter': 100,
+                            'readable_outputs': rank_outputs,
+                            'recording': recording_on_root_rank,
+                            'ls_max_step': 1.,
+                            'turn_off_outputs': turn_off_outputs_on_nonroot_rank}
+    optimizer   = InteriorPoint(prob, **interior_point_options)
+    optimizer.solve()
+    optimizer.print_results()
     
-# else:
-#     print(f'Check optimizer choice. {optimizer_choice} is not an option.')
+else:
+    print(f'Check optimizer choice. {optimizer_choice} is not an option.')
 
 
 
@@ -584,6 +598,6 @@ sim = csdl.experimental.PySimulator(recorder)
 from csdl_dafoam.utils.csdl_test_functions import CustomComponentChecks
 import matplotlib.pyplot as plt
 
-component_testing = CustomComponentChecks(dafoam_rom, comm=comm)
-component_testing.run_inverse_jacobian_fd_sweep(eps_test_values=10. ** np.array(range(-2, -10, -1)))
-component_testing.run_jacvec_fd_sweep(eps_test_values=10. ** np.array(range(-10, -2)))
+# component_testing = CustomComponentChecks(dafoam_rom, comm=comm)
+# component_testing.run_inverse_jacobian_fd_sweep(eps_test_values=10. ** np.array(range(-2, -10, -1)))
+# component_testing.run_jacvec_fd_sweep(eps_test_values=10. ** np.array(range(-10, -2)))

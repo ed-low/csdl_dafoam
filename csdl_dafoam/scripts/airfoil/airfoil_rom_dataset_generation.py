@@ -157,7 +157,7 @@ mesh_options = {
 # region Training options
 # ===============================
 # Storage options
-dataset_keyword       = 'training_data_extremes'
+dataset_keyword       = 'training_data2'
 storage_location      = dafoam_directory
 
 # Sampling options
@@ -361,7 +361,7 @@ grassmann_vars_and_limits = {
     # }, 
     flight_conditions_group.angle_of_attack_deg: {
         'name': 'angle_of_attack_deg',     
-        'range': [0., 10],
+        'range': [0., 5],
     },
     flight_conditions_group.altitude_m: {
         'name': 'altitude_m', 
@@ -372,12 +372,12 @@ grassmann_vars_and_limits = {
 snapshot_vars_and_limits = {
     percent_change_in_thickness_dof: {
         'name': '%_thickness_change',
-        'range': [-50, 20],
+        'range': [-10, 10],
         'ref_value': 0, 
     },
     normalized_percent_camber_change_dof: {
         'name': '%_camber_change',
-        'range': [-50, 50],
+        'range': [-10, 10],
         'ref_value': 0, 
     }
 }
@@ -413,6 +413,8 @@ data_generator = TrainingDataInterface(dafoam_instance=dafoam_instance,
 
 # data = data_generator.read_h5_file(Path(dafoam_directory)/dataset_keyword/"point_0.h5", visualize_data=True)
 # print(data)
+
+print(sim.__dict__)
 
 data_generator.sample_variables()
 data_generator.run_sweep()

@@ -201,6 +201,15 @@ geometry_pickle_file_path         = Path(geometry_directory)/geometry_pickle_fil
 stp_file_path                     = Path(geometry_directory)/stp_file_name
 surface_mesh_projection_file_path = Path(dafoam_directory)/f'projected_surface_mesh_{x_surf_hash}.pickle'
 
+# POD Data import
+data_generator = TrainingDataInterface(dafoam_instance=dafoam_instance, 
+                                        storage_location=storage_location, 
+                                        dataset_keyword=dataset_keyword,
+                                        h5_file_base_name="point")
+
+# Manually obtaining the file for now
+data = data_generator.load_h5(Path(storage_location)/dataset_keyword/"point_0.h5", only_distributed_data=False)
+
 
 # ===============================
 # region CSDL RECORDER
@@ -329,8 +338,8 @@ i0, i1          = x_surf_dafoam_initial_indices[rank]
 # Flight condition variables
 flight_conditions_group                 = csdl.VariableGroup()
 flight_conditions_group.mach_number     = csdl.Variable(value=0.7, name="mach_number")
-flight_conditions_group.angle_of_attack_deg = csdl.Variable(value=aoa0, name="angle_of_attack_deg")
-flight_conditions_group.altitude_m      = csdl.Variable(value=1.194e+4, name="altitude (m)")
+flight_conditions_group.angle_of_attack_deg = csdl.Variable(value=data["parameters"]["primary_variables"]["angle_of_attack_deg"], name="angle_of_attack_deg")
+flight_conditions_group.altitude_m      = csdl.Variable(value=data["parameters"]["primary_variables"]["altitude_m"], name="altitude (m)")
 
 # Atmospheric condition variables
 ambient_conditions_group = sam.compute_ambient_conditions_group(flight_conditions_group.altitude_m)
@@ -355,15 +364,6 @@ with csdl.experimental.mpi.enter_mpi_region(rank, comm) as mpi_region:
                                                                 flight_conditions_group,
                                                                 x_vol_dafoam)
     
-    # POD Data import
-    data_generator = TrainingDataInterface(dafoam_instance=dafoam_instance, 
-                                            storage_location=storage_location, 
-                                            dataset_keyword=dataset_keyword,
-                                            h5_file_base_name="point")
-
-    # Manually obtaining the file for now
-    data = data_generator.load_h5(Path(storage_location)/dataset_keyword/"point_0.h5", only_distributed_data=False)
-
     # Assemble POD modes and relevant vectors:
     state_info  = data_generator.state_info # Get our state variable names
     pod_modes   = np.array(np.concatenate([data["pod"]["modes"][state_var] for state_var in state_info.keys()], axis=0))[:, 0:20]
@@ -403,23 +403,26 @@ with csdl.experimental.mpi.enter_mpi_region(rank, comm) as mpi_region:
                                         ])
     
     # DAFoamSolver Implicit component setup and evaluation
-    dafoam_solver           = DAFoamSolver(dafoam_instance)
-    dafoam_solver_states    = dafoam_solver.evaluate(dafoam_input_variables_group)
-
-    # DAFoamSolver Implicit component setup and evaluation
-    dafoam_rom           = DAFoamROM(dafoam_instance_rom, 
+    dafoam_rom           = DAFoamROM(dafoam_instance, 
                                      pod_modes=pod_modes, 
                                      reference_state=reference_state, 
                                      weights=weights, 
                                      scaling=scaling, 
-                                     residual_scaling=residual_scaling, 
-                                     rom_type='lspg',
-                                     exclude_from_projection=["T", "phi", "nuTilda"],
-                                     newton_options={"jac_fd_step": 1e-8, "verbose" : 3})
+                                     residual_scaling=None,#residual_scaling, 
+                                     rom_type="lspg",
+                                     jac_mode="fd",
+                                     exclude_from_projection=None,#["nuTilda", "phi"], #["T", "phi", "nuTilda"],
+                                     newton_options={"jac_fd_step": 1e-8, "verbose" : 3, "tol_rel": 1e-8, 'ls_freeze_basis': True},
+                                     use_normalized_residuals=True,
+                                     write_residuals_with_solutions=True)
     dafoam_rom_states    = dafoam_rom.evaluate(dafoam_input_variables_group)
 
     # Reconstruct state
     dafoam_state_estimate = reference_state + scaling * (pod_modes @ dafoam_rom_states)
+    
+    # DAFoamSolver Implicit component setup and evaluation
+    dafoam_solver           = DAFoamSolver(dafoam_instance)
+    dafoam_solver_states    = dafoam_solver.evaluate(dafoam_input_variables_group)
 
     # DAFoamFunctions Explicit component setup and evaluation
     dafoam_functions = DAFoamFunctions(dafoam_instance)
@@ -513,11 +516,11 @@ elif optimization_case == 5:
     drag_rom = dafoam_function_rom_outputs.drag
 
     # Design variables
-    percent_change_in_thickness_dof.set_as_design_variable(lower=-10, upper=10, scaler=1./10)
-    normalized_percent_camber_change_dof.set_as_design_variable(lower=-10, upper=10, scaler=1./10)
+    percent_change_in_thickness_dof.set_as_design_variable(lower=-5, upper=5, scaler=1./5) #(lower=-10, upper=10, scaler=1./10)
+    normalized_percent_camber_change_dof.set_as_design_variable(lower=-5, upper=5, scaler=1./5) #(lower=-10, upper=10, scaler=1./10)
 
     # Objectives
-    objective_fun = -0.5 * (lift / drag  + lift_rom / drag_rom)
+    objective_fun = - lift / drag - 0 * lift_rom / drag_rom
     objective_fun.set_as_objective()
 
 
