@@ -72,7 +72,6 @@ class DAFoamSolver(csdl.experimental.CustomImplicitOperation):
         self.disable_successful_primal_state_save = disable_successful_primal_state_save
         if disable_successful_primal_state_save is False or always_use_same_ic:
             self.saved_states = np.copy(dafoam_instance.getStates())
-        self.last_time_converged = True
 
         # Use the same initial condition for all primal solves
         # (May be useful for checking apply_inverse_jacobian)
@@ -121,10 +120,10 @@ class DAFoamSolver(csdl.experimental.CustomImplicitOperation):
         # Revert solver to last successful primal state (to help with convergence on next iteration)
         # (This helps when we had an unconverged run last - placing here instead of at end in unconverged
         #  scenario allows us to still used the unconverged results from the solver if necessary) 
-        if (self.last_time_converged and self.disable_successful_primal_state_save is False) or self.always_use_same_ic:
+        if (self.dafoam_instance.primalFail and self.disable_successful_primal_state_save is False) or self.always_use_same_ic:
             if dafoam_instance.rank == 0:
-                if (self.last_time_converged and self.disable_successful_primal_state_save is False):
-                    print('Initializing DAFoam solver with last saved primal state')  
+                if (self.dafoam_instance.primalFail and self.disable_successful_primal_state_save is False):
+                    print('Initializing DAFoam solver with last saved/successful primal state')  
             dafoam_instance.setStates(np.copy(self.saved_states))
 
         # Run primal
@@ -147,9 +146,6 @@ class DAFoamSolver(csdl.experimental.CustomImplicitOperation):
             # If we didn't converge, send the optimizer a NaN solution
             output_vals['dafoam_solver_states'] = np.full((self.n_local_state_elements, ), np.nan)
 
-            # Save convergence flag
-            self.last_time_converged            = False
-
         # Converged case - return states and update the last successful primal state with current
         else:
             if dafoam_instance.rank == 0:
@@ -161,7 +157,6 @@ class DAFoamSolver(csdl.experimental.CustomImplicitOperation):
 
             if self.disable_successful_primal_state_save is False and self.always_use_same_ic is False:
                 self.saved_states               = np.copy(states)
-            self.last_time_converged            = True
 
         # We also need to just calculate the residual for the AD mode to initialize vars like URes
         # We do not print the residual for AD, though
