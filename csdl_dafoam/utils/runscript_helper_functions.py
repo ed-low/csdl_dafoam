@@ -307,3 +307,19 @@ def print_runscript_info():
         print(f"Warning: Could not read script file at {script_path}")
         print("="*80)
         print()
+
+
+
+# region write_dv_names
+def write_dv_names(filepath, sim):
+    # Quick write of the variable names to file
+    with open(filepath, 'w') as f:
+        f.write(f"{'Name':30s} {'Start':>8s} {'End':>8s}\n")
+        f.write("-"*40 + "\n")
+        dv_num = 0
+        for var, meta in sim.dv_meta.items():
+            name = var.name if var.name is not None else f"DV_{dv_num}"
+            start = meta['l_ind']
+            end = meta['u_ind'] - 1  # convert exclusive -> inclusive
+            f.write(f"{name:30s} {start:8d} {end:8d}\n")
+            dv_num += 1
