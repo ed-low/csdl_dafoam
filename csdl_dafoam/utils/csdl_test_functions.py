@@ -390,7 +390,7 @@ class CustomComponentChecks():
                 rhs += name_dot
 
         # --- Compare ---
-        err = np.abs(lhs - rhs) / (rhs)
+        err = np.abs((lhs - rhs) / (rhs))
 
         self.print0(f"LHS (v^T v): {lhs}")
         self.print0(f"RHS ((J^-T v)^T (J v)): {rhs}")
