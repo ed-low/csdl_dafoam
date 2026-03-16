@@ -421,7 +421,7 @@ with csdl.experimental.mpi.enter_mpi_region(rank, comm) as mpi_region:
     dafoam_state_estimate = reference_state + scaling * (pod_modes @ dafoam_rom_states)
     
     # DAFoamSolver Implicit component setup and evaluation
-    dafoam_solver           = DAFoamSolver(dafoam_instance)
+    dafoam_solver           = DAFoamSolver(dafoam_instance, write_residual_fields=True)
     dafoam_solver_states    = dafoam_solver.evaluate(dafoam_input_variables_group)
 
     # DAFoamFunctions Explicit component setup and evaluation

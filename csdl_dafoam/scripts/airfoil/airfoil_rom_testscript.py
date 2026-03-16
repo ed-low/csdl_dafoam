@@ -209,8 +209,8 @@ data_generator = TrainingDataInterface(dafoam_instance=dafoam_instance,
 
 data = data_generator.load_h5(Path(storage_location)/dataset_keyword/"point_0.h5", only_distributed_data=False)
 
-data_generator._leave_one_out_test(Path(storage_location)/dataset_keyword/"point_0.h5", 20, 
-                                   {"inner_product": "reference", "centering": "reference", "scaling": "reference"})
+# data_generator._leave_one_out_test(Path(storage_location)/dataset_keyword/"point_0.h5", 20, 
+#                                    {"inner_product": "reference", "centering": "reference", "scaling": "reference"})
 
 
 # ===============================
@@ -290,9 +290,9 @@ ffd_block = construct_ffd_block_around_entities(entities=geometry,
 
 # region CSDL Variable declaration
 percent_change_in_thickness          = csdl.Variable(shape=(num_ffd_coefficients_chordwise, num_ffd_sections), value=0.) # (5,2)
-percent_change_in_thickness_dof      = csdl.Variable(shape=(num_ffd_coefficients_chordwise-2,), value=np.array([0,0,0])) 
+percent_change_in_thickness_dof      = csdl.Variable(shape=(num_ffd_coefficients_chordwise-2,), value=5*np.array([0, 0, 0]), name="normalized_thickness_dof") 
 normalized_percent_camber_change     = csdl.Variable(shape=(num_ffd_coefficients_chordwise, num_ffd_sections),  value=0.)
-normalized_percent_camber_change_dof = csdl.Variable(shape=(num_ffd_coefficients_chordwise-2,), value=np.array([0,0,0]))
+normalized_percent_camber_change_dof = csdl.Variable(shape=(num_ffd_coefficients_chordwise-2,), value=5*np.array([0, 0, 0]), name="normalized_camber_dof")
 
 # ffd_block.plot()
 ffd_sectional_parameterization = VolumeSectionalParameterization(
@@ -368,7 +368,7 @@ with csdl.experimental.mpi.enter_mpi_region(rank, comm) as mpi_region:
 
     # Assemble POD modes and relevant vectors:
     state_info  = data_generator.state_info # Get our state variable names
-    pod_modes   = np.array(np.concatenate([data["pod"]["modes"][state_var] for state_var in state_info.keys()], axis=0))[:, 0:17]
+    pod_modes   = np.array(np.concatenate([data["pod"]["modes"][state_var] for state_var in state_info.keys()], axis=0))[:, 0:20]
     scaling     = np.array(np.concatenate([data["pod"]["scaling"][state_var] * np.ones((np.size(state_info[state_var]["indices"]),)) for state_var in state_info.keys()]))
     weights     = np.array(np.concatenate([data["pod"]["weights"][state_var] for state_var in state_info.keys()]))
     reference_state = np.array(np.concatenate([data["pod"]["reference_state"][state_var] for state_var in state_info.keys()]))
@@ -409,8 +409,8 @@ with csdl.experimental.mpi.enter_mpi_region(rank, comm) as mpi_region:
         residual_scaling_by_state[state_var] for state_var in state_info.keys()
     ])
 
-    # residual_scaling = dafoam_instance.getStateWeights()
-    # residual_scaling[state_info["T"]["indices"]] /= 1005.
+    residual_scaling = dafoam_instance.getStateWeights()
+    residual_scaling[state_info["T"]["indices"]] /= 1005.
 
     # DAFoamSolver Implicit component setup and evaluation
     dafoam_rom           = DAFoamROM(dafoam_instance, 
@@ -422,7 +422,7 @@ with csdl.experimental.mpi.enter_mpi_region(rank, comm) as mpi_region:
                                      rom_type="lspg",
                                      jac_mode="fd",
                                      exclude_from_projection=None,#["nuTilda", "phi"], #["T", "phi", "nuTilda"],
-                                     newton_options={"jac_fd_step": 1e-8, "verbose" : 3, "tol_rel": 1e-8, 'ls_freeze_basis': True},
+                                     newton_options={"jac_fd_step": 1e-8, "jac_fd_central": True, "verbose" : 3, "tol_rel": 1e-10, 'ls_freeze_basis': True},
                                      use_normalized_residuals=True,
                                      write_residuals_with_solutions=True)
     
@@ -537,6 +537,8 @@ recorder.stop()
 # ===============================
 sim = csdl.experimental.PySimulator(recorder)
 
+# Quick write of the variable names to file
+write_dv_names(f"{problem_name}_outputs/design_variable_map.txt", sim)
 
 
 
@@ -551,6 +553,7 @@ rank_outputs                     = ['x'] if rank == 0 else []
 
 # Optimization solver setup and run
 prob                = CSDLAlphaProblem(problem_name=f'{problem_name}', simulator=sim)
+
 optimizer_choice    = 3 # Set to 1 for PySLSQP, 2 for OpenSQP, or 3 for InteriorPoint
 
 if optimizer_choice == 1:
@@ -590,13 +593,16 @@ else:
     print(f'Check optimizer choice. {optimizer_choice} is not an option.')
 
 
+return_derivs = sim.compute_totals(ofs=[objective_fun], wrts=[dafoam_rom_states])
+print(return_derivs)
 
 
-# ===============================
-# region COMPONENT TESTS
-# ===============================
-from csdl_dafoam.utils.csdl_test_functions import CustomComponentChecks
-import matplotlib.pyplot as plt
+
+# # ===============================
+# # region COMPONENT TESTS
+# # ===============================
+# from csdl_dafoam.utils.csdl_test_functions import CustomComponentChecks
+# import matplotlib.pyplot as plt
 
 # component_testing = CustomComponentChecks(dafoam_rom, comm=comm)
 # component_testing.run_inverse_jacobian_fd_sweep(eps_test_values=10. ** np.array(range(-2, -10, -1)))
