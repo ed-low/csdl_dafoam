@@ -69,6 +69,7 @@ In summary:
 #                         'ls_maxiter':       10,       # max line search iterations
 #                         'ls_freeze_basis':  True,     # Whether or not to freeze the trial basis for the line search (disabling will increase cost)
 #                         'jac_fd_step':      1e-6,     # FD step for Jacobian
+#                         'jac_fd_central':   False.    # Use central differencing for the jacobian finite difference computation
 #                         'update_test_basis_every': 1, # how often to recompute Psi (every n iters)
 #                         'min_newton_steps:  1,        # force the newton solver to take this many steps, even if initially converged
 #                         'verbose': {
@@ -201,7 +202,7 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
             self._m_eff = self.weights / (self.residual_scaling ** 2)    # R^{-1} M R^{-1}
 
         # Check orthogonaliy (only once if constant basis)
-        if self.pod_modes_is_csdl_var or self.checked_basis_orthogonality:
+        if self.pod_modes_is_csdl_var or not self.checked_basis_orthogonality:
             self._check_basis_orthogonality()
             self.checked_basis_orthogonality = True
 
@@ -261,15 +262,24 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
         else:
             raise ValueError(f'"{mode}" not recognized. Only support "fwd" and "rev" modes')
         
-        # Write state to file
-        leading_integer = 1
-        self.dafoam_instance.solver.writeAdjointFields("", leading_integer + (self.solution_iter + 1) / 10000, self._cached_w, True)
+        # Write state to file 
+        # Need to convert to the writing format. Will match DAFoam style, except use a different leading value
+        # Eg, DAFoam writes to 0.0001, 0.0002, etc
+        # Change the leading integer to 1 to write to 1.0001, 1.0002, etc
+        leading_integer         = 1
+        solution_write_number   = leading_integer + (self.solution_iter + 1) / 10000
+        self.print0(f"Writing solution to {solution_write_number}.")
+
+        # Write the state
+        self.dafoam_instance.solver.writeAdjointFields("", solution_write_number, self._cached_w, True)
         if self.write_residuals_with_solutions:
             current_residual = self._eval_fom_residual(self._cached_w)
-            self.dafoam_instance.solver.writeAdjointFields("res_", leading_integer + (self.solution_iter + 1) / 10000, current_residual, True)
+            self.dafoam_instance.solver.writeAdjointFields("res_", solution_write_number, current_residual, True)
+
+        # Write the mesh
         mesh = np.zeros_like(self.dafoam_instance.xv.flatten())
         self.dafoam_instance.solver.getOFMeshPoints(mesh)
-        self.dafoam_instance.solver.writeMeshPoints(mesh, leading_integer + (self.solution_iter + 1) / 10000)
+        self.dafoam_instance.solver.writeMeshPoints(mesh, solution_write_number)
         self.solution_iter += 1
 
 
@@ -315,7 +325,6 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
             # Maybe add some logic to make this more robust for the case that this is not true?
             if not self.use_normalized_residuals:
                 res_scale_factors = dafoam_instance.getStateWeights()
-                res_scale_factors[self.state_indices["T"]] /= 1005.
                 seed_norm *= res_scale_factors
 
             # FOM inputs: mesh, flow DVs
@@ -452,12 +461,13 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
                             self.print0(f"Netwon converged (step tolerance {np.linalg.norm(dq) * alpha / max(np.linalg.norm(q), 1e-14)} < {opts.get('tol_step_rel', 1e-8)})...")
                     
                     # Update the reduced jacobian to latest state
+                    w     = self._reconstruct_fom_state(q)
+                    self._update_test_basis(fom_state=w, step=jac_fd_step)
                     J_rom = self._compute_rom_jacobian(fom_state=w, step=jac_fd_step)
                         
                     reason = 1 if ls_success else 2
                     break
                 
-
             # Compute ROM Jacobian (only rebuild on successful steps)
             w = self._reconstruct_fom_state(q)
             if ls_success:  # ls_success from previous iteration
@@ -488,8 +498,8 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
             reason = -2
 
         # Cache and return
-        self._cached_q   = q
-        self._cached_w   = self._reconstruct_fom_state(q)
+        self._cached_q   = self._cached_q if any(np.isnan(q)) else q
+        self._cached_w   = self._reconstruct_fom_state(self._cached_q)
         self._cached_J_r = J_rom
 
         # if verb["footer"]:
@@ -552,7 +562,6 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
         # Maybe add some logic to make this more robust for the case that this is not true?
         if not self.use_normalized_residuals:
             res_scale_factors = dafoam_instance.getStateWeights()
-            # res_scale_factors[self.state_indices["T"]] /= 1005.
             residuals         = residuals * res_scale_factors
 
         return residuals
@@ -608,28 +617,31 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
     def _jac_vec_product(self, fom_state, direction, fom_residual=None, step=1e-6, reset_state=True):
         w = fom_state
         v = direction
-        
+
         # Scale h relative to the direction magnitude to avoid truncation/cancellation
-        # TODO: Maybe make the 
         v_norm_local  = np.dot(v, v)
         v_norm_global = np.zeros(1)
         self.comm.Allreduce(v_norm_local, v_norm_global, op=MPI.SUM)
         v_norm = np.sqrt(v_norm_global[0])
 
-        h = step * v_norm if v_norm > 0 else step
+        w_norm = np.sqrt(self.comm.allreduce(np.dot(w, w), op=MPI.SUM))
+        h = step * (1.0 + w_norm) / v_norm if v_norm > 0 else step
 
-        # h = step
-    
-        # Use directional derivative fd approximation
-        r0      = self._eval_fom_residual(fom_state=w) if fom_residual is None else fom_residual
-        r_pert  = self._eval_fom_residual(fom_state=w + h * v)
+        if self.newton_options["jac_fd_central"]:
+            # Central difference: O(h^2) accuracy, 2 residual evals, fom_residual unused
+            r_fwd = self._eval_fom_residual(fom_state=w + h * v)
+            r_bwd = self._eval_fom_residual(fom_state=w - h * v)
+            result = (r_fwd - r_bwd) / (2 * h)
+        else:
+            # Forward difference: O(h) accuracy, 1 residual eval (+ r0 if not cached)
+            r0     = self._eval_fom_residual(fom_state=w) if fom_residual is None else fom_residual
+            r_fwd  = self._eval_fom_residual(fom_state=w + h * v)
+            result = (r_fwd - r0) / h
 
-        # Return the dafoam states back to original state
-        # We'd set this to false in the case of using _jac_mad_product
         if reset_state:
             self.dafoam_instance.setStates(w)
 
-        return (r_pert - r0) / h
+        return result
 
     
     # region _jacT_vec_product
@@ -643,7 +655,13 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
         
         # Prescale (for temperature residual fix)
         if self.apply_temperature_residual_fix:
-            product[self.state_indices["T"]] /= self.temperature_residual_cp_val
+            seed[self.state_indices["T"]] /= self.temperature_residual_cp_val
+
+        # TODO: Assuming that the dafoam_instance always has normalizeResiduals for all states
+        # Maybe add some logic to make this more robust for the case that this is not true?
+        if not self.use_normalized_residuals:
+            res_scale_factors = dafoam_instance.getStateWeights()
+            seed_norm *= res_scale_factors
 
         dafoam_instance.solverAD.calcJacTVecProduct(
             'dafoam_solver_states',
@@ -654,12 +672,6 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
             seed,
             product,
             )
-        
-        # TODO: Assuming that the dafoam_instance always has normalizeResiduals for all states
-        # Maybe add some logic to make this more robust for the case that this is not true?
-        if not self.use_normalized_residuals:
-            res_scale_factors = dafoam_instance.getStateWeights()
-            product *= res_scale_factors
         
         return product / dafoam_instance.getStateScalingFactors()
     
@@ -778,6 +790,7 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
             'ls_maxiter':               10,
             'ls_freeze_basis':          True,
             'jac_fd_step':              1e-6,
+            'jac_fd_central':           False,
             'update_test_basis_every':  1,
             'verbose':                  1,
             'min_newton_steps':         1,
@@ -821,6 +834,7 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
         self.print0(f"  {'tol_rel / tol_abs':<28} "
                     f"{opts['tol_rel']:.1e} / {opts['tol_abs']:.1e}")
         self.print0(f"  {'fd step':<28} {opts['jac_fd_step']:.2e}")
+        self.print0(f"  {'fd type':<28} {'central' if opts['jac_fd_central'] else 'forward'}")
         self.print0(f"  {'‖r_fom‖ (at q=0)':<28} {r_fom_norm_ref:.6e}")
         self.print0(f"  {'‖r_rom‖ (at q=0, normalizer)':<28} {r_rom_norm_ref:.6e}")
         self.print0(f"{'-'*W}")
