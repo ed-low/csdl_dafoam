@@ -46,7 +46,11 @@ def instantiateDAFoam(options, comm, run_directory=None, mesh_options=None):
 
 # region DAFOAMSOLVER
 class DAFoamSolver(csdl.experimental.CustomImplicitOperation):
-    def __init__(self, dafoam_instance, disable_successful_primal_state_save=False, always_use_same_ic=False, disable_inverse_jacobian_normalization=False):
+    def __init__(self, dafoam_instance,
+                 disable_successful_primal_state_save=False, 
+                 always_use_same_ic=False, 
+                 disable_inverse_jacobian_normalization=False,
+                 write_residual_fields=False):
         super().__init__()
 
         self.dafoam_instance    = dafoam_instance
@@ -79,6 +83,9 @@ class DAFoamSolver(csdl.experimental.CustomImplicitOperation):
 
         # Been using this to compare the inverse jacobian to a finite difference using evaluate_residuals
         self.disable_inverse_jacobian_normalization = disable_inverse_jacobian_normalization
+
+        # Hack job to write the residuals whenever the solution is written
+        self.write_residual_fields = write_residual_fields
         
 
     # region evaluate
@@ -233,6 +240,10 @@ class DAFoamSolver(csdl.experimental.CustomImplicitOperation):
                         if dafoam_instance.comm.rank == 0:
                             print("Driver total derivatives for iteration: %d" % self.solution_counter, flush=True)
                             print("---------------------------------------------", flush=True)
+
+                        if self.write_residual_fields:
+                            dafoam_instance.solver.writeAdjointFields("res_", self.solution_counter / 10000, dafoam_instance.getResiduals(), True)
+
                         self.solution_counter += 1
 
                     # compute the preconditioner matrix for the adjoint linear equation solution
