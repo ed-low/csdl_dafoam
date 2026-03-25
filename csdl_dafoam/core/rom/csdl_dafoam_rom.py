@@ -59,6 +59,7 @@ In summary:
 '''
 
 # dafault newton_options = {
+#                         'solver_type':      'newton', # Can be newton or ptc (pseudo-transient continuation)
 #                         'maxiter':          50,       # max Newton iterations
 #                         'tol_rel':          1e-6,     # relative residual tolerance
 #                         'tol_abs':          1e-10,    # absolute residual tolerance
@@ -72,6 +73,8 @@ In summary:
 #                         'jac_fd_central':   False.    # Use central differencing for the jacobian finite difference computation
 #                         'update_test_basis_every': 1, # how often to recompute Psi (every n iters)
 #                         'min_newton_steps:  1,        # force the newton solver to take this many steps, even if initially converged
+#                         'ptc_delta_tau_0':   1e-2,    # initial pseudo-timestep
+#                         'ptc_delta_tau_max': 1e10,    # effectively pure Newton once residual is small
 #                         'verbose': {
 #                                     'level':          1,       # 0=silent, 1=standard, 2=diagnostic, 3=expensive
 #                                     'progress':       True,    # per-iteration table (Level 1)
@@ -424,6 +427,7 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
         J_rom           = None
         reason          = 0 # Will return 1 for successful solution, 2 for success with failed line search, -2 for max iterations
         ls_success      = True  # assume success until line search runs
+        delta_tau       = opts["ptc_delta_tau_0"] # This is used of we are using the pseudo-transient continuation solver
 
         # Setup
         jac_fd_step = opts["jac_fd_step"]
@@ -477,21 +481,32 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
 
             # Linear solve
             try:
-                dq = np.linalg.solve(J_rom, -r_rom)
+                if opts["solver_type"] == "newton":
+                    dq = np.linalg.solve(J_rom, -r_rom)
+                elif opts["solver_type"] == "ptc":
+                    J_ptc = J_rom + (1.0 / delta_tau) * np.eye(len(r_rom))
+                    dq = np.linalg.solve(J_ptc, -r_rom)
+                else:
+                    raise NotImplementedError(f"{opts['solver_type']} not implemented")
             except np.linalg.LinAlgError:
                 self.print0("Warning: ROM Jacobian is singular. Attempting least-squares solve.")
                 dq, _, _, _ = np.linalg.lstsq(J_rom, -r_rom, rcond=None)
 
             # Line search
             alpha, q_trial, r_rom_trial, ls_success = self._line_search(q, dq, r_rom_norm, opts)
+            
+            # Update delta_tau before update (this is really only necessary for the ptc solver)
+            r_rom_norm_trial = np.linalg.norm(r_rom_trial)
+            delta_tau        *= r_rom_norm / r_rom_norm_trial
+            delta_tau        = min(delta_tau, opts["ptc_delta_tau_max"])
 
             # Accept step/minimum step
             q           = q_trial
             r_rom       = r_rom_trial
-            r_rom_norm  = np.linalg.norm(r_rom)
+            r_rom_norm  = r_rom_norm_trial
 
             if verb['progress']:
-                self._print_iteration(k+1, r_rom_norm, r_rom_norm_ref, alpha, dq, q, J_rom, verb, ls_success)
+                self._print_iteration(k+1, r_rom_norm, r_rom_norm_ref, delta_tau, alpha, dq, q, J_rom, verb, ls_success)
 
         else:
             self.print0(f"Warning: Newton solver reached max iterations ({opts['maxiter']}) without converging.")
@@ -780,6 +795,7 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
     # region _init_newton_options
     def _init_newton_options(self, user_options):
         DEFAULT_NEWTON_OPTIONS = {
+            'solver_type':              'newton',
             'maxiter':                  50,
             'tol_rel':                  1e-6,
             'tol_abs':                  1e-10,
@@ -794,6 +810,8 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
             'update_test_basis_every':  1,
             'verbose':                  1,
             'min_newton_steps':         1,
+            'ptc_delta_tau_0':          1e-1,    
+            'ptc_delta_tau_max':        1e10,    
         }
         opts            = {**DEFAULT_NEWTON_OPTIONS, **(user_options or {})}
 
@@ -842,32 +860,34 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
         # Column headers
         self.print0(
             f"  {'Iter':>4}  {'‖r_rom‖':>12}  {'‖r_rom‖/‖r_ref‖':>16}  "
-            f"{'alpha':>8}  {'‖dq‖':>10}  {'‖q‖':>10}"
+            f"{'delta_tau':>16}  {'alpha':>8}  {'‖dq‖':>10}  {'‖q‖':>10}"
             + (f"  {'cond(J)':>10}" if verb.get('numerics') else "")
         )
         self.print0(
-            f"  {'-'*4}  {'-'*12}  {'-'*16}  "
+            f"  {'-'*4}  {'-'*12}  {'-'*16}  {'-'*16}  "
             f"{'-'*8}  {'-'*10}  {'-'*10}"
             + (f"  {'-'*10}" if verb.get('numerics') else "")
         )
         self.print0(
-            f"  {0:>4}  {np.linalg.norm(r_rom_norm_ref):>12.6e}  {1.0:>16.6e}  "
+            f"  {0:>4}  {np.linalg.norm(r_rom_norm_ref):>12.6e}  {1.0:>16.6e}  {'-':>16}  "
             f"{'-':>8}  {'-':>10}  {np.linalg.norm(q0):>10.4e}"
             + (f"  {'-':>10}" if verb.get('numerics') else "")
         )
 
     
     # region _print_iteration
-    def _print_iteration(self, k, r_rom_norm, r_rom_norm_ref, alpha, dq, q, J_rom, verb, ls_success):
+    def _print_iteration(self, k, r_rom_norm, r_rom_norm_ref, delta_tau, alpha, dq, q, J_rom, verb, ls_success):
         ls_flag  = "" if ls_success else " <- Line search failed!"
         cond_str = ""
 
         if verb.get('numerics') and J_rom is not None:
             cond_str = f"  {np.linalg.cond(J_rom):>10.3e}"
 
+
         self.print0(
             f"  {k:>4}  {r_rom_norm:>12.6e}  "
             f"{r_rom_norm/max(r_rom_norm_ref,1e-14):>16.6e}  "
+            f"{delta_tau:>16.6e}  "
             f"{alpha:>8.2e}  {np.linalg.norm(dq):>10.4e}  "
             f"{np.linalg.norm(q):>10.4e}"
             + cond_str
