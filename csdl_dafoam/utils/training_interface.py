@@ -618,7 +618,7 @@ class TrainingDataInterface():
     
 
     # region _compute_pod_modes
-    def _compute_pod_modes(self, h5filepath, inner_product=None, centering='mean', scaling="reference", write_h5=True, new_h5_file=True, new_file_suffix="modes", write_modes_using_write_adjoint_fields=False):
+    def _compute_pod_modes(self, h5filepath, inner_product=None, centering='mean', scaling="reference", write_h5=True, new_h5_file=True, new_file_suffix="modes", write_modes_using_write_adjoint_fields=True):
         
         # Option to pass a dict containing similar data structure as what would be read from the load_h5
         # This is currently an internal option and kind of sketchy - should update to a proper interface
@@ -804,9 +804,22 @@ class TrainingDataInterface():
                 dset[...] = singular_values
 
         if write_modes_using_write_adjoint_fields:
+
             for i in range(singular_values.size):
-                state_vec = np.concatenate([local_modes[state_var][:, i] for state_var in self.state_info.keys()])
-                self.dafoam_instance.solver.writeAdjointFields("pod_mode", i+1, state_vec, True)
+
+                leading_integer         = 2
+                solution_write_number   = leading_integer + (i + 1) / 10000
+
+                # Write the mode
+                self.dafoam_instance.solver.writeAdjointFields("pod_mode_", 
+                                                               solution_write_number, 
+                                                               np.concatenate([local_modes[state_var][:, i] for state_var in self.state_info.keys()], axis=0), 
+                                                               True)
+
+                # Write the mesh
+                mesh = np.zeros_like(self.dafoam_instance.xv.flatten())
+                self.dafoam_instance.solver.getOFMeshPoints(mesh)
+                self.dafoam_instance.solver.writeMeshPoints(mesh, solution_write_number)
 
         return local_modes, reference_state, weights, scaling_values
         
