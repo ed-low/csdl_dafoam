@@ -570,10 +570,8 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
         w = fom_state
         dafoam_instance = self.dafoam_instance
         
-        w_old = dafoam_instance.getStates()
         dafoam_instance.setStates(w)
         residuals = dafoam_instance.getResiduals()
-        dafoam_instance.setStates(w_old)
 
         if self.apply_temperature_residual_fix:
             residuals[self.state_indices["T"]] /= self.temperature_residual_cp_val
