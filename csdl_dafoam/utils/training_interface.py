@@ -729,10 +729,12 @@ class TrainingDataInterface():
                 if "reference_states" in data_dict.keys():
                     reference_states = data_dict["reference_states"]
                     if f'{state_var}' in reference_states:
-                        if state_var != "phi":
-                            scaling_values[state_var] = reference_states[state_var][0]
+                        if state_var == "nuTilda":
+                            scaling_values[state_var] = 1000 * reference_states[state_var][0] # We'll "overscale" nuTilda to reduce its contribution to the POD mode energy
+                        elif state_var == "phi":
+                            scaling_values[state_var] = reference_states["p"][0] / reference_states["T"][0] / 287. * reference_states["U"][0] #data["face_areas"][:, 0] # Use face areas for phi weighting
                         else:
-                            scaling_values[state_var] = 1 #data["face_areas"][:, 0] # Use face areas for phi weighting
+                            scaling_values[state_var] = reference_states[state_var][0]
                     else:
                         raise TypeError(f'Reference value not found for {state_var} in dataset during POD compute setup.')
                 else:
@@ -744,17 +746,13 @@ class TrainingDataInterface():
                     
             else:
                 raise TypeError("Not a valid scaling method. Please supply None, 'reference', or a dict with the proper entries.")
-            
-            # Rescaling data for POD computation
-            # if state_var == "phi":
-            #     data[state_var] = 1/scaling_values[state_var][:, None] * (data[state_var] - reference_state[state_var][:, None])
-            # else:
+
             data_dict["states"][state_var] = 1/scaling_values[state_var] * (data_dict["states"][state_var] - reference_state[state_var][:, None])
-        
+
         # Only need state data and number of samples for POD computation
         data                = data_dict["states"]
 
-        # Number of sample correction
+        # Number of samples correction
         data["num_samples"] = data[next(iter(data))].shape[1] # Get the number of columns of first state entry
 
         # Actual POD computation
