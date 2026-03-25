@@ -367,64 +367,36 @@ with csdl.experimental.mpi.enter_mpi_region(rank, comm) as mpi_region:
                                                                 x_vol_dafoam)
 
     # Assemble POD modes and relevant vectors:
-    state_info  = data_generator.state_info # Get our state variable names
-    pod_modes   = np.array(np.concatenate([data["pod"]["modes"][state_var] for state_var in state_info.keys()], axis=0))[:, 0:20]
-    scaling     = np.array(np.concatenate([data["pod"]["scaling"][state_var] * np.ones((np.size(state_info[state_var]["indices"]),)) for state_var in state_info.keys()]))
-    weights     = np.array(np.concatenate([data["pod"]["weights"][state_var] for state_var in state_info.keys()]))
-    reference_state = np.array(np.concatenate([data["pod"]["reference_state"][state_var] for state_var in state_info.keys()]))
+    state_info      = data_generator.state_info # Get our state variable names
+    pod_modes       = np.array(np.concatenate([data["pod"]["modes"][state_var]              for state_var in state_info.keys()], axis=0))[:, 0:20]
+    scaling         = np.array(np.concatenate([data["pod"]["scaling"][state_var] * np.ones((np.size(info["indices"]), )) for state_var, info in state_info.items()], axis=0))
+    weights         = np.array(np.concatenate([data["pod"]["weights"][state_var]            for state_var in state_info.keys()], axis=0))
+    reference_state = np.array(np.concatenate([data["pod"]["reference_state"][state_var]    for state_var in state_info.keys()], axis=0))
 
-
-
-    residual_scaling_by_state = {}
-    rms_values = {}
-
-    for state_var, info in state_info.items():
-        res = data["samples"]["residuals"][state_var][:, 0]
-
-        if state_var == "T":
-            res /= 1005.
-
-        # Correct global RMS
-        sum_sq   = comm.allreduce(np.sum(res ** 2), op=MPI.SUM)
-        n_global = comm.allreduce(np.size(res),     op=MPI.SUM)
-        rms      = np.sqrt(sum_sq / n_global)
-
-        rms_values[state_var] = rms
-        if rank == 0:
-            print(f"{state_var} rms: {rms}")
-
-    # Apply floor: no variable can be more than floor_factor times smaller than the max
-    global_max   = max(rms_values.values())
-    floor_factor = 1e-1  # tune: keeps m_eff ratio <= 1e4 (or 1e8 for LSPG after squaring)
-    floor        = floor_factor * global_max
-
-    for state_var, info in state_info.items():
-        clipped = max(rms_values[state_var], floor)
-        res     = data["samples"]["residuals"][state_var][:, 0]
-        residual_scaling_by_state[state_var] = np.ones_like(res) * clipped
-        if rank == 0 and clipped != rms_values[state_var]:
-            print(f"  {state_var}: clipped {rms_values[state_var]:.3e} -> {clipped:.3e}")
-
-    residual_scaling = np.concatenate([
-        residual_scaling_by_state[state_var] for state_var in state_info.keys()
-    ])
-
-    residual_scaling = dafoam_instance.getStateWeights()
-    residual_scaling[state_info["T"]["indices"]] /= 1005.
+    residual_scaling = np.ones_like(dafoam_instance.getStateWeights())
+    residual_scaling[state_info["T"]["indices"]] *= 1005
 
     # DAFoamSolver Implicit component setup and evaluation
     dafoam_rom           = DAFoamROM(dafoam_instance, 
                                      pod_modes=pod_modes, 
                                      reference_state=reference_state, 
-                                     weights=weights, 
+                                     weights=weights,
                                      scaling=scaling, 
-                                     residual_scaling=None,#residual_scaling, 
-                                     rom_type="lspg",
-                                     jac_mode="fd",
-                                     exclude_from_projection=None,#["nuTilda", "phi"], #["T", "phi", "nuTilda"],
-                                     newton_options={"jac_fd_step": 1e-8, "jac_fd_central": True, "verbose" : 3, "tol_rel": 1e-10, 'ls_freeze_basis': True},
+                                     residual_scaling=None, #residual_scaling, 
+                                     rom_type="galerkin",
+                                     jac_mode="analytical",
+                                     exclude_from_projection=None, #["nuTilda", "phi"], #["T", "phi", "nuTilda"],
+                                     newton_options={"solver_type": "newton",
+                                                     "jac_fd_step": 1e-8, 
+                                                     "jac_fd_central": True, 
+                                                     "verbose" : 3, 
+                                                     "tol_rel": 1e-8,
+                                                     "tol_step_rel":1e-6, 
+                                                     'ls_freeze_basis': True,
+                                                     'ls_c1':   1e-6,},
                                      use_normalized_residuals=True,
-                                     write_residuals_with_solutions=True)
+                                     write_residuals_with_solutions=True,
+                                     apply_temperature_residual_fix=False)
     
     dafoam_rom_states    = dafoam_rom.evaluate(dafoam_input_variables_group)
 
@@ -542,68 +514,64 @@ write_dv_names(f"{problem_name}_outputs/design_variable_map.txt", sim)
 
 
 
-# ===============================
-# region OPTIMIZER
-# ===============================
-# Only allow visualization and modopt output files on the root rank
-visualize_on_this_rank           = True  if rank == 0 and not is_headless() else False
-turn_off_outputs_on_nonroot_rank = False if rank == 0 else True
-recording_on_root_rank           = True  if rank == 0 else False
-rank_outputs                     = ['x'] if rank == 0 else []
+# # ===============================
+# # region OPTIMIZER
+# # ===============================
+# # Only allow visualization and modopt output files on the root rank
+# visualize_on_this_rank           = True  if rank == 0 and not is_headless() else False
+# turn_off_outputs_on_nonroot_rank = False if rank == 0 else True
+# recording_on_root_rank           = True  if rank == 0 else False
+# rank_outputs                     = ['x'] if rank == 0 else []
 
-# Optimization solver setup and run
-prob                = CSDLAlphaProblem(problem_name=f'{problem_name}', simulator=sim)
+# # Optimization solver setup and run
+# prob                = CSDLAlphaProblem(problem_name=f'{problem_name}', simulator=sim)
 
-optimizer_choice    = 3 # Set to 1 for PySLSQP, 2 for OpenSQP, or 3 for InteriorPoint
+# optimizer_choice    = 3 # Set to 1 for PySLSQP, 2 for OpenSQP, or 3 for InteriorPoint
 
-if optimizer_choice == 1:
-    # PySLSQP optimizer setup
-    solver_options = {'maxiter': 20,
-                    'iprint': 2,
-                    'readable_outputs': rank_outputs,
-                    'recording': recording_on_root_rank,
-                    'turn_off_outputs': turn_off_outputs_on_nonroot_rank}
-    optimizer   = PySLSQP(prob, solver_options=solver_options)
-    optimizer.solve()
-    optimizer.print_results()
+# if optimizer_choice == 1:
+#     # PySLSQP optimizer setup
+#     solver_options = {'maxiter': 20,
+#                     'iprint': 2,
+#                     'readable_outputs': rank_outputs,
+#                     'recording': recording_on_root_rank,
+#                     'turn_off_outputs': turn_off_outputs_on_nonroot_rank}
+#     optimizer   = PySLSQP(prob, solver_options=solver_options)
+#     optimizer.solve()
+#     optimizer.print_results()
 
-elif optimizer_choice == 2:
-    # OpenSQP optimizer setup
-    open_sqp_options = {'maxiter': 100,
-                        'readable_outputs': rank_outputs,
-                        'recording': recording_on_root_rank,
-                        'ls_max_step': 1.,
-                        'turn_off_outputs': turn_off_outputs_on_nonroot_rank,}
-    optimizer = OpenSQP(prob, **open_sqp_options)
-    optimizer.solve()
-    optimizer.print_results()
+# elif optimizer_choice == 2:
+#     # OpenSQP optimizer setup
+#     open_sqp_options = {'maxiter': 100,
+#                         'readable_outputs': rank_outputs,
+#                         'recording': recording_on_root_rank,
+#                         'ls_max_step': 1.,
+#                         'turn_off_outputs': turn_off_outputs_on_nonroot_rank,}
+#     optimizer = OpenSQP(prob, **open_sqp_options)
+#     optimizer.solve()
+#     optimizer.print_results()
 
-elif optimizer_choice == 3:
-    # InteriorPoint optimizer setup
-    interior_point_options = {'maxiter': 100,
-                            'readable_outputs': rank_outputs,
-                            'recording': recording_on_root_rank,
-                            'ls_max_step': 1.,
-                            'turn_off_outputs': turn_off_outputs_on_nonroot_rank}
-    optimizer   = InteriorPoint(prob, **interior_point_options)
-    optimizer.solve()
-    optimizer.print_results()
+# elif optimizer_choice == 3:
+#     # InteriorPoint optimizer setup
+#     interior_point_options = {'maxiter': 100,
+#                             'readable_outputs': rank_outputs,
+#                             'recording': recording_on_root_rank,
+#                             'ls_max_step': 1.,
+#                             'turn_off_outputs': turn_off_outputs_on_nonroot_rank}
+#     optimizer   = InteriorPoint(prob, **interior_point_options)
+#     optimizer.solve()
+#     optimizer.print_results()
     
-else:
-    print(f'Check optimizer choice. {optimizer_choice} is not an option.')
-
-
-return_derivs = sim.compute_totals(ofs=[objective_fun], wrts=[dafoam_rom_states])
-print(return_derivs)
+# else:
+#     print(f'Check optimizer choice. {optimizer_choice} is not an option.')
 
 
 
-# # ===============================
-# # region COMPONENT TESTS
-# # ===============================
-# from csdl_dafoam.utils.csdl_test_functions import CustomComponentChecks
-# import matplotlib.pyplot as plt
+# ===============================
+# region COMPONENT TESTS
+# ===============================
+from csdl_dafoam.utils.csdl_test_functions import CustomComponentChecks
+import matplotlib.pyplot as plt
 
-# component_testing = CustomComponentChecks(dafoam_rom, comm=comm)
-# component_testing.run_inverse_jacobian_fd_sweep(eps_test_values=10. ** np.array(range(-2, -10, -1)))
-# component_testing.run_jacvec_fd_sweep(eps_test_values=10. ** np.array(range(-10, -2)))
+component_testing = CustomComponentChecks(dafoam_rom, comm=comm)
+component_testing.run_inverse_jacobian_fd_sweep(eps_test_values=10. ** np.array(range(-2, -10, -1)))
+component_testing.run_jacvec_fd_sweep(eps_test_values=10. ** np.array(range(-10, -2)))

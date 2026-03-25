@@ -164,7 +164,7 @@ storage_location      = dafoam_directory
 # grassmann_variables indicates the variables which correspond to points on the Grassmann manifold
 # snapshot_variables indicates the variables which correspond to "snapshots" or realizations
 num_grassmann_samples     = 2
-num_snapshot_samples      = 300
+num_snapshot_samples      = 100
 random_state_seed         = 0
 
 
@@ -191,25 +191,25 @@ stp_file_path                     = Path(geometry_directory)/stp_file_name
 
 
 
-# ########################################
-# # Use this to visualize data 
-data_generator = TrainingDataInterface(dafoam_instance=dafoam_instance, 
-                                            storage_location=storage_location, 
-                                            dataset_keyword=dataset_keyword,
-                                            h5_file_base_name="point")
+# # ########################################
+# # # Use this to visualize data 
+# data_generator = TrainingDataInterface(dafoam_instance=dafoam_instance, 
+#                                             storage_location=storage_location, 
+#                                             dataset_keyword=dataset_keyword,
+#                                             h5_file_base_name="point")
 
-data = data_generator.load_h5(Path(storage_location)/dataset_keyword/"point_0.h5", only_distributed_data=False)
-data_generator._visualize_imported_data(data["pod"]["modes"], data["samples"]["mesh"]["centroid_coordinates"][:, 0], center_colormap=True)
+# data = data_generator.load_h5(Path(storage_location)/dataset_keyword/"point_0.h5", only_distributed_data=False)
+# data_generator._visualize_imported_data(data["pod"]["modes"], data["samples"]["mesh"]["centroid_coordinates"][:, 0], center_colormap=True)
 
-import matplotlib.pyplot as plt
-if rank == 0:
-    singular_values = data["pod"]["singular_values"]
-    plt.plot(np.cumsum(singular_values ** 2) / np.sum(singular_values ** 2))
-    plt.axhline(y=0.9999, color='r', linestyle='-')
-    plt.show()
-    input("Press ENTER to continue...")
-quiet_barrier(comm)
-# ########################################
+# import matplotlib.pyplot as plt
+# if rank == 0:
+#     singular_values = data["pod"]["singular_values"]
+#     plt.plot(np.cumsum(singular_values ** 2) / np.sum(singular_values ** 2))
+#     plt.axhline(y=0.9999, color='r', linestyle='-')
+#     plt.show()
+#     input("Press ENTER to continue...")
+# quiet_barrier(comm)
+# # ########################################
 
 
 
@@ -414,10 +414,62 @@ data_generator = TrainingDataInterface(dafoam_instance=dafoam_instance,
 # data = data_generator.read_h5_file(Path(dafoam_directory)/dataset_keyword/"point_0.h5", visualize_data=True)
 # print(data)
 
-print(sim.__dict__)
+# data_generator.sample_variables()
+# data_generator.run_sweep(pod_options={"write_modes_using_write_adjoint_fields":False})
 
-data_generator.sample_variables()
-data_generator.run_sweep()
+local_mode_computed, reference_state, weights_computed, scaling_values = data_generator._compute_pod_modes(Path(dafoam_directory)/dataset_keyword/"point_0.h5", 
+                                  inner_product="reference", 
+                                  centering='reference', 
+                                  scaling="reference", 
+                                  write_h5=True, 
+                                  new_h5_file=False, 
+                                  new_file_suffix="modes", 
+                                  write_modes_using_write_adjoint_fields=False)
+
+data = data_generator.load_h5(Path(storage_location)/dataset_keyword/"point_0.h5", only_distributed_data=False)
+
+local_mode_read = data["pod"]["modes"]
+
+weights_read = data["pod"]["weights"]
+
+
+indices      = np.concatenate(comm.allgather(data_generator.face_global_indices), axis=0)
+mode_compute = np.concatenate(comm.allgather(local_mode_computed["phi"][:, 0]), axis=0)
+mode_read    = np.concatenate(comm.allgather(local_mode_read["phi"][:, 0]), axis=0)
+
+indices_abs = np.abs(indices) - 1
+indices_neg = indices < 0
+sign_mask   = np.ones_like(indices_abs)
+sign_mask[indices_neg] = -1
+
+import matplotlib.pyplot as plt
+
+if rank == 0:
+    plt.scatter(indices_abs, mode_compute, label='Computed, abs')
+    plt.scatter(indices_abs[indices_neg], mode_compute[indices_neg], marker='x', label='Computed, negated boundaries')
+    plt.scatter(indices_abs, mode_read, marker='+', label='Read, abs')
+    plt.scatter(indices_abs[indices_neg], mode_read[indices_neg], marker='x', label='Read, negated boundaries')
+    plt.legend()
+    plt.ylabel("phi")
+    
+    plt.figure()
+    plt.scatter(range(mode_compute.size), mode_compute, marker='x', label='compute')
+    plt.scatter(range(mode_read.size), mode_read, marker='+', label='read')
+    
+    diff_greater_than_tol = np.abs(mode_compute - mode_read) > 1e-12
+
+    plt.scatter(np.where(diff_greater_than_tol), mode_compute[diff_greater_than_tol], marker='.', label='marked errors')
+    plt.legend()
+
+    
+
+    plt.figure()
+    plt.scatter(range(mode_read[indices_neg].size), mode_compute[indices_neg]/mode_read[indices_neg])
+
+    plt.show()
+quiet_barrier(comm)
+
+
 
 # h5file = "/media/edward/DATA/Edward/AFRL_project/csdl_dafoam_workspace/airfoil_case/results/training_test/airfoil_training/point_0.h5"
 # data_generator._compute_pod_modes(h5filepath=h5file, inner_product="reference", centering='reference', scaling="reference", new_file=True)
