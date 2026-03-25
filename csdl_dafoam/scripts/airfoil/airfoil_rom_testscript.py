@@ -382,21 +382,7 @@ with csdl.experimental.mpi.enter_mpi_region(rank, comm) as mpi_region:
                                      reference_state=reference_state, 
                                      weights=weights,
                                      scaling=scaling, 
-                                     residual_scaling=None, #residual_scaling, 
-                                     rom_type="galerkin",
-                                     jac_mode="analytical",
-                                     exclude_from_projection=None, #["nuTilda", "phi"], #["T", "phi", "nuTilda"],
-                                     newton_options={"solver_type": "newton",
-                                                     "jac_fd_step": 1e-8, 
-                                                     "jac_fd_central": True, 
-                                                     "verbose" : 3, 
-                                                     "tol_rel": 1e-8,
-                                                     "tol_step_rel":1e-6, 
-                                                     'ls_freeze_basis': True,
-                                                     'ls_c1':   1e-6,},
-                                     use_normalized_residuals=True,
-                                     write_residuals_with_solutions=True,
-                                     apply_temperature_residual_fix=False)
+                                     rom_type="lspg")
     
     dafoam_rom_states    = dafoam_rom.evaluate(dafoam_input_variables_group)
 
