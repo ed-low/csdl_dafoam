@@ -206,8 +206,13 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
 
         # Check orthogonaliy (only once if constant basis)
         if self.pod_modes_is_csdl_var or not self.checked_basis_orthogonality:
-            self._check_basis_orthogonality()
+            test_passed = self._check_basis_orthogonality()
+            ### DEBUG ###
+            self.print_mode_energy_breakdown()
+            self.print_scaling_breakdown()
+            ###
             self.checked_basis_orthogonality = True
+            self.orthogonality_check_passed  = test_passed
 
         # Zero out excluded variables in m_eff (e.g. T for incompressible SA)
         if self.exclude_from_projection:
@@ -849,6 +854,7 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
             f"n_modes: {self.basis_size}]"
         )
         self.print0(f"{'-'*W}")
+        self.print0(f"  {'Basis orthogonality check':<28} {'Pass' if self.orthogonality_check_passed else '***** FAILED *****'}")
         self.print0(f"  {'tol_rel / tol_abs':<28} "
                     f"{opts['tol_rel']:.1e} / {opts['tol_abs']:.1e}")
         self.print0(f"  {'fd step':<28} {opts['jac_fd_step']:.2e}")
@@ -908,22 +914,32 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
 
         # Gram matrix: G_ij = Phi_i^T M Phi_j
         G_local = Phi.T @ (m[:, None] * Phi)
-        G       = np.zeros_like(G_local)
-        self.comm.Allreduce(G_local, G, op=MPI.SUM)
+        G       = self.comm.allreduce(G_local, op=MPI.SUM)
 
         ortho_error = np.linalg.norm(G - np.eye(n), 'fro')
         tol         = 1e-10
+
+        diag = np.diag(G)
+        self.print0(f"min diag: {diag.min()}")
+        self.print0(f"max diag: {diag.max()}")
+
+        off_diag = G - np.diag(np.diag(G))
+        self.print0(f"max offdiag: {np.max(np.abs(off_diag))}")
 
         if ortho_error < tol:
             self.print0(
                 f"  Basis orthogonality check (‖Phi^T M Phi - I‖_F):  "
                 f"PASS ({ortho_error:.2e})"
             )
+            test_passed = True
         else:
             self.print0(
                 f"  Basis orthogonality check (‖Phi^T M Phi - I‖_F):  "
                 f"WARNING ({ortho_error:.2e}) -- downstream math may be affected"
             )
+            test_passed = False
+
+        return test_passed
 
 
     # region _print_diagnostics
@@ -1040,6 +1056,16 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
         )
         self.print0(f"{'-'*W}")
 
+        ### DEBUG ###
+        r_fom = self._eval_fom_residual(w_final)
+        Psi   = self.test_basis
+        m     = self._m_eff
+        for var, idx in self.state_indices.items():
+            r_var   = r_fom[idx]
+            Psi_var = Psi[idx, :]
+            contrib = np.linalg.norm(Psi_var.T @ (m[idx, None] * r_var[:, None]))
+            self.print0(f"{var}: r_rom contribution = {contrib:.4e}")
+        ### DEBUG ###
 
     # region _print_numerics
     def _print_numerics(self, q, dq, r_rom, r_rom_norm, opts):
@@ -1259,3 +1285,74 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
             )
 
         self.print0(f"{'-'*W}")
+
+    
+    # region print_mode_energy_breakdown
+    def print_mode_energy_breakdown(self):
+        """
+        For each POD mode k, print the fraction of M-weighted energy 
+        contributed by each state variable.
+        
+        phi_k_var = pod_modes[var_idx, k]
+        eps_k_var = (phi_k_var^T M_var phi_k_var) / (phi_k^T M phi_k)
+        
+        Since modes are M-orthonormal, phi_k^T M phi_k = 1 (after Allreduce),
+        so denominator should be ~1 as a sanity check.
+        """
+        pod_modes       = self.pod_modes
+        weights         = self.weights
+        state_indices   = self.state_indices
+        comm            = self.comm
+
+        n_modes = pod_modes.shape[1]
+        
+        self.print0("\n" + "-"*72)
+        self.print0("  POD Mode Energy Breakdown (per-variable fraction of M-weighted energy)")
+        self.print0("-"*72)
+        
+        # Header
+        var_names = list(state_indices.keys())
+        header = f"  {'Mode':>6}" + "".join(f"  {v:>10}" for v in var_names) + f"  {'Total':>10}"
+        self.print0(header)
+        self.print0("  " + "-"*68)
+        
+        for k in range(n_modes):
+            phi_k = pod_modes[:, k]
+            
+            # Total M-weighted norm squared (should be ~1.0 if orthonormal)
+            total_local = np.sum(weights * phi_k**2)
+            total = comm.allreduce(total_local, op=MPI.SUM)
+            
+            fracs = []
+            for var in var_names:
+                idx = state_indices[var]
+                var_local = np.sum(weights[idx] * phi_k[idx]**2)
+                var_total = comm.allreduce(var_local, op=MPI.SUM)
+                fracs.append(var_total / total)
+            
+            row = f"  {k:>6d}" + "".join(f"  {f:>10.4f}" for f in fracs) + f"  {total:>10.4f}"
+            self.print0(row)
+        
+        self.print0("-"*72 + "\n")
+
+
+    # region print_scaling_breakdown
+    def print_scaling_breakdown(self):
+        comm            = self.comm
+        state_indices   = self.state_indices
+        weights         = self.weights
+        scaling         = self.scaling
+        self.print0("\n" + "-"*72)
+        self.print0("  Scaling and Weight Summary per Variable")
+        self.print0("-"*72)
+        self.print0(f"  {'Variable':>10}  {'S min':>12}  {'S max':>12}  {'M min':>12}  {'M max':>12}  {'S^-1 mean':>12}")
+        self.print0("  " + "-"*68)
+        for var, idx in state_indices.items():
+            s_var    = scaling[idx]
+            m_var    = weights[idx]
+            sinv     = 1.0 / s_var
+            n_global = comm.allreduce(s_var.shape[0], op=MPI.SUM) 
+            self.print0(f"  {var:>10}  {comm.allreduce(s_var.min(), op=MPI.MIN):>12.4e}  {comm.allreduce(s_var.min(), op=MPI.MIN):>12.4e}  "
+                f"{comm.allreduce(m_var.min(), op=MPI.MIN):>12.4e}  {comm.allreduce(m_var.max(), op=MPI.MAX):>12.4e}  "
+                f"{comm.allreduce(np.sum(sinv), op=MPI.SUM) / n_global :>12.4e}")
+        self.print0("-"*72 + "\n")
