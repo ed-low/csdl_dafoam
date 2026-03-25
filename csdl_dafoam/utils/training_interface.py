@@ -410,8 +410,9 @@ class TrainingDataInterface():
                         continue
 
                     if is_distributed:
-                        addressing_type = item.attrs["addressing_type"]
-                        result[key] = self._read_field_data_from_dataset(item, addressing_type)
+                        addressing_type         = item.attrs["addressing_type"]
+                        apply_sign_convention   = item.attrs.get("apply_sign_convention", True)
+                        result[key] = self._read_field_data_from_dataset(item, addressing_type, apply_sign_convention=apply_sign_convention)
 
                     else:
                         result[key] = item[()]
@@ -783,6 +784,8 @@ class TrainingDataInterface():
                     mode_group.create_dataset(state_var,        (num_rows, num_modes),              dtype="f8")
                     self._write_field_data_to_dataset(mode_group[state_var], local_modes[state_var], state_type)
                     mode_group[state_var].attrs.create("addressing_type", state_type)
+                    if state_type == "scalarSurfaceStates":
+                        mode_group[state_var].attrs.create("apply_sign_convention", True)
 
                     reference_group.create_dataset(state_var,   (num_rows, ),                       dtype="f8")
                     self._write_field_data_to_dataset(reference_group[state_var], reference_state[state_var], state_type)
@@ -792,6 +795,8 @@ class TrainingDataInterface():
                         weights_group.create_dataset(state_var, (num_rows, ),                       dtype="f8")
                         self._write_field_data_to_dataset(weights_group[state_var], weights[state_var], state_type)
                         weights_group[state_var].attrs.create("addressing_type", state_type)
+                        if state_type == "scalarSurfaceStates":
+                            weights_group[state_var].attrs.create("apply_sign_convention", False) # Flag to tell that we want magnitudes when loading face data (no negatives for processor boundaries)
                     
                     if scaling is not None:
                         scaling_group.create_dataset(state_var,     data=scaling_values[state_var], dtype="f8")
@@ -1063,17 +1068,6 @@ class TrainingDataInterface():
         quiet_barrier(self.comm)
 
 
-
-
-
-            
-
-
-
-        
-
-
-
     # region _write_field_data_to_dataset
     def _write_field_data_to_dataset(self, dset, data, field_type, column_idx=None):
 
@@ -1106,7 +1100,9 @@ class TrainingDataInterface():
         
 
     # region _read_field_data_from_dataset
-    def _read_field_data_from_dataset(self, dset, field_type, column_idx=None):
+    def _read_field_data_from_dataset(self, dset, field_type, column_idx=None, apply_sign_convention=True):
+        # apply_sign_convention = true will negate the stored data for the oppositely oriented faces
+        # (This matches DAFoam face area convention for processor boundary faces - set to false for magnitudes instead)
 
         cell_global_indices                     = self.cell_global_indices
         cell_vector_global_indices              = self.cell_vector_global_indices
@@ -1116,7 +1112,7 @@ class TrainingDataInterface():
         negative_indices                            = self.face_global_indices < 0
         positive_face_global_indices_zero_indexed   = (np.abs(face_global_indices) - 1)
         negative_mask                               = np.ones_like(face_global_indices)
-        negative_mask[negative_indices]             = -1
+        negative_mask[negative_indices]             = -1 if apply_sign_convention else 1
 
         positive_face_zero_indexed_ordered_indices = np.argsort(positive_face_global_indices_zero_indexed)
 
@@ -1135,18 +1131,20 @@ class TrainingDataInterface():
                     local_data      = np.zeros((self.num_faces, ))
             else:
                 local_data     = np.zeros((self.num_faces,))
-            
+                dset           = dset[:, column_idx]
+                
             if dset.ndim > 1:
                 dset_sorted                                             = dset[positive_face_global_indices_zero_indexed[positive_face_zero_indexed_ordered_indices], :]
             else:
                 dset_sorted                                             = dset[positive_face_global_indices_zero_indexed[positive_face_zero_indexed_ordered_indices]]
-            negative_mask_sorted                                        = negative_mask[positive_face_zero_indexed_ordered_indices]
+            
+            negative_mask_sorted                                        = negative_mask[positive_face_zero_indexed_ordered_indices] # Recall: Negative mask won't do anything if apply_sign_convention=False
 
             if dset.ndim > 1:
-                local_data_sorted                                           = negative_mask_sorted[:, None] * dset_sorted 
+                local_data_sorted                                           = negative_mask_sorted[:, None] * dset_sorted # Recall: Negative mask won't do anything if apply_sign_convention=False
                 local_data[positive_face_zero_indexed_ordered_indices, :]   = local_data_sorted
             else:
-                local_data_sorted                                           = negative_mask_sorted * dset_sorted 
+                local_data_sorted                                           = negative_mask_sorted * dset_sorted # Recall: Negative mask won't do anything if apply_sign_convention=False
                 local_data[positive_face_zero_indexed_ordered_indices]      = local_data_sorted
 
             data                                                        = local_data
