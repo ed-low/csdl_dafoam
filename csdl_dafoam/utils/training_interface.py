@@ -335,7 +335,7 @@ class TrainingDataInterface():
         dafoam_instance = self.dafoam_instance
         states                                  = dafoam_instance.getStates()
         cell_coords                             = dafoam_instance.getCellCentroids()
-        state_weights                           = dafoam_instance.getStateWeights()
+        state_weights                           = np.abs(dafoam_instance.getStateWeights())
         state_reference_values                  = dafoam_instance.getPatchStateAverages(self.reference_patch) if self.reference_patch is not None else None
 
         if self.store_residuals:
@@ -704,7 +704,7 @@ class TrainingDataInterface():
                     elif state_type == 'volScalarStates' or state_type == "modelStates":
                         weights[state_var] = data_dict["mesh"]['cell_volumes'][:, 0]
                     elif state_type == "surfaceScalarStates":
-                        weights[state_var] = data_dict["mesh"]['face_areas'][:, 0]
+                        weights[state_var] = np.abs(data_dict["mesh"]['face_areas'][:, 0]) # Need to take abs because face areas have direction associated.
                     else:
                         raise TypeError(f"State type of {state_type} not recognized. May need to be implemented?")
                         
