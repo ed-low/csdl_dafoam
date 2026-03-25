@@ -670,7 +670,7 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
         v = vec
         w = fom_state
 
-        seed    = np.ascontiguousarray(v)
+        seed    = np.ascontiguousarray(v.copy())
         product = np.zeros_like(seed)
         
         # Prescale (for temperature residual fix)
@@ -681,7 +681,7 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
         # Maybe add some logic to make this more robust for the case that this is not true?
         if not self.use_normalized_residuals:
             res_scale_factors = dafoam_instance.getStateWeights()
-            seed_norm *= res_scale_factors
+            seed *= res_scale_factors
 
         dafoam_instance.solverAD.calcJacTVecProduct(
             'dafoam_solver_states',
