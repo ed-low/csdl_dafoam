@@ -767,12 +767,12 @@ class TrainingDataInterface():
                 outfilepath = outfilepath.with_name(outfilepath.stem + f'_{new_file_suffix}' + outfilepath.suffix)
             
             with h5py.File(outfilepath, "a", driver="mpio", comm=self.comm) as f:
-                pod_group       = f.create_group("pod")
-                mode_group      = pod_group.create_group("modes")
-                reference_group = pod_group.create_group("reference_state")
+                pod_group       = f.require_group("pod")
+                mode_group      = pod_group.require_group("modes")
+                reference_group = pod_group.require_group("reference_state")
                 if weights is not None:
-                    weights_group   = pod_group.create_group("weights")
-                scaling_group   = pod_group.create_group("scaling")
+                    weights_group   = pod_group.require_group("weights")
+                scaling_group   = pod_group.require_group("scaling")
 
                 for state_var, info in self.state_info.items():
                     state_type  = info["type"]
@@ -781,27 +781,29 @@ class TrainingDataInterface():
                     elif    state_type == "volVectorStates":                                num_rows = 3 * self.num_cells_global
                     elif    state_type == "surfaceScalarStates":                            num_rows = self.num_faces_no_proc_boundaries_global
 
-                    mode_group.create_dataset(state_var,        (num_rows, num_modes),              dtype="f8")
+                    mode_group.require_dataset(state_var,        (num_rows, num_modes),              dtype="f8")
                     self._write_field_data_to_dataset(mode_group[state_var], local_modes[state_var], state_type)
                     mode_group[state_var].attrs.create("addressing_type", state_type)
                     if state_type == "scalarSurfaceStates":
                         mode_group[state_var].attrs.create("apply_sign_convention", True)
 
-                    reference_group.create_dataset(state_var,   (num_rows, ),                       dtype="f8")
+                    reference_group.require_dataset(state_var,   (num_rows, ),                       dtype="f8")
                     self._write_field_data_to_dataset(reference_group[state_var], reference_state[state_var], state_type)
                     reference_group[state_var].attrs.create("addressing_type", state_type)
 
                     if weights is not None:
-                        weights_group.create_dataset(state_var, (num_rows, ),                       dtype="f8")
+                        weights_group.require_dataset(state_var, (num_rows, ),                       dtype="f8")
                         self._write_field_data_to_dataset(weights_group[state_var], weights[state_var], state_type)
                         weights_group[state_var].attrs.create("addressing_type", state_type)
                         if state_type == "scalarSurfaceStates":
                             weights_group[state_var].attrs.create("apply_sign_convention", False) # Flag to tell that we want magnitudes when loading face data (no negatives for processor boundaries)
                     
                     if scaling is not None:
-                        scaling_group.create_dataset(state_var,     data=scaling_values[state_var], dtype="f8")
+                        dset = scaling_group.require_dataset(state_var, shape=scaling_values[state_var].shape, dtype="f8")
+                        dset[...] = scaling_values[state_var]
 
-                pod_group.create_dataset('singular_values',     data=singular_values,               dtype="f8")
+                dset = pod_group.require_dataset('singular_values',     shape=singular_values.shape,               dtype="f8")
+                dset[...] = singular_values
 
         if write_modes_using_write_adjoint_fields:
             for i in range(singular_values.size):
