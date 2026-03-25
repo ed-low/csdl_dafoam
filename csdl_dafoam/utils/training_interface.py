@@ -837,12 +837,6 @@ class TrainingDataInterface():
         comm.Reduce(local_gramian, total_gramian, op=MPI.SUM, root=0)
 
         if rank == 0:
-
-            # # DEBUG
-            # print(f"Total Gramian diagonal: {np.diag(total_gramian)}")
-            # print(f"Total Gramian sum: {np.sum(total_gramian)}")
-            # ########
-
             eigvals, eigvecs = np.linalg.eigh(total_gramian)
 
             # Re-order (largest to smallest).
@@ -886,11 +880,6 @@ class TrainingDataInterface():
         eigvecs = eigvecs_bcast
         s_vals = s_vals_bcast
 
-        # # DEBUG
-        # print(f"Rank {self.rank}: First eigenvector sum = {np.sum(eigvecs[:, 0])}")
-        # print(f"Rank {self.rank}: First eigenvalue = {eigvals[0]}")
-        ###
-
         # Rescale and square root eigenvalues to get singular values.
         if isinstance(local_data, dict):
             local_modes = {}
@@ -898,6 +887,35 @@ class TrainingDataInterface():
                 local_modes[state_var] = local_data[state_var] @ (eigvecs / s_vals)
         else:
             local_modes = local_data @ (eigvecs / s_vals)
+
+        # Orthogonality check: should be I by construction
+        # Uses the same weights as the Gramian, so any violation is numerical, not a mismatch
+        if isinstance(local_data, dict):
+            PhiTMPhi_local = np.zeros((local_modes[next(iter(self.state_info))].shape[1],) * 2)
+            for state_var in self.state_info.keys():
+                Phi_var = local_modes[state_var]
+                if local_weights is None:
+                    PhiTMPhi_local += Phi_var.T @ Phi_var
+                else:
+                    PhiTMPhi_local += Phi_var.T @ (local_weights[state_var][:, None] * Phi_var)
+        else:
+            if local_weights is None:
+                PhiTMPhi_local = local_modes.T @ local_modes
+            else:
+                PhiTMPhi_local = local_modes.T @ (local_weights[:, None] * local_modes)
+
+        PhiTMPhi = np.zeros_like(PhiTMPhi_local)
+        self.comm.Allreduce(PhiTMPhi_local, PhiTMPhi, op=MPI.SUM)
+
+        orth_err = np.linalg.norm(PhiTMPhi - np.eye(PhiTMPhi.shape[0]), ord='fro')
+        tol      = 1e-10 * PhiTMPhi.shape[0]  # scale tolerance with number of modes
+
+        if self.rank == 0:
+            if orth_err > 1e-6:
+                print(f"  POD orthogonality check (internal, same M as Gramian): WARNING ({orth_err:.2e})")
+                print(f"  --> This is a numerical issue in the POD computation itself, not an M mismatch.")
+            else:
+                print(f"  POD orthogonality check (internal, same M as Gramian): PASSED ({orth_err:.2e})")
 
         return local_modes, s_vals
     
