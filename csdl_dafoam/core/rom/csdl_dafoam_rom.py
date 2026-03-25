@@ -458,7 +458,7 @@ class DAFoamROM(csdl.experimental.CustomImplicitOperation):
             residual_converged = r_rom_norm < opts["tol_abs"] or r_rom_norm / r_rom_norm_ref < opts["tol_rel"]
             step_converged     = np.linalg.norm(dq) * alpha / max(np.linalg.norm(q), 1e-14) < opts.get("tol_step_rel", 1e-8)
 
-            if residual_converged or (step_converged and ls_success):
+            if (residual_converged and step_converged) or (step_converged and ls_success):
                 if k >= opts["min_newton_steps"]:
                     if verb['progress']:
                         if residual_converged:
