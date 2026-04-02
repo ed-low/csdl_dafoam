@@ -1,10 +1,133 @@
-import numpy as np
 import csdl_alpha as csdl
-from mpi4py import MPI
+import numpy as np
+from typing import Union
+from dafoam import PYDAFOAM
 
-from csdl_dafoam.core.csdl_dafoam import has_global_nan_or_inf
-from csdl_dafoam.core.rom.rom_solver import ROMSolverBase, NewtonSolver
-from csdl_dafoam.core.rom.rom_projector import ROMProjectorBase, GalerkinProjector, LSPGProjector
+
+
+# region DAFOAMROM
+class DAFoamROM(csdl.CustomImplicitOperation):
+    def __init__(self,
+                 rom_type:        str='lspg',
+                 solver_type:     str='newton',
+                 scaling:         np.ndarray=None,
+                 weights:         np.ndarray=None,
+                 dafoam_instance: PYDAFOAM=None,
+                 basis_size:      int=None
+    ):
+        super().__init__()
+
+        self.rom_type        = rom_type
+        self.solver_type     = solver_type
+        self.scaling         = scaling
+        self.weights         = weights
+        self.dafoam_instance = dafoam_instance
+        self.basis_size      = basis_size
+
+        if rom_type.lower() == "galerkin":
+            self.rom_model = GalerkinModel()
+        elif rom_type.lower() == "lspg":
+            self.rom_model = LSPGModel()
+        else:
+            raise NotImplementedError(f"{rom_type} is not a recognized/implemented ROM model.")
+        
+        if solver_type.lower() == "newton":
+            self.solver = NewtonSolver()
+        elif solver_type.lower() == "ptc":
+            self.solver = PTCSolver()
+        else:
+            raise NotImplementedError(f"{solver_type} is not a recognized/implemented solver.")
+
+
+    # region evaluate
+    def evaluate(
+        self,
+        dafoam_input_variables_group: csdl.VariableGroup,
+        pod_modes:                    Union[csdl.Variable, np.ndarray]=None,
+        reference_state:              Union[csdl.Variable, np.ndarray]=None,
+    ):
+        
+        # DAFoam solver inputs
+        input_dict = self.dafoam_instance.getOption("inputInfo")
+        for name, info in input_dict.items():
+            if "solver" in info["components"]:
+                self.declare_input(name, getattr(dafoam_input_variables_group, name))
+
+        # Handle POD modes as constant or CSDL variable
+        if isinstance(pod_modes, np.ndarray):
+            self.pod_modes = pod_modes
+            self._n_modes  = pod_modes.shape[1]
+        elif isinstance(pod_modes, csdl.Variable):
+            self.declare_input("pod_modes", pod_modes)
+            self._n_modes = pod_modes.value.shape[1]
+        else:
+            raise TypeError("Either pod_modes were not supplied, or they were not a CSDL variable or numpy array")
+        
+        # Handle reference state as constant or CSDL variable
+        if isinstance(reference_state, np.ndarray):
+            self.reference_state = reference_state
+        elif isinstance(reference_state, csdl.Variable):
+            self.declare_input("reference_state", reference_state)
+        else:
+            raise TypeError("Either reference_state were not supplied, or they were not a CSDL variable or numpy array")
+
+        dafoam_rom_states = self.create_output("dafoam_rom_states", (self._n_modes,))
+        return dafoam_rom_states
+    
+
+    # region solve_residual_equations
+    def solve_residual_equations(self, input_vals, output_vals):
+        phi     = input_vals.get("pod_modes",       self.pod_modes)
+        w_ref   = input_vals.get("reference_state", self.reference_state)
+
+        # Update model values (if our basis or reference state are variables)
+        model = self.rom_model
+        model.update_parameters(new_basis=phi, new_fom_reference_state=w_ref)
+
+        # Update DAFoam with current inputs
+        self.dafoam_instance.set_solver_input(input_vals)
+
+        # Initial guess (warm start if previus solution is cached)
+        q0 = getattr(self, "_cached_q", np.zeros(self.basis_size))
+
+        # Solve with solver component
+        q, reason = self.solver.solve(model=model, initial_state=q0)
+
+        # Set solution (to NaN if failed)
+        output_vals["dafoam_rom_states"] = q if reason > 0 else np.full_like(q, np.nan)
+
+
+    # region apply_inverse_jacobian
+    def apply_inverse_jacobian(self, input_vals, output_vals, d_outputs, d_residuals, mode):
+        q = output_vals["dafoam_rom_states"]
+        v = d_outputs["dafoam_rom_states"]
+        d_residuals["dafoam_rom_states"] += self.solver.adjoint_solve(model=self.rom_model, state=q, rhs=v, mode=mode)
+
+    
+    # region compute_jacvec_product
+    def compute_jacvec_product(self, input_vals, output_vals, d_inputs, d_outputs, d_residuals, mode):
+        q   = output_vals["dafoam_rom_states"]
+        lam = d_residuals["dafoam_rom_states"]
+
+        input_sensitivities = self.rom_model.input_jacvec_transpose(state=q, lam=lam, inputs=input_vals, mode=mode)
+
+        for name, value in input_sensitivities.items():
+            if name in d_inputs:
+                d_inputs[name] += value
+
+    
+    # region evaluate_residuals
+    def evaluate_residuals(self, input_vals, output_vals, residual_vals):
+        q = output_vals["dafoam_rom_states"]
+        residual_vals["dafoam_rom_states"] = self.rom_model.evaluate_residuals(state=q)
+
+
+    
+
+
+
+
+
 
 
 """
