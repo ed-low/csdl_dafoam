@@ -29,7 +29,9 @@ from modopt import PySLSQP, OpenSQP, InteriorPoint
 # IDWarp and DAFoam
 from csdl_dafoam.core.csdl_idwarp import DAFoamMeshWarper
 from csdl_dafoam.core.csdl_dafoam import instantiateDAFoam, DAFoamFunctions, DAFoamSolver, compute_dafoam_input_variables
-from csdl_dafoam.core.rom.csdl_dafoam_rom import DAFoamROM
+from csdl_dafoam.core.rom.csdl_rom import CSDLROMWrapper
+from csdl_dafoam.core.rom.rom_models import DAFoamLSPGModel
+from csdl_dafoam.core.rom.rom_solver import NewtonSolver
 from csdl_dafoam.utils.training_interface import TrainingDataInterface
 import csdl_dafoam.utils.standard_atmosphere_model as sam
 from csdl_dafoam.utils.runscript_helper_functions import *
@@ -376,15 +378,17 @@ with csdl.experimental.mpi.enter_mpi_region(rank, comm) as mpi_region:
     residual_scaling = np.ones_like(dafoam_instance.getStateWeights())
     residual_scaling[state_info["T"]["indices"]] *= 1005
 
-    # DAFoamSolver Implicit component setup and evaluation
-    dafoam_rom           = DAFoamROM(dafoam_instance, 
-                                     pod_modes=pod_modes, 
-                                     reference_state=reference_state, 
-                                     weights=weights,
-                                     scaling=scaling, 
-                                     rom_type="lspg")
+    dafoam_lspg_model = DAFoamLSPGModel(dafoam_input_variables_group=dafoam_input_variables_group,
+                                 pod_modes=pod_modes,
+                                 reference_fom_state=reference_state,
+                                 scaling=scaling,
+                                 weights=weights,
+                                 dafoam_instance=dafoam_instance)
     
-    dafoam_rom_states    = dafoam_rom.evaluate(dafoam_input_variables_group)
+    newton_solver = NewtonSolver()
+
+    dafoam_rom = CSDLROMWrapper(model=dafoam_lspg_model, solver=newton_solver)   
+    dafoam_rom_states = dafoam_rom.evaluate()
 
     # Reconstruct state
     dafoam_state_estimate = reference_state + scaling * (pod_modes @ dafoam_rom_states)

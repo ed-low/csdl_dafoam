@@ -1,12 +1,14 @@
 import csdl_alpha as csdl
 import numpy as np
-
+from csdl_dafoam.core.rom.rom_models import BaseModel
+from csdl_dafoam.core.rom.rom_solver import BaseSolver
 
 
 # region CSDLROMWrapper
 class CSDLROMWrapper(csdl.CustomImplicitOperation):
-    def __init__(self, model, solver):
+    def __init__(self, model:BaseModel, solver:BaseSolver):
         super().__init__()
+        solver.model    = model
         self.model      = model
         self.solver     = solver
         self.print_fn   = model.print_fn
@@ -51,7 +53,7 @@ class CSDLROMWrapper(csdl.CustomImplicitOperation):
 
         # Use cached state, otherwise start at zero
         rom_state0 = np.zeros(output_shape) if self._cached_result is None else self._cached_result.rom_state.copy()
-        result     = solver.solve(model=model, initial_state=rom_state0)
+        result     = solver.solve(initial_state=rom_state0)
         rom_state  = result.rom_state #.copy() Might need the copy?
 
         # Set solution (to NaN if failed)
@@ -75,7 +77,7 @@ class CSDLROMWrapper(csdl.CustomImplicitOperation):
         if mode == "fwd":
             raise NotImplementedError("Forward mode not yet implemented for CSDL ROM class.")
         
-        lam = solver.adjoint_solve(model=model, result=self._cached_result, rhs=vec, mode=mode)
+        lam = solver.adjoint_solve(result=self._cached_result, rhs=vec, mode=mode)
 
         d_residuals[output_name] += lam
 

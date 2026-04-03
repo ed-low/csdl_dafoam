@@ -16,7 +16,7 @@ class SolverResult():
     rom_state:          np.ndarray
     rom_residual:       np.ndarray
     converged:          bool
-    reason:             str
+    reason:             list[str]
     rom_jacobian:       np.ndarray=None
     fom_state:          np.ndarray=None
     iterations:         int=None
@@ -27,7 +27,9 @@ class SolverResult():
 
 # region BASESOLVER
 class BaseSolver(ABC):
-    def __init__(self):
+    def __init__(self, model:BaseModel=None, options:dict=None):
+        self.model = model
+        self.opts  = options
         pass
     
     @abstractmethod
@@ -41,12 +43,16 @@ class BaseSolver(ABC):
 
 
 
+
+# region NEWTONSOLVER
 class NewtonSolver(BaseSolver):
     def __init__(self, model:BaseModel, options:dict):
         self.model = model
         self.opts  = options
 
-    def solver(self, initial_state):
+
+    # region solve
+    def solve(self, initial_state:np.ndarray):
         # Get solver options
         opts    = self.opts
         alpha   = opts.get("ls_alpha0", 1.0)
@@ -63,13 +69,20 @@ class NewtonSolver(BaseSolver):
         r_norm0 = np.linalg.norm(r)
         J       = None
 
-        # Extra return info initialization
+        # Extra flags and return info initialization
         history     = []
         converged   = False
         reason      = []
+        ls_success  = True
 
         if r_norm0 == 0.0:
-            return q, {"converged": True, "reason": "initial residual zero"}   ################################CHANGE THIS TO SOLVERRESULT
+            return SolverResult(rom_state=q, 
+                                rom_residual=r, 
+                                converged=True, 
+                                reason=["initial residual zero"], 
+                                rom_jacobian=J,
+                                iterations=0,
+                                history=history)
 
         # Main Newton loop
         for k in range(maxiter):
@@ -100,16 +113,105 @@ class NewtonSolver(BaseSolver):
                                     iterations=k,
                                     history=history)
             
-            # Jacobian computation with FD fallback if Model doesn't support it
+            # Jacobian computation with FD fallback if Model doesn't support direct Jacobian return
             J = self.model.compute_reduced_jacobian(rom_state=q)  
             if J is None:
-                J = self._compute_fd_jacobian(rom_state=q, rom_residual=r)
+                J = self._compute_fd_jacobian(state=q, residual=r)
 
             # Step and linesearch
             try:
                 dq = np.linalg.solve(J, -r)
-            except:
+            except np.linalg.LinAlgError:
                 dq, *_ = np.linalg.lstsq(J, -r, rcond=None)
+
+            alpha, q_trial, r_trial, ls_success = self._line_search(q, dq, r_norm)
+
+            q = q_trial
+            r = r_trial
+            dq_prev = alpha * dq
+
+            history.append(
+                {
+                    "residual_norm": np.linalg.norm(r),
+                    "alpha": alpha,
+                    "line_search_success": ls_success
+               }
+            )
+
+        return SolverResult(rom_state=q, 
+                            rom_residual=r, 
+                            converged=False, 
+                            reason=["maxiter"], 
+                            rom_jacobian=J,
+                            iterations=maxiter,
+                            history=history)
+    
+
+
+    # region adjoint_solve
+    def adjoint_solve(self, result:SolverResult, rhs:np.ndarray, mode:str):
+        J = result.rom_jacobian
+
+        # If we already have the reduced Jacobian in the result, then we can just
+        # solve the linear system
+        if J is not None:
+            return np.linalg.solve(J.T, rhs)
+        
+        # Otherwise, we'll have to get the model compute for us
+        else:
+            raise NotImplementedError
+
+
+    # region _line_search
+    def _line_search(self, state:np.ndarray, step:float, residual_norm:float):
+        q       = state
+        dq      = step
+        r_norm0 = residual_norm
+        opts = self.opts
+        alpha = opts.get("ls_alpha0", 1.0)
+        rho   = opts.get("ls_rho", 0.5)
+        c1    = opts.get("ls_c1", 1e-4)
+        max_ls = opts.get("ls_maxiter", 10)
+
+        for _ in range(max_ls):
+            q_trial = q + alpha * dq
+            r_trial = self.model.evaluate_residuals(rom_state=q_trial)
+            r_trial_norm = np.linalg.norm(r_trial)
+
+            if r_trial_norm <= (1.0 - c1 * alpha) * r_norm0:
+                return alpha, q_trial, r_trial, True
+            
+            alpha *= rho
+
+        return alpha, q_trial, r_trial, False
+    
+
+    # region _compute_fd_jacobian
+    def _compute_fd_jacobian(self, state:np.ndarray, residual:np.ndarray=None):
+        step    = self.opts.get("jac_fd_step",    1e-6)
+        central = self.opts.get("jac_fd_central", True)
+        q  = state
+        r0 = residual
+
+        r0 = self.model.evaluate_residuals(state) if r0 is None else r0
+        m = len(r0)
+        n = len(q)
+        J = np.zeros((m, n))
+
+        for j in range(n):
+            h = step * max(1, np.abs(q[j])) # Scale the stepsize with q when q is large
+            dq = np.zeros_like(q)
+            dq[j] = h
+
+            if central:
+                rp = self.model.evaluate_residuals(q + dq)
+                rm = self.model.evaluate_residuals(q - dq)
+                J[:, j] = (rp - rm) / (2.0 * h)
+            else:
+                rp = self.model.evaluate_residuals(q + dq)
+                J[:, j] = (rp - r0) / h
+
+        return J
 
             
             
