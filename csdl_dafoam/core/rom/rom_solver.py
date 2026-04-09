@@ -27,7 +27,7 @@ class SolverResult():
 
 # region BASESOLVER
 class BaseSolver(ABC):
-    def __init__(self, model:BaseModel=None, options:dict=None):
+    def __init__(self, model:BaseModel=None, options:dict={}):
         self.model = model
         self.opts  = options
         pass
@@ -38,6 +38,8 @@ class BaseSolver(ABC):
 
     @abstractmethod
     def adjoint_solve(self, result, rhs, mode):
+        # Will need to solve J^T x = rhs for x
+        # result variable should contain the latest J (if a direct solve is feasible)
         pass
 
 
@@ -46,13 +48,8 @@ class BaseSolver(ABC):
 
 # region NEWTONSOLVER
 class NewtonSolver(BaseSolver):
-    def __init__(self, model:BaseModel, options:dict):
-        self.model = model
-        self.opts  = options
-
-
     # region solve
-    def solve(self, initial_state:np.ndarray):
+    def solve(self, initial_state:np.ndarray, datum_state:np.ndarray=None):
         # Get solver options
         opts    = self.opts
         alpha   = opts.get("ls_alpha0", 1.0)
@@ -60,13 +57,18 @@ class NewtonSolver(BaseSolver):
         tol_abs = opts.get("tol_abs", 1e-12)
         tol_rel = opts.get("tol_rel", 1e-8)
         tol_step_rel = opts.get("tol_step_rel", 1e-10)
+        tol_step_abs = opts.get("tol_step_abs", 1e-14)
 
-        # Initial value setup
-        q0      = initial_state
+        # Reference value for residual
+        q_ref       = datum_state if datum_state is not None else np.zeros_like(initial_state)
+        r_ref       = self.model.evaluate_residuals(rom_state=q_ref)
+        r_norm_ref  = np.linalg.norm(r_ref)
+
+        # Initial state
         q       = initial_state.copy()
-        dq_prev = np.zeros_like(q)
+        dq_prev = np.full_like(q, np.inf)
         r       = self.model.evaluate_residuals(rom_state=q)
-        r_norm0 = np.linalg.norm(r)
+        r_norm  = np.linalg.norm(r)
         J       = None
 
         # Extra flags and return info initialization
@@ -74,8 +76,11 @@ class NewtonSolver(BaseSolver):
         converged   = False
         reason      = []
         ls_success  = True
+        result      = None
 
-        if r_norm0 == 0.0:
+        self._print_header(residual_norm=r_norm, reference_residual_norm=r_norm_ref, initial_state=q, print_fn=self.model.print_fn)
+
+        if r_norm == 0.0:
             return SolverResult(rom_state=q, 
                                 rom_residual=r, 
                                 converged=True, 
@@ -83,14 +88,15 @@ class NewtonSolver(BaseSolver):
                                 rom_jacobian=J,
                                 iterations=0,
                                 history=history)
+                
 
         # Main Newton loop
         for k in range(maxiter):
             
             # Convergence check
-            r_norm   = np.linalg.norm(r)
-            rel_res  = r_norm / r_norm0
-            step_rel = np.linalg.norm(dq_prev) * alpha / max(np.linalg.norm(q), 1e-14)
+            rel_res  = r_norm / r_norm_ref
+            step_abs = np.linalg.norm(dq_prev)
+            step_rel = step_abs / max(np.linalg.norm(q), 1e-14)
 
             if r_norm < tol_abs and ls_success:
                 converged = True
@@ -104,19 +110,36 @@ class NewtonSolver(BaseSolver):
                 converged = True
                 reason.append(f"relative steps size tolerance {step_rel} < {tol_step_rel}")
 
+            if step_abs < tol_step_abs and ls_success:
+                converged = True
+                reason.append(f"absolute steps size tolerance {step_abs} < {tol_step_abs}")
+
             if converged:
-                return SolverResult(rom_state=q, 
+                J = self.model.compute_reduced_jacobian(rom_state=q)
+                if J is None:
+                    J = self._compute_fd_jacobian(state=q, residual=r)
+                # Bring residual up to date (this is for cases where the residual might depend on the Jacobian - e.g., LSPG)
+                with self.model.freeze_jacobian():
+                    r = self.model.evaluate_residuals(rom_state=q)
+                    
+                result =  SolverResult(rom_state=q, 
                                     rom_residual=r, 
                                     converged=True, 
                                     reason=reason, 
                                     rom_jacobian=J,
                                     iterations=k,
                                     history=history)
+
+                break
             
             # Jacobian computation with FD fallback if Model doesn't support direct Jacobian return
             J = self.model.compute_reduced_jacobian(rom_state=q)  
             if J is None:
                 J = self._compute_fd_jacobian(state=q, residual=r)
+
+            # Bring residual up to date (this is for cases where the residual might depend on the Jacobian - e.g., LSPG)
+            with self.model.freeze_jacobian():
+                r = self.model.evaluate_residuals(rom_state=q)
 
             # Step and linesearch
             try:
@@ -124,11 +147,17 @@ class NewtonSolver(BaseSolver):
             except np.linalg.LinAlgError:
                 dq, *_ = np.linalg.lstsq(J, -r, rcond=None)
 
-            alpha, q_trial, r_trial, ls_success = self._line_search(q, dq, r_norm)
+
+            # Conduct the line search with the frozen Jacobian (again, mainly for LSPG)
+            with self.model.freeze_jacobian():
+                alpha, q_trial, r_trial, ls_success = self._line_search(q, dq, r_norm)
 
             q = q_trial
             r = r_trial
             dq_prev = alpha * dq
+            r_norm  = np.linalg.norm(r)
+
+            self._print_iter(iter=k+1, residual_norm=r_norm, reference_residual_norm=r_norm_ref, alpha=alpha, state=q, state_step=dq_prev, print_fn=self.model.print_fn)
 
             history.append(
                 {
@@ -137,21 +166,26 @@ class NewtonSolver(BaseSolver):
                     "line_search_success": ls_success
                }
             )
+        
 
-        return SolverResult(rom_state=q, 
-                            rom_residual=r, 
-                            converged=False, 
-                            reason=["maxiter"], 
-                            rom_jacobian=J,
-                            iterations=maxiter,
-                            history=history)
+        if result is None:
+            reason = ["maxiter"]
+            result = SolverResult(rom_state=q, 
+                                rom_residual=r, 
+                                converged=False, 
+                                reason=reason, 
+                                rom_jacobian=J,
+                                iterations=maxiter,
+                                history=history)
+            
+        self._print_footer(result=result, print_fn=self.model.print_fn)
+
+        return result
     
-
 
     # region adjoint_solve
     def adjoint_solve(self, result:SolverResult, rhs:np.ndarray, mode:str):
         J = result.rom_jacobian
-
         # If we already have the reduced Jacobian in the result, then we can just
         # solve the linear system
         if J is not None:
@@ -163,7 +197,7 @@ class NewtonSolver(BaseSolver):
 
 
     # region _line_search
-    def _line_search(self, state:np.ndarray, step:float, residual_norm:float):
+    def _line_search(self, state:np.ndarray, step:np.ndarray, residual_norm:float):
         q       = state
         dq      = step
         r_norm0 = residual_norm
@@ -192,7 +226,7 @@ class NewtonSolver(BaseSolver):
         central = self.opts.get("jac_fd_central", True)
         q  = state
         r0 = residual
-
+        
         r0 = self.model.evaluate_residuals(state) if r0 is None else r0
         m = len(r0)
         n = len(q)
@@ -213,6 +247,53 @@ class NewtonSolver(BaseSolver):
 
         return J
 
+
+    # region print_header
+    def _print_header(self, residual_norm, reference_residual_norm, initial_state, print_fn=None):
+        print_fn = print() if print_fn is None else print_fn
+        separator_width = 60
+        separator_str   = "_" * separator_width
+        print_fn(separator_str)
+        print_fn("NEWTON SOLVER")
+
+        # Column headers
+        print_fn(
+            f"  {'Iter':>4}  {'‖r_rom‖':>16}  {'‖r_rom‖/‖r_ref‖':>16}"
+            f"  {'alpha':>16}  {'‖dq‖':>16}  {'‖q‖':>16}"
+           
+        )
+        print_fn(
+            f"  {'-' *4}  {'-'*16}  {'-'*16}"
+            f"  {'-'*16}  {'-'*16}  {'-'*16}"
+        )
+        print_fn(
+            f"  {0:>4}  {(residual_norm):>16.6e}  {residual_norm / reference_residual_norm:>16.6e}"
+            f"  {'-':>16}  {'-':>16}  {np.linalg.norm(initial_state):>16.6e}"
+        )
+
+    
+    # region print_iter
+    def _print_iter(self, iter, residual_norm, reference_residual_norm, alpha, state, state_step, print_fn=None):
+        print_fn = print() if print_fn is None else print_fn
+
+        print_fn(
+            f"  {iter:>4}  {(residual_norm):>16.6e}  {residual_norm / reference_residual_norm:>16.6e}"
+            f"  {alpha:>16.6e}  {np.linalg.norm(state_step):>16.6e}  {np.linalg.norm(state):>16.6e}"
+        )
+
+    
+    # region print_footer
+    def _print_footer(self, result:SolverResult, print_fn=None):
+        print_fn = print() if print_fn is None else print_fn
+        separator_width = 60
+        separator_str   = "_" * separator_width
+        
+        print_fn(f"Converged: {result.converged}")
+        print_fn(f"Reason:    {result.reason}")
+        
+        print_fn(separator_str)
+
+        
             
             
             

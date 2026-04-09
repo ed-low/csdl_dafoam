@@ -30,7 +30,7 @@ from modopt import PySLSQP, OpenSQP, InteriorPoint
 from csdl_dafoam.core.csdl_idwarp import DAFoamMeshWarper
 from csdl_dafoam.core.csdl_dafoam import instantiateDAFoam, DAFoamFunctions, DAFoamSolver, compute_dafoam_input_variables
 from csdl_dafoam.core.rom.csdl_rom import CSDLROMWrapper
-from csdl_dafoam.core.rom.rom_models import DAFoamLSPGModel
+from csdl_dafoam.core.rom.rom_models import DAFoamLSPGModel, DAFoamGalerkinModel
 from csdl_dafoam.core.rom.rom_solver import NewtonSolver
 from csdl_dafoam.utils.training_interface import TrainingDataInterface
 import csdl_dafoam.utils.standard_atmosphere_model as sam
@@ -299,7 +299,7 @@ normalized_percent_camber_change_dof = csdl.Variable(shape=(num_ffd_coefficients
 # ffd_block.plot()
 ffd_sectional_parameterization = VolumeSectionalParameterization(
     name="ffd_sectional_parameterization",
-    parameterized_points=ffd_block.coefficients,    # ffd_block.coefficients.shape = (5, 2, 2, 3)
+    parameterized_points=ffd_block.coefficients, #ffd_block.coefficients.shape = (5, 2, 2, 3)
     principal_parametric_dimension=1,
 )
 
@@ -378,16 +378,28 @@ with csdl.experimental.mpi.enter_mpi_region(rank, comm) as mpi_region:
     residual_scaling = np.ones_like(dafoam_instance.getStateWeights())
     residual_scaling[state_info["T"]["indices"]] *= 1005
 
-    dafoam_lspg_model = DAFoamLSPGModel(dafoam_input_variables_group=dafoam_input_variables_group,
+
+
+    dafoam_rom_model = DAFoamLSPGModel(dafoam_input_variables_group=dafoam_input_variables_group,
                                  pod_modes=pod_modes,
                                  reference_fom_state=reference_state,
                                  scaling=scaling,
-                                 weights=weights,
-                                 dafoam_instance=dafoam_instance)
+                                 weights=1 / residual_scaling ** 2,
+                                 dafoam_instance=dafoam_instance,
+                                 normalize_residuals=False,
+                                 fd_step=1e-6)
     
-    newton_solver = NewtonSolver()
+    # dafoam_rom_model = DAFoamGalerkinModel(dafoam_input_variables_group=dafoam_input_variables_group,
+    #                              pod_modes=pod_modes,
+    #                              reference_fom_state=reference_state,
+    #                              scaling=scaling,
+    #                              weights=weights / residual_scaling,
+    #                              dafoam_instance=dafoam_instance,
+    #                              normalize_residuals=False,
+    #                              fd_step=1e-6,
+    #                              jac_mode="fd")
 
-    dafoam_rom = CSDLROMWrapper(model=dafoam_lspg_model, solver=newton_solver)   
+    dafoam_rom = CSDLROMWrapper(model=dafoam_rom_model, solver=NewtonSolver(options={"tol_rel":1e-9, "tol_step_abs":1e-13}))   
     dafoam_rom_states = dafoam_rom.evaluate()
 
     # Reconstruct state
@@ -504,64 +516,63 @@ write_dv_names(f"{problem_name}_outputs/design_variable_map.txt", sim)
 
 
 
-# # ===============================
-# # region OPTIMIZER
-# # ===============================
-# # Only allow visualization and modopt output files on the root rank
-# visualize_on_this_rank           = True  if rank == 0 and not is_headless() else False
-# turn_off_outputs_on_nonroot_rank = False if rank == 0 else True
-# recording_on_root_rank           = True  if rank == 0 else False
-# rank_outputs                     = ['x'] if rank == 0 else []
+# ===============================
+# region OPTIMIZER
+# ===============================
+# Only allow visualization and modopt output files on the root rank
+visualize_on_this_rank           = True  if rank == 0 and not is_headless() else False
+turn_off_outputs_on_nonroot_rank = False if rank == 0 else True
+recording_on_root_rank           = True  if rank == 0 else False
+rank_outputs                     = ['x'] if rank == 0 else []
 
-# # Optimization solver setup and run
-# prob                = CSDLAlphaProblem(problem_name=f'{problem_name}', simulator=sim)
+# Optimization solver setup and run
+prob                = CSDLAlphaProblem(problem_name=f'{problem_name}', simulator=sim)
 
-# optimizer_choice    = 3 # Set to 1 for PySLSQP, 2 for OpenSQP, or 3 for InteriorPoint
+optimizer_choice    = 3 # Set to 1 for PySLSQP, 2 for OpenSQP, or 3 for InteriorPoint
 
-# if optimizer_choice == 1:
-#     # PySLSQP optimizer setup
-#     solver_options = {'maxiter': 20,
-#                     'iprint': 2,
-#                     'readable_outputs': rank_outputs,
-#                     'recording': recording_on_root_rank,
-#                     'turn_off_outputs': turn_off_outputs_on_nonroot_rank}
-#     optimizer   = PySLSQP(prob, solver_options=solver_options)
-#     optimizer.solve()
-#     optimizer.print_results()
+if optimizer_choice == 1:
+    # PySLSQP optimizer setup
+    solver_options = {'maxiter': 20,
+                    'iprint': 2,
+                    'readable_outputs': rank_outputs,
+                    'recording': recording_on_root_rank,
+                    'turn_off_outputs': turn_off_outputs_on_nonroot_rank}
+    optimizer   = PySLSQP(prob, solver_options=solver_options)
+    optimizer.solve()
+    optimizer.print_results()
 
-# elif optimizer_choice == 2:
-#     # OpenSQP optimizer setup
-#     open_sqp_options = {'maxiter': 100,
-#                         'readable_outputs': rank_outputs,
-#                         'recording': recording_on_root_rank,
-#                         'ls_max_step': 1.,
-#                         'turn_off_outputs': turn_off_outputs_on_nonroot_rank,}
-#     optimizer = OpenSQP(prob, **open_sqp_options)
-#     optimizer.solve()
-#     optimizer.print_results()
+elif optimizer_choice == 2:
+    # OpenSQP optimizer setup
+    open_sqp_options = {'maxiter': 100,
+                        'readable_outputs': rank_outputs,
+                        'recording': recording_on_root_rank,
+                        'ls_max_step': 1.,
+                        'turn_off_outputs': turn_off_outputs_on_nonroot_rank,}
+    optimizer = OpenSQP(prob, **open_sqp_options)
+    optimizer.solve()
+    optimizer.print_results()
 
-# elif optimizer_choice == 3:
-#     # InteriorPoint optimizer setup
-#     interior_point_options = {'maxiter': 100,
-#                             'readable_outputs': rank_outputs,
-#                             'recording': recording_on_root_rank,
-#                             'ls_max_step': 1.,
-#                             'turn_off_outputs': turn_off_outputs_on_nonroot_rank}
-#     optimizer   = InteriorPoint(prob, **interior_point_options)
-#     optimizer.solve()
-#     optimizer.print_results()
+elif optimizer_choice == 3:
+    # InteriorPoint optimizer setup
+    interior_point_options = {'maxiter': 100,
+                            'readable_outputs': rank_outputs,
+                            'recording': recording_on_root_rank,
+                            'ls_max_step': 1.,
+                            'turn_off_outputs': turn_off_outputs_on_nonroot_rank}
+    optimizer   = InteriorPoint(prob, **interior_point_options)
+    optimizer.solve()
+    optimizer.print_results()
     
-# else:
-#     print(f'Check optimizer choice. {optimizer_choice} is not an option.')
+else:
+    print(f'Check optimizer choice. {optimizer_choice} is not an option.')
 
 
+# # ===============================
+# # region COMPONENT TESTS
+# # ===============================
+# from csdl_dafoam.utils.csdl_test_functions import CustomComponentChecks
+# import matplotlib.pyplot as plt
 
-# ===============================
-# region COMPONENT TESTS
-# ===============================
-from csdl_dafoam.utils.csdl_test_functions import CustomComponentChecks
-import matplotlib.pyplot as plt
-
-component_testing = CustomComponentChecks(dafoam_rom, comm=comm)
-component_testing.run_inverse_jacobian_fd_sweep(eps_test_values=10. ** np.array(range(-2, -10, -1)))
-component_testing.run_jacvec_fd_sweep(eps_test_values=10. ** np.array(range(-10, -2)))
+# component_testing = CustomComponentChecks(dafoam_rom, comm=comm)
+# component_testing.run_inverse_jacobian_fd_sweep(eps_test_values=10. ** np.array(range(-2, -10, -1)))
+# component_testing.run_jacvec_fd_sweep(eps_test_values=10. ** np.array(range(-10, -2)))

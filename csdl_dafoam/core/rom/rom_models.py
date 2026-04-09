@@ -6,7 +6,12 @@ from csdl_dafoam.core.csdl_dafoam import has_global_nan_or_inf
 import numpy as np
 from mpi4py import MPI
 from dafoam import PYDAFOAM # For typing
-import csdl_alpha as csdl   # For typing and checking
+from csdl_alpha import Variable, VariableGroup
+
+# DAFoamLSPGModel
+from contextlib import contextmanager, nullcontext
+
+
 
 # region BASEMODEL
 class BaseModel(ABC):  
@@ -16,12 +21,14 @@ class BaseModel(ABC):
     # region evaluate_input_output
     @abstractmethod
     def evaluate_input_output(self):
+        # FOR CSDL INTERFACE
         # Return input dict will be {name:variable}, output will be {name:str, shape:tuple}
         raise NotImplementedError()
 
     # region update_from_input_vals
     @abstractmethod
     def update_from_input_vals(self, input_vals):
+        # FOR CSDL INTERFACE
         # Take the input_val dictionaries from the CSDL variable and update any of the values held here
         # or using any FOM API/interfacing
         raise NotImplementedError()
@@ -29,24 +36,40 @@ class BaseModel(ABC):
     # region input_jacvec_transpose
     @abstractmethod
     def input_jacvec_transpose(self, rom_state, vec, input_vals, mode):
+        # FOR CSDL INTERFACE
         # Compute dR/dx^T@vec for x in input_vals (input values will be a dict with {name: np.ndarray})
         raise NotImplementedError()
 
     # region evaluate_residuals
     @abstractmethod
     def evaluate_residuals(self, rom_state):
+        # FOR SOLVER AND CSDL INTERFACE
+        raise NotImplementedError()
+    
+    # region write_solution
+    @abstractmethod
+    def write_solution(self, rom_state):
+        # FOR CSDL INTERFACE
         raise NotImplementedError()
 
     # region compute_reduced_jacobian
     def compute_reduced_jacobian(self, rom_state):
+        # FOR SOLVER
         # Optional reduced Jacobian evaluation.
         # Solver may want/need this or revert to FD or other strategy, depending on solver.
         return None
     
+    # region freeze_jacobian
+    def freeze_jacobian(self):
+        # FOR SOLVER
+        # Optional Context manager. Override in subclasses that have a freezable Jacobian.
+        return nullcontext()
+    
     # region print_fn
     @abstractmethod
     def print_fn(self, msg: str, **kwargs):
-    # Custom print function, if necessary (mainly for MPI business)
+        # FOR SOLVER AND CSDL INTERFACE
+        # Custom print function, if necessary (mainly for MPI business)
         print(msg, **kwargs)
 
 
@@ -56,27 +79,34 @@ class BaseModel(ABC):
 # region DAFOAMPROJECTIONROMMODEL
 class DAFoamProjectionROMModel(BaseModel):  
     def __init__(self,
-                 dafoam_input_variables_group:csdl.VariableGroup,
+                 dafoam_input_variables_group:VariableGroup,
                  pod_modes:np.ndarray,
                  reference_fom_state:np.ndarray,
                  scaling:np.ndarray,
                  weights:np.ndarray,
                  dafoam_instance:PYDAFOAM,
+                 normalize_residuals:bool=True,
                  fd_step:float=1e-6,
                  jac_fd_central:bool=True,
-     ):
+    ):
+        self.model_name          = "DAFoamProjectionModel"
+
         self.dafoam_input_variables_group = dafoam_input_variables_group
         self.pod_modes           = pod_modes            # Note we'll keep only the array representation
         self.reference_fom_state = reference_fom_state  # for these two variables in evaluate_input_output
         self.scaling             = scaling 
         self.weights             = weights
         self.dafoam_instance     = dafoam_instance
+        self.normalize_residuals = normalize_residuals
         self.fd_step             = fd_step
         self.jac_fd_central      = jac_fd_central
         self.n_local_states      = dafoam_instance.getNLocalAdjointStates()
 
         # To be setup later
         self.n_modes             = None
+
+        # Values for writing to disk
+        self.solution_iter       = 0
 
         # convenient MPI parameters
         self.comm       = dafoam_instance.comm
@@ -97,11 +127,11 @@ class DAFoamProjectionROMModel(BaseModel):
             if "solver" in info["components"]:
                 input_dict[name] = getattr(self.dafoam_input_variables_group, name)
 
-        if isinstance(self.pod_modes, csdl.Variable):
+        if isinstance(self.pod_modes, Variable):
             input_dict["pod_modes"] = self.pod_modes
             self.pod_modes          = self.pod_modes.value.copy() # We'll keep only the array representation
 
-        if isinstance(self.reference_fom_state, csdl.Variable):
+        if isinstance(self.reference_fom_state, Variable):
             input_dict["reference_fom_state"] = self.reference_fom_state
             self.reference_fom_state          = self.reference_fom_state.value.copy()
 
@@ -109,7 +139,7 @@ class DAFoamProjectionROMModel(BaseModel):
 
         self.n_modes = self.pod_modes.shape[1]
 
-        output_info = {"dafoam_rom_states": (self.n_modes,)}
+        output_info = {"name":"dafoam_rom_states", "shape":(self.n_modes,)}
 
         return input_dict, output_info
 
@@ -133,7 +163,7 @@ class DAFoamProjectionROMModel(BaseModel):
         q = rom_state
         w = self._reconstruct_fom_state(rom_state=q)
         
-        if not has_global_nan_or_inf(w):
+        if not has_global_nan_or_inf(w, self.comm):
             self.dafoam_instance.setStates(w)
         else:
             self.print_fn("DAFoamROMModel: Detected NaN(s) in input_vals. Skipping DAFoam setStates")
@@ -150,7 +180,11 @@ class DAFoamProjectionROMModel(BaseModel):
 
             # Shared seed: M @ Psi @ lam (fom size, distributed)
             seed        = np.ascontiguousarray(m * (Psi @ vec))
-            seed_norm   = seed.copy()
+
+            if not self.normalize_residuals:
+                seed_norm   = seed.copy() * self.dafoam_instance.getStateWeights()
+            else:
+                seed_norm   = seed
 
             # FOM inputs: mesh, flow DVs
             input_dict = self.dafoam_instance.getOption("inputInfo")
@@ -235,6 +269,31 @@ class DAFoamProjectionROMModel(BaseModel):
         return self._project_and_reduce(distributed_val=r, fom_state=w)
     
 
+    # region write_solution
+    def write_solution(self, rom_state):
+        q = rom_state
+        w = self._reconstruct_fom_state(rom_state=q)
+        r = self._eval_fom_residual(fom_state=w)
+
+        # Write state to file 
+        # Need to convert to the writing format. Will match DAFoam style, except use a different leading value
+        # Eg, DAFoam writes to 0.0001, 0.0002, etc
+        # Change the leading integer to 1 to write to 1.0001, 1.0002, etc
+        leading_integer         = 1
+        solution_write_number   = leading_integer + (self.solution_iter + 1) / 10000
+        self.print_fn(f"Writing solution to {solution_write_number}.")
+
+        # Write the state and residuals
+        self.dafoam_instance.solver.writeAdjointFields("",     solution_write_number, w, True)
+        self.dafoam_instance.solver.writeAdjointFields("res_", solution_write_number, r, True)
+
+        # Write the mesh
+        mesh = np.zeros_like(self.dafoam_instance.xv.flatten())
+        self.dafoam_instance.solver.getOFMeshPoints(mesh)
+        self.dafoam_instance.solver.writeMeshPoints(mesh, solution_write_number)
+        self.solution_iter += 1
+    
+
     # region compute_reduced_jacobian
     def compute_reduced_jacobian(self, rom_state):
         raise NotImplementedError("This needs to be implemented for the particular projection model.")
@@ -251,7 +310,7 @@ class DAFoamProjectionROMModel(BaseModel):
         Phi   = self.pod_modes
         s     = self.scaling
         w_ref = self.reference_fom_state
-        w     = w_ref + s[:, None] * (Phi @ q)
+        w     = w_ref + s * (Phi @ q)
         return w
     
 
@@ -262,7 +321,7 @@ class DAFoamProjectionROMModel(BaseModel):
         dafoam_instance = self.dafoam_instance
         dafoam_instance.setStates(w)
         residuals = dafoam_instance.getResiduals()
-        return residuals
+        return residuals if self.normalize_residuals else residuals * dafoam_instance.getStateWeights()
         
 
     # region _project_and_reduce
@@ -293,8 +352,13 @@ class DAFoamProjectionROMModel(BaseModel):
         v = vec
         w = fom_state
 
+        dafoam_instance.setStates(w)
+
         seed    = np.ascontiguousarray(v.copy())
         product = np.zeros_like(seed)
+
+        if not self.normalize_residuals:
+            seed *= dafoam_instance.getStateWeights()
         
         dafoam_instance.solverAD.calcJacTVecProduct(
             'dafoam_solver_states',
@@ -377,17 +441,17 @@ class DAFoamProjectionROMModel(BaseModel):
 # region DAFOAMGALERKINMODEL
 class DAFoamGalerkinModel(DAFoamProjectionROMModel):
     def __init__(self, 
-                 dafoam_input_variables_group:csdl.VariableGroup,
+                 dafoam_input_variables_group:VariableGroup,
                  pod_modes:np.ndarray,
                  reference_fom_state:np.ndarray,
                  scaling:np.ndarray,
                  weights:np.ndarray,
                  dafoam_instance:PYDAFOAM,
+                 normalize_residuals:bool=True,
                  fd_step:float=1e-6,
                  jac_fd_central:bool=True,
                  jac_mode:str="fd"
     ):
-        
         super().__init__(
             dafoam_input_variables_group,
             pod_modes,
@@ -395,6 +459,7 @@ class DAFoamGalerkinModel(DAFoamProjectionROMModel):
             scaling,
             weights,
             dafoam_instance,
+            normalize_residuals,
             fd_step,
             jac_fd_central
         )
@@ -427,7 +492,7 @@ class DAFoamGalerkinModel(DAFoamProjectionROMModel):
 
     # region _get_test_basis
     def _get_test_basis(self, fom_state=None):
-        return self.pod_modes
+        return self.scaling[:, None] * self.pod_modes
 
 
     # region _projection_phi_term
@@ -444,7 +509,6 @@ class DAFoamGalerkinModel(DAFoamProjectionROMModel):
     def _jacT_mat_product(self, fom_state, matrix):
         M = matrix
         w = fom_state
-
         JT_M = np.zeros_like(M)
 
         for i in range(M.shape[1]):
@@ -460,12 +524,13 @@ class DAFoamGalerkinModel(DAFoamProjectionROMModel):
 # region DAFOAMLSPGMODEL
 class DAFoamLSPGModel(DAFoamProjectionROMModel):
     def __init__(self,
-                 dafoam_input_variables_group:csdl.VariableGroup,
+                 dafoam_input_variables_group:VariableGroup,
                  pod_modes:np.ndarray,
                  reference_fom_state:np.ndarray,
                  scaling:np.ndarray,
                  weights:np.ndarray,
                  dafoam_instance:PYDAFOAM,
+                 normalize_residuals:bool=True,
                  fd_step:float=1e-6,
                  jac_fd_central:bool=True,
     ):
@@ -476,10 +541,12 @@ class DAFoamLSPGModel(DAFoamProjectionROMModel):
             scaling,
             weights,
             dafoam_instance,
+            normalize_residuals,
             fd_step,
             jac_fd_central
         )
-        self._test_basis = None
+        self._test_basis        = None
+        self._freeze_test_basis = False
 
 
     # region compute_reduced_jacobian
@@ -489,6 +556,16 @@ class DAFoamLSPGModel(DAFoamProjectionROMModel):
         Psi   = self._get_test_basis(fom_state=w)
         J_rom = self._project_and_reduce(distributed_val=Psi)
         return J_rom
+    
+
+    # region freeze_jacobian
+    @contextmanager
+    def freeze_jacobian(self):
+        self._freeze_test_basis = True
+        try:
+            yield
+        finally:
+            self._freeze_test_basis = False
 
     
     # region _get_test_basis
@@ -497,20 +574,15 @@ class DAFoamLSPGModel(DAFoamProjectionROMModel):
         s   = self.scaling
 
         # If we're given a FOM state, we'll go ahead and recompute the basis
-        if fom_state is not None or self._test_basis is None:
-            if self._test_basis is None:
-                self.print_fn("Test basis not initialized. Computing...")
-
+        if not self._freeze_test_basis and fom_state is not None:
             test_basis = self._jac_mat_product(fom_state=fom_state, matrix=s[:, None] * Phi, step=self.fd_step)
             self._test_basis = test_basis
             return test_basis
 
-        # If we're not given a FOM state, we'll return the stored basis
-        elif fom_state is None:
-            return self._test_basis
+        elif self._test_basis is None:
+            raise ValueError("Test basis not initialized. Provide 'fom_state' to compute it.")
         
-        else:
-            raise ValueError("Test basis has not been initialized. You must provide 'fom_state' to compute it.")
+        return self._test_basis
         
 
     # region _projection_phi_term
@@ -529,6 +601,238 @@ class DAFoamLSPGModel(DAFoamProjectionROMModel):
 
 
 
+import numpy as np
+from mpi4py import MPI
+from csdl_dafoam.core.rom.rom_models import BaseModel
 
 
+class SyntheticROMModel(BaseModel):
+
+    def __init__(self, N=40, r=6, use_analytic_jacobian=True):
+        super().__init__()
+
+        self.comm = MPI.COMM_WORLD
+        self.rank = self.comm.rank
+        self.size = self.comm.size
+
+        self.N = N
+        self.r = r
+        self.use_analytic_jacobian = use_analytic_jacobian
+
+        # MPI Partitioning
+        # # simple contiguous split
+        # n_per_rank = N // self.size
+        # start = self.rank * n_per_rank
+        # end = start + n_per_rank if self.rank != self.size-1 else N
+        # self.local_idx = np.arange(start, end)
+
+        # Strided partition
+        self.local_idx = np.arange(self.rank, self.N, self.size)
+
+        # trial basis
+        np.random.seed(0)
+        V           = np.random.randn(N, r)
+        self.V, _   = np.linalg.qr(V)
+        self.V_local   = self.V[self.local_idx, :]
+
+        # true FOM state
+        self.w_true         = np.linspace(1.0, 2.0, N)
+        self.w_true_local   = self.w_true[self.local_idx]
+
+        # exact ROM solution
+        self.q_true = self.V.T @ self.w_true
+
+
+    # ------------------------------
+    # CSDL placeholders
+    # ------------------------------
+
+    def evaluate_input_output(self):
+        return {}, {}
+
+    def update_from_input_vals(self, input_vals):
+        pass
+
+    def input_jacvec_transpose(self, rom_state, vec, input_vals, mode):
+        raise NotImplementedError
+
+
+    # ------------------------------
+    # residual evaluation
+    # ------------------------------
+
+    def evaluate_residuals(self, rom_state):
+
+        q = rom_state
+
+        # reconstruct FOM state
+        w = self.reconstruct_fom_state(q)
+        f = self.compute_fom_residual(w)
+
+        # ROM projection
+        R_local = self.V_local.T @ f
+
+        # Sum contributions across ranks
+        R = self.comm.allreduce(R_local, op=MPI.SUM)
+
+        return R
+
+
+    # ------------------------------
+    # analytic reduced Jacobian
+    # ------------------------------
+
+    def compute_reduced_jacobian(self, rom_state):
+
+        if not self.use_analytic_jacobian:
+            return None
+
+        q = rom_state
+        w = self.reconstruct_fom_state(q)
+
+        J_fom_local = 2 * w
+
+        J_local = self.V_local.T @ (np.diag(J_fom_local) @ self.V_local)
+
+        # Reduce J across ranks
+        J = np.zeros_like(J_local)
+        self.comm.Allreduce(J_local, J, op=MPI.SUM)
+
+        return J
     
+    
+    def reconstruct_fom_state(self, rom_state):
+        return self.V_local @ rom_state
+    
+    def compute_fom_residual(self, fom_state):
+        return fom_state**2 - self.w_true_local**2
+
+
+    # ------------------------------
+    # printing
+    # ------------------------------
+
+    def print_fn(self, msg: str, **kwargs):
+        if self.rank == 0:
+            print(msg, **kwargs)
+
+
+
+import numpy as np
+from mpi4py import MPI
+from abc import ABC
+
+class Burgers1DFOM(BaseModel):
+    def __init__(self, N=50, nu=0.01, u0=1.0, u1=2.0, use_analytic_jacobian=True):
+        super().__init__()
+
+        self.comm = MPI.COMM_WORLD
+        self.rank = self.comm.rank
+        self.size = self.comm.size
+
+        self.N = N
+        self.nu = nu
+        self.u0 = u0
+        self.u1 = u1
+        self.use_analytic_jacobian = use_analytic_jacobian
+
+        # Grid
+        self.x = np.linspace(0, 1, N)
+        self.dx = self.x[1] - self.x[0]
+
+        # MPI partitioning (strided)
+        self.local_idx = np.arange(self.rank, N, self.size)
+        
+        # Initial guess
+        self.u_init = np.linspace(u0, u1, N)[self.local_idx]
+
+    # --------------------------
+    # Evaluate residuals
+    # --------------------------
+    def evaluate_residuals(self, rom_state=None):
+        # For FOM, rom_state is just the local state
+        u = rom_state if rom_state is not None else self.u_init.copy()
+
+        # Extend to full vector for boundary conditions
+        u_full = np.zeros(self.N)
+        # gather u_local to u_full
+        all_u   = np.concatenate(self.comm.allgather(u))
+        all_idx = np.concatenate(self.comm.allgather(self.local_idx))
+        u_full[all_idx] = all_u
+
+        R = np.zeros_like(u)
+        idx = self.local_idx
+
+        for i_local, i in enumerate(idx):
+            if i == 0:
+                R[i_local] = u_full[i] - self.u0  # left BC
+            elif i == self.N-1:
+                R[i_local] = u_full[i] - self.u1  # right BC
+            else:
+                # central differences for d^2u/dx^2
+                du_dx = (u_full[i+1] - u_full[i-1]) / (2*self.dx)
+                d2u_dx2 = (u_full[i+1] - 2*u_full[i] + u_full[i-1]) / (self.dx**2)
+                R[i_local] = u_full[i]*du_dx - self.nu*d2u_dx2
+
+        return R
+
+    # --------------------------
+    # Analytical Jacobian
+    # --------------------------
+    def compute_reduced_jacobian(self, rom_state=None):
+        if not self.use_analytic_jacobian:
+            return None
+
+        u = rom_state if rom_state is not None else self.u_init.copy()
+        N_local = len(u)
+        J_local = np.zeros((N_local, N_local))
+
+        # Extend to full vector for boundary conditions
+        u_full = np.zeros(self.N)
+        # gather u_local to u_full
+        all_u   = np.concatenate(self.comm.allgather(u))
+        all_idx = np.concatenate(self.comm.allgather(self.local_idx))
+        u_full[all_idx] = all_u
+
+        for i_local, i in enumerate(self.local_idx):
+            if i == 0 or i == self.N-1:
+                J_local[i_local, i_local] = 1.0
+            else:
+                # derivatives for interior points
+                idx_m = i-1
+                idx_c = i
+                idx_p = i+1
+
+                # check if these indices are local
+                local_map = {idx: j for j, idx in enumerate(self.local_idx)}
+                
+                # central diff terms
+                val_c = u_full[idx_c]*0.0  # placeholder
+                val_m = -self.nu / (self.dx**2) - u_full[idx_c]/(2*self.dx)
+                val_c = (u_full[idx_c+1] - u_full[idx_c-1])/(2*self.dx) + 2*self.nu/(self.dx**2)
+                val_p = -self.nu/(self.dx**2) + u_full[idx_c]/(2*self.dx)
+
+                for idx_, val in zip([idx_m, idx_c, idx_p], [val_m, val_c, val_p]):
+                    if idx_ in local_map:
+                        J_local[i_local, local_map[idx_]] = val
+
+        return J_local
+
+    # --------------------------
+    # CSDL placeholders
+    # --------------------------
+    def evaluate_input_output(self):
+        return {}, {}
+
+    def update_from_input_vals(self, input_vals):
+        pass
+
+    def input_jacvec_transpose(self, rom_state, vec, input_vals, mode):
+        raise NotImplementedError
+
+    # --------------------------
+    # Printing
+    # --------------------------
+    def print_fn(self, msg, **kwargs):
+        if self.rank == 0:
+            print(msg, **kwargs)
