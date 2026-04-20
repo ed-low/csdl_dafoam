@@ -17,6 +17,7 @@ class Grassmann:
         self.m       = m
         self.k       = k
         self.comm    = comm
+        self.rank    = comm.Get_rank()
         self.weights = inner_product_weights
 
 
@@ -38,8 +39,8 @@ class Grassmann:
         if len(Y0.shape) > 2 or len(Y1.shape) > 2:
             raise NotImplementedError("Batch mode not implemented yet for Grassmann log map.")
         P, _, RT = self._svd(self._inner_product(Y1, Y0), is_global=True)
-        Y_star   = Y1 @ (P @ RT)
-        L        = Y_star - Y0 @ self._inner_product(Y0, Y_star)
+        Y_star   = Y1 @ (P @ RT) #self.local_global_op(Y1, (P @ RT), lambda x,y:x@y)
+        L        = Y_star - Y0 @ self._inner_product(Y0, Y_star) #self.local_global_op(Y0, self._inner_product(Y0, Y_star), lambda x,y:x@y)
         Q, E, VT = self._svd(L)
         theta    = self._arcsin(E)
         return Q @ self._diagA_times_B(theta, VT)
@@ -88,7 +89,7 @@ class Grassmann:
         if comm is None:
             out_value = prod
         else:
-            out_value = csdl.experimental.mpi.mpi_sum(prod, comm=comm) if csdl_vars else comm.allreduce(prod, op=MPI.SUM)
+            out_value = csdl.experimental.mpi.mpi_allreduce(prod, comm=comm) if csdl_vars else comm.allreduce(prod, op=MPI.SUM)
         return out_value
         
 
@@ -155,6 +156,30 @@ def _is_csdl(var:csdl.Variable|np.ndarray):
     return isinstance(var, csdl.Variable)
 
 
+# region global_local_op
+def global_local_op(global_var, local_var, op, comm):
+    rank = comm.Get_rank()
+    with csdl.experimental.mpi.enter_mpi_region(rank, comm) as region:
+        if isinstance(local_var, csdl.Variable):
+            local_var_split = region.split_custom(local_var, lambda x:x)
+        else:
+            local_var_split = region.split_constant(local_var)
+        out_split        = op(global_var, local_var_split)
+        out = region.merge_custom(out_split, lambda x:x)
+        return out
+
+
+# region local_global_op
+def local_global_op(local_var, global_var, op, comm):
+    rank = comm.Get_rank()
+    with csdl.experimental.mpi.enter_mpi_region(rank, comm) as region:
+        if isinstance(local_var, csdl.Variable):
+            local_var_split = region.split_custom(local_var, lambda x:x)
+        else:
+            local_var_split = region.split_constant(local_var)
+        out_split        = op(local_var_split, global_var)
+        out = region.merge_custom(out_split, lambda x:x)
+        return out
 
     
 
@@ -181,50 +206,50 @@ if __name__ == "__main__":
     A1 = np.random.random((m, n))
 
     print(f"Forming bases...") if rank == 0 else None
-    U0, _ = np.linalg.qr(A0)
-    U1, _ = np.linalg.qr(A1)
+    U0_np, _ = np.linalg.qr(A0)
+    U1_np, _ = np.linalg.qr(A1)
 
     # Numpy variables
-    U0       = U0[:, :k]
-    U1       = U1[:, :k]
+    U0_np    = U0_np[:, :k]
+    U1_np    = U1_np[:, :k]
 
     # Block partitioning
     rows_per_rank = m // comm_size
     remainder = m % comm_size
     start = rank * rows_per_rank + min(rank, remainder)
     end   = start + rows_per_rank + (1 if rank < remainder else 0)
-    U0_local = U0[start:end, :]
-    U1_local = U1[start:end, :]
+    U0_local_np = U0_np[start:end, :]
+    U1_local_np = U1_np[start:end, :]
 
     # # Strided partitioning
-    # U0_local = U0[rank::comm_size, :]
-    # U1_local = U1[rank::comm_size, :]
+    # U0_local_np = U0_np[rank::comm_size, :]
+    # U1_local_np = U1_np[rank::comm_size, :]
 
     # CSDL Setup
     recorder = csdl.Recorder(inline=True, debug=True)
     recorder.start()
 
     # CSDL variables
-    U0_csdl       = csdl.Variable(value=U0)
-    U1_csdl       = csdl.Variable(value=U1)
-
-    U0_local_csdl = csdl.Variable(value=U0_local)
-    U1_local_csdl = csdl.Variable(value=U1_local) 
+    alpha    = csdl.Variable(value=1)
+    U0       = alpha * U0_np
+    U1       = alpha * U1_np
+    U0_local = global_local_op(alpha, U0_local_np, lambda x,y:x*y, comm=comm) #csdl.Variable(value=U0_local_np)
+    U1_local = global_local_op(alpha, U1_local_np, lambda x,y:x*y, comm=comm) #csdl.Variable(value=U1_local_np) 
 
     manifold_local  = Grassmann(m, k, comm=comm)
 
-    # with csdl.experimental.mpi.enter_mpi_region(rank=rank, comm=comm) as mpi_region:
-    #     U0_local_csdl = mpi_region.split_custom(U0_local_csdl, split_func=lambda x: x)
-    #     U1_local_csdl = mpi_region.split_custom(U1_local_csdl, split_func=lambda x: x)
-    #     print(rank, U0_local_csdl.shape)
-        
-    gamma_local = manifold_local.log(U0_local_csdl, U1_local_csdl)
-    obj_local   = csdl.experimental.mpi.mpi_sum(csdl.sum(gamma_local), comm=comm)
+    gamma_local = manifold_local.log(U0_local, U1_local)
+    U05_local   = manifold_local.exp(U0_local, 0.5 * gamma_local)
+    angles      = manifold_local.subspace_angles(U0_local, U05_local)
+    obj_local   = csdl.norm(angles) / comm_size
+    obj_global  = csdl.experimental.mpi.mpi_sum(obj_local, comm)
+    
+    # obj_local   = csdl.experimental.mpi.mpi_sum(csdl.sum(U05_local), comm=comm)
     #     mpi_region.set_as_global_output(obj_local)
     
     # obj_local = csdl.experimental.mpi.mpi_sum(csdl.sum(gamma_local), comm=comm)
-    dv  = U0_local_csdl
-    obj = obj_local
+    dv  = alpha
+    obj = obj_global
 
     recorder.stop()
     sim = csdl.experimental.PySimulator(recorder=recorder)
@@ -232,6 +257,8 @@ if __name__ == "__main__":
     analytical_grad  = sim.compute_totals(obj, dv)[obj, dv]
     # finite_diff_grad = sim.compute_totals(obj, dv, use_finite_difference=True)[obj, dv]
 
+
+    print(f"Rank {rank} obj         : {obj.value}")
     print(f"Rank {rank} Analytical  : {analytical_grad}")
     # print(f"Rank {rank} Finite Diff : {finite_diff_grad}")
 
