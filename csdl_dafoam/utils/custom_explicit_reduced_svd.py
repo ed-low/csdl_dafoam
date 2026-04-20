@@ -1,6 +1,6 @@
 import numpy as np
 import csdl_alpha as csdl
-from typing import List
+from typing import List, Literal
 
 
 #  compute_jacvec_product
@@ -174,9 +174,10 @@ from csdl_dafoam.utils.decompositions import svd_distributed
 
 # region CUSTOMEXPLICITREDUCEDSVDROOTDISTRIBUTED
 class customExplicitReducedSVDRootDistributed(csdl.CustomExplicitOperation):
-	def __init__(self, comm:MPI.Comm,):
+	def __init__(self, comm:MPI.Comm, distribution:Literal["block", "strided"]="block"):
 		super().__init__()
 		self.comm = comm
+		self.distribution = distribution
 
     # region evaluate
 	def evaluate(self, A_rows_local:csdl.Variable):
@@ -340,75 +341,234 @@ class customExplicitReducedSVDRootDistributed(csdl.CustomExplicitOperation):
 		d_inputs["A_local"] += A_bar_local
 		
 
-	# region gather_rows
+	# # region gather_rows
+	# def gather_rows(self, A_local, root=0):
+	# 	comm = self.comm
+	# 	rank = comm.Get_rank()
+
+	# 	A_local = np.ascontiguousarray(A_local)
+	# 	m_local, n = A_local.shape
+
+	# 	counts_rows = comm.allgather(m_local)
+
+	# 	# Convert to element counts (as Python ints)
+	# 	counts = [int(c * n) for c in counts_rows]
+	# 	displs = [int(sum(counts[:i])) for i in range(len(counts))]
+
+	# 	if rank == root:
+	# 		m_global = sum(counts_rows)
+	# 		A_global = np.empty((m_global, n), dtype=A_local.dtype)
+	# 	else:
+	# 		A_global = None
+
+	# 	comm.Gatherv(
+	# 		sendbuf=A_local.ravel(),
+	# 		recvbuf=(A_global.ravel(), (counts, displs)) if rank == root else None,
+	# 		root=root
+	# 	)
+
+	# 	return A_global, counts_rows
+	
+
+	# # region scatter_rows
+	# def scatter_rows(self, A_global, counts_rows, root=0):
+	# 	"""
+	# 	Scatter a row-partitioned matrix from root to all ranks.
+
+	# 	Parameters
+	# 	----------
+	# 	A_global : (m_global, n) ndarray on root, None elsewhere
+	# 	counts_rows : list of row counts per rank
+	# 	comm : MPI communicator
+
+	# 	Returns
+	# 	-------
+	# 	A_local : (m_local, n) ndarray on each rank
+	# 	"""
+	# 	comm = self.comm
+	# 	rank = comm.Get_rank()
+
+	# 	# Broadcast n (number of columns)
+	# 	if rank == root:
+	# 		n = A_global.shape[1]
+	# 	else:
+	# 		n = None
+	# 	n = comm.bcast(n, root=root)
+
+	# 	m_local = counts_rows[rank]
+
+	# 	A_local = np.empty((m_local, n), dtype=A_global.dtype if rank == root else float)
+
+	# 	counts = np.array(counts_rows) * n
+	# 	displs = np.cumsum([0] + list(counts[:-1]))
+
+	# 	comm.Scatterv(
+	# 		sendbuf=(A_global.ravel(), (counts, displs)) if rank == root else None,
+	# 		recvbuf=A_local.ravel(),
+	# 		root=root
+	# 	)
+
+	# 	return A_local
+
+	def _row_counts_block(self, m_global):
+		comm = self.comm
+		size = comm.Get_size()
+		base = m_global // size
+		rem = m_global % size
+		return [base + (r < rem) for r in range(size)]
+
+
+	def _row_counts_strided(self, m_global):
+		comm = self.comm
+		size = comm.Get_size()
+		return [len(range(r, m_global, size)) for r in range(size)]
+
+
 	def gather_rows(self, A_local, root=0):
+		"""
+		Gather a row-distributed matrix to root.
+
+		Parameters
+		----------
+		A_local : ndarray
+			Local rows on each rank.
+		root : int
+			Root rank.
+		distribution : {'block', 'strided'}
+			Row ownership pattern.
+
+		Returns
+		-------
+		A_global : ndarray on root, None elsewhere
+		counts_rows : list[int]
+			Number of rows on each rank.
+		"""
 		comm = self.comm
 		rank = comm.Get_rank()
-
+		size = comm.Get_size()
+		distribution = self.distribution
 		A_local = np.ascontiguousarray(A_local)
 		m_local, n = A_local.shape
 
 		counts_rows = comm.allgather(m_local)
-
-		# Convert to element counts (as Python ints)
 		counts = [int(c * n) for c in counts_rows]
-		displs = [int(sum(counts[:i])) for i in range(len(counts))]
+		displs = [int(sum(counts[:i])) for i in range(size)]
 
+		# Gather local data into a temporary rank-concatenated buffer on root
 		if rank == root:
-			m_global = sum(counts_rows)
-			A_global = np.empty((m_global, n), dtype=A_local.dtype)
+			dtype = A_local.dtype
+			tmp = np.empty((sum(counts_rows), n), dtype=dtype)
 		else:
-			A_global = None
+			tmp = None
 
 		comm.Gatherv(
 			sendbuf=A_local.ravel(),
-			recvbuf=(A_global.ravel(), (counts, displs)) if rank == root else None,
-			root=root
+			recvbuf=(tmp.ravel(), (counts, displs)) if rank == root else None,
+			root=root,
 		)
 
-		return A_global, counts_rows
-	
+		if rank != root:
+			return None, counts_rows
 
-	# region scatter_rows
-	def scatter_rows(self, A_global, counts_rows, root=0):
+		if distribution == "block":
+			# For block partitioning, the rank-concatenated gather already matches the global order.
+			A_global = tmp
+
+		elif distribution == "strided":
+			# Rebuild global order by placing rank-r rows into rows r, r+size, r+2*size, ...
+			m_global = sum(counts_rows)
+			A_global = np.empty((m_global, n), dtype=tmp.dtype)
+
+			offset = 0
+			for r, m_r in enumerate(counts_rows):
+				local_block = tmp[offset : offset + m_r, :]
+				global_rows = np.arange(r, m_global, size)
+				A_global[global_rows, :] = local_block
+				offset += m_r
+
+		else:
+			raise ValueError(f"Unknown distribution='{distribution}'. Use 'block' or 'strided'.")
+
+		return A_global, counts_rows
+
+
+	def scatter_rows(self, A_global, counts_rows=None, root=0):
 		"""
-		Scatter a row-partitioned matrix from root to all ranks.
+		Scatter a row-distributed matrix from root to all ranks.
 
 		Parameters
 		----------
-		A_global : (m_global, n) ndarray on root, None elsewhere
-		counts_rows : list of row counts per rank
-		comm : MPI communicator
+		A_global : ndarray on root, None elsewhere
+			Global matrix.
+		counts_rows : list[int] or None
+			Rows per rank. If None, it is inferred for the chosen distribution.
+		root : int
+			Root rank.
+		distribution : {'block', 'strided'}
+			Row ownership pattern.
 
 		Returns
 		-------
-		A_local : (m_local, n) ndarray on each rank
+		A_local : ndarray on each rank
 		"""
 		comm = self.comm
 		rank = comm.Get_rank()
+		size = comm.Get_size()
+		distribution = self.distribution
 
-		# Broadcast n (number of columns)
+		# Broadcast shape/dtype information from root
 		if rank == root:
-			n = A_global.shape[1]
+			m_global, n = A_global.shape
+			dtype_str = A_global.dtype.str
 		else:
-			n = None
+			m_global, n, dtype_str = None, None, None
+
+		m_global = comm.bcast(m_global, root=root)
 		n = comm.bcast(n, root=root)
+		dtype = np.dtype(comm.bcast(dtype_str, root=root))
+
+		if counts_rows is None:
+			if distribution == "block":
+				counts_rows = self._row_counts_block(m_global)
+			elif distribution == "strided":
+				counts_rows = self._row_counts_strided(m_global)
+			else:
+				raise ValueError(f"Unknown distribution='{distribution}'. Use 'block' or 'strided'.")
 
 		m_local = counts_rows[rank]
+		A_local = np.empty((m_local, n), dtype=dtype)
 
-		A_local = np.empty((m_local, n), dtype=A_global.dtype if rank == root else float)
+		# Build a root send buffer in the order expected by Scatterv
+		if rank == root:
+			if distribution == "block":
+				sendbuf = np.ascontiguousarray(A_global).ravel()
 
-		counts = np.array(counts_rows) * n
-		displs = np.cumsum([0] + list(counts[:-1]))
+			elif distribution == "strided":
+				# Pack rows rank-by-rank: [rows for rank 0, rows for rank 1, ...]
+				packed = []
+				for r in range(size):
+					rows_r = A_global[r::size, :]
+					packed.append(np.ascontiguousarray(rows_r))
+				sendbuf = np.vstack(packed).ravel() if m_global > 0 else np.empty((0,), dtype=dtype)
+
+			else:
+				raise ValueError(f"Unknown distribution='{distribution}'. Use 'block' or 'strided'.")
+
+			counts = np.array(counts_rows, dtype=int) * n
+			displs = np.cumsum(np.r_[0, counts[:-1]]).astype(int)
+		else:
+			sendbuf = None
+			counts = None
+			displs = None
 
 		comm.Scatterv(
-			sendbuf=(A_global.ravel(), (counts, displs)) if rank == root else None,
+			sendbuf=(sendbuf, (counts, displs)) if rank == root else None,
 			recvbuf=A_local.ravel(),
-			root=root
+			root=root,
 		)
 
 		return A_local
-	
+		
 
 	# region broadcast_array
 	def broadcast_array(self, arr, root=0):
@@ -638,19 +798,23 @@ if __name__ == "__main__":
 	w_np = np.random.random(m)
 	x_np = np.random.random(n)
 
-	# Block partitioning
-	rows_per_rank = m // comm_size
-	remainder = m % comm_size
-	start = rank * rows_per_rank + min(rank, remainder)
-	end   = start + rows_per_rank + (1 if rank < remainder else 0)
-	A_local_np = A_np[start:end, :]
-	y_local_np = y_np[start:end]
-	w_local_np = y_np[start:end]
+	# Partitioning selection
+	distribution = "block" #strided
 
-	# # We'll stripe the array (our MPI partitioning
-	# A_local_np = A_np[rank::comm_size, :]
-	# y_local_np = y_np[rank::comm_size]
-	# w_local_np = w_np[rank::comm_size]
+	# # Block partitioning
+	if distribution == "block":
+		rows_per_rank = m // comm_size
+		remainder = m % comm_size
+		start = rank * rows_per_rank + min(rank, remainder)
+		end   = start + rows_per_rank + (1 if rank < remainder else 0)
+		A_local_np = A_np[start:end, :]
+		y_local_np = y_np[start:end]
+		w_local_np = w_np[start:end]
+
+	elif distribution == "strided":
+		A_local_np = A_np[rank::comm_size, :]
+		y_local_np = y_np[rank::comm_size]
+		w_local_np = w_np[rank::comm_size]
 
 	# Get local sizes
 	m_local    = y_local_np.size
@@ -663,8 +827,8 @@ if __name__ == "__main__":
 	weights = csdl.Variable(value=np.random.rand(n))
 	alpha   = csdl.Variable(value=1.)
 
-	loss_dict = {name:{loss_name:None for loss_name in ["loss_1", "loss_2", "loss_3", "loss_4"]} for name in ["base", "root", "dist"]}
-	grad_norm = {name:{loss_name:None for loss_name in ["loss_1", "loss_2", "loss_3", "loss_4"]} for name in ["base", "root", "dist"]}
+	loss_dict = {name:{loss_name:None for loss_name in ["loss_1", "loss_2", "loss_3", "loss_4", "loss_5"]} for name in ["base", "root", "dist"]}
+	grad_norm = {name:{loss_name:None for loss_name in ["loss_1", "loss_2", "loss_3", "loss_4", "loss_5"]} for name in ["base", "root", "dist"]}
 
 	# # BASE CASE
 	A 	  	  = alpha * A_np #csdl.Variable(value=A_np)
@@ -675,11 +839,11 @@ if __name__ == "__main__":
 	U, S, VT  = customSVD.evaluate(A=A)
 	
 	# loss functions
-	UTy = U.T() @ y.reshape((m,1))
 	loss_dict["base"]["loss_1"] = csdl.sum(S)
 	loss_dict["base"]["loss_2"] = csdl.sum(S * weights)
 	loss_dict["base"]["loss_3"] = csdl.sum(w.reshape((m,1)) * (U @ (U.T() @ y.reshape((m,1)))))
 	loss_dict["base"]["loss_4"] = csdl.sum(y.reshape((m,1)) * (U @ (csdl.einsum(S, VT, action='i,ij->ij')) @ x.reshape((n,1))))
+	loss_dict["base"]["loss_5"] = csdl.sum(y.reshape((m,1)) * (A @ x.reshape((n,1))))
  
 	# The distributed cases
 	def mpi_sum(x):
@@ -688,26 +852,58 @@ if __name__ == "__main__":
 	def mpi_allreduce(x):
 		return csdl.experimental.mpi.mpi_allreduce(x, comm=comm)
 	
-	A_local = alpha * A_local_np	 #csdl.Variable(value=A_local_np)
+	def global_local_op(global_var, local_var, op):
+		with csdl.experimental.mpi.enter_mpi_region(rank, comm) as region:
+			if isinstance(local_var, csdl.Variable):
+				local_var_split = region.split_custom(local_var, lambda x:x)
+			else:
+				local_var_split = region.split_constant(local_var)
+			out_split        = op(global_var, local_var_split)
+			out = region.merge_custom(out_split, lambda x:x)
+			return out
+		
+	def local_global_op(local_var, global_var, op):
+		with csdl.experimental.mpi.enter_mpi_region(rank, comm) as region:
+			if isinstance(local_var, csdl.Variable):
+				local_var_split = region.split_custom(local_var, lambda x:x)
+			else:
+				local_var_split = region.split_constant(local_var)
+			out_split        = op(local_var_split, global_var)
+			out = region.merge_custom(out_split, lambda x:x)
+			return out
+	
+	A_local = global_local_op(alpha, A_local_np, lambda x, y: x * y)
+	# A_local = alpha * A_local_np	 #csdl.Variable(value=A_local_np)
 	y_local = csdl.Variable(value=y_local_np)
 	w_local = csdl.Variable(value=w_local_np)
 
 	# ROOT THEN SCATTER
-	customSVDRootDist 			= customExplicitReducedSVDRootDistributed(comm=comm)
+	customSVDRootDist 			= customExplicitReducedSVDRootDistributed(comm=comm, distribution=distribution)
 	U_root, S_root, VT_root 	= customSVDRootDist.evaluate(A_rows_local=A_local)
 	loss_dict["root"]["loss_1"] = csdl.sum(S_root)
 	loss_dict["root"]["loss_2"] = csdl.sum(S_root * weights)
 	loss_dict["root"]["loss_3"] = (csdl.sum(w_local.reshape((m_local,1)) * (U_root @ mpi_allreduce(U_root.T() @ y_local.reshape((m_local,1))))))
 	loss_dict["root"]["loss_4"] = mpi_sum(csdl.sum(y_local.reshape((m_local,1)) * (U_root @ (csdl.einsum(S_root, VT_root, action='i,ij->ij')) @ x.reshape((n,1)))))
+	loss_dict["root"]["loss_5"] = mpi_sum(csdl.sum(y_local.reshape((m_local,1)) * local_global_op(A_local, x.reshape((n,1)), lambda x,y:x@y)))#(A_local @ x.reshape((n,1)))))
 
 	# FULLY DISTRIBUTED
 	customSVDDist 		 		= customExplicitReducedSVDDistributed(comm=comm)
 	U_dist, S_dist, VT_dist 	= customSVDDist.evaluate(A_rows_local=A_local)
 	loss_dict["dist"]["loss_1"] = csdl.sum(S_dist)
 	loss_dict["dist"]["loss_2"] = csdl.sum(S_dist * weights)
-	loss_dict["dist"]["loss_3"] = mpi_sum(csdl.sum(w_local.reshape((m_local,1)) * (U_dist @ mpi_allreduce(U_dist.T() @ y_local.reshape((m_local,1))))))
-	loss_dict["dist"]["loss_4"] = mpi_sum(csdl.sum(y_local.reshape((m_local,1)) * (U_dist @ (csdl.einsum(S_dist, VT_dist, action='i,ij->ij')) @ x.reshape((n,1)))))
+	loss_dict["dist"]["loss_3"] = (csdl.sum(w_local.reshape((m_local,1)) * (U_dist @ mpi_allreduce(U_dist.T() @ y_local.reshape((m_local,1))))))
+	loss_dict["dist"]["loss_4"] = (csdl.sum(y_local.reshape((m_local,1)) * (U_dist @ (csdl.einsum(S_dist, VT_dist, action='i,ij->ij')) @ x.reshape((n,1)))))
+	loss_dict["dist"]["loss_5"] = (csdl.sum(y_local.reshape((m_local,1)) * (A_local @ x.reshape((n,1)))))
 
+	# with csdl.experimental.mpi.enter_mpi_region(rank, comm) as mpi_region:
+	# 	mpi_region.split_custom(alpha, lambda x:x)
+	# 	# mpi_region.split_custom(y_local, lambda x:x)
+	# 	mpi_region.split_custom(x, lambda x:x)
+	# 	A_local2 = alpha * A_local_np
+		
+	# 	mpi_region.set_as_global_output(loss_dict["dist"]["loss_5"])
+
+	
 	recorder.stop()
 	sim = csdl.experimental.PySimulator(recorder=recorder)
 
@@ -719,222 +915,13 @@ if __name__ == "__main__":
 			analytical_grad       		   = sim.compute_totals(loss_var, wrt)[loss_var, wrt]
 			
 			if svd_type == "base":
-				grad_norm[svd_type][loss_case] = np.linalg.norm(analytical_grad)
+				grad_norm[svd_type][loss_case] = analytical_grad #np.linalg.norm(analytical_grad)
 			else:
-				grad_norm[svd_type][loss_case] = np.sqrt(comm.allreduce(np.sum(analytical_grad** 2), op=MPI.SUM))
+				grad_norm[svd_type][loss_case] = analytical_grad#np.sqrt(comm.allreduce(np.sum(analytical_grad** 2), op=MPI.SUM))
 
 	import pandas as pd
 
-	if rank  == 0:
-		df = pd.DataFrame.from_dict(grad_norm, orient="index")
-		pd.set_option("display.float_format", "{:.8f}".format)
-		print(df)
-
-	# customSVDDist = customExplicitReducedSVDDistributed(comm=comm)
-	# U_d_csdl, S_d_csdl, VT_d_csdl = customSVDDist.evaluate(A_rows_local=A_local_csdl)
-
-	# with csdl.experimental.mpi.enter_mpi_region(rank=rank, comm=comm) as mpi_region:
-	# 	mpi_region.split_custom(A_local_csdl, split_func=lambda x:x)
-
-	# 	customSVDDist = customExplicitReducedSVDDistributed(comm=comm)
-	# 	U_d_csdl, S_d_csdl, VT_d_csdl = customSVDDist.evaluate(A_rows_local=A_local_csdl)
-
-	# 	mpi_region.set_as_global_output(U_d_csdl)
-	# 	mpi_region.set_as_global_output(S_d_csdl)
-	# 	mpi_region.set_as_global_output(VT_d_csdl)
-
-	# A_reconstructed = U_d_csdl @ csdl.einsum(S_d_csdl, VT_d_csdl, action='i,ij->ij')
- 
-	# obj_serial = csdl.sum(U)
-	# obj_dist   = csdl.sum(U_d_csdl @ U_d_csdl.T())
-
-	# obj = obj_dist
-	# dv  = A_local_csdl
-
-	# dv.set_as_design_variable()
-	# obj.set_as_objective()
-
-	# recorder.stop()
 	
-	# sim = csdl.experimental.PySimulator(recorder=recorder)
-
-	# Manual derivative check
-	# analytical_grad  = sim.compute_totals(obj, dv)[obj, dv]
-	# finite_diff_grad = sim.compute_totals(obj, dv, use_finite_difference=True)[obj, dv]
-	# relative_diff    = (analytical_grad - finite_diff_grad) / analytical_grad
-
-	# print(f"Rank {rank} Analytical  : {analytical_grad}")
-	# print(f"Rank {rank} Finite Diff : {finite_diff_grad}")
-
-
-	# # print(relative_diff)
-	# print(f"Rank {rank} ||relative_diff||      : {np.linalg.norm(relative_diff)}")
-	# print(f"Rank {rank} ||computed_grad||      : {np.linalg.norm(analytical_grad)}")
-	# print(f"Rank {rank} ||fd_grad||            : {np.linalg.norm(finite_diff_grad)}")
-	# print(f"Rank {rank} ||cg||-||fdg||/||fdg|| : {(np.linalg.norm(analytical_grad) - np.linalg.norm(finite_diff_grad)) / np.linalg.norm(analytical_grad)}")
-
-    # # Check derivatives
-	# import modopt as mo
-
-	
-	# prob        = mo.CSDLAlphaProblem(problem_name="test", simulator=sim)
-	# optimizer   = mo.SLSQP(problem=prob, solver_options={'ftol':1e-6, 'maxiter':20})
-	# optimizer.check_first_derivatives(step=1e-6)
-
-	# component_check = CustomComponentChecks(component=customSVDSerial, random_seed=0, fd_step=1e-6, comm=comm)
-	# component_check.run_jacvec_fd_sweep(eps_test_values=10. ** np.array(range(-2, -12, -1)))
-
-	# component_check = CustomComponentChecks(component=customSVDDist, random_seed=0, fd_step=1e-6, comm=comm)
-	# component_check.run_jacvec_fd_sweep(eps_test_values=10. ** np.array(range(-2, -12, -1)))
-
-
-
-
-
-
-
-
-
-
-# with csdl.experimental.mpi.enter_mpi_region(rank, comm) as mpi_region:
-		# 
-		# A_local_csdl = mpi_region.split_custom(A_local_csdl, split_func=lambda x:x)
-		# U_d_csdl     = mpi_region.split_custom(U_d_csdl, split_func=lambda x:x)
-
-		
-		# A_reconstructed = U_d_csdl @ csdl.einsum(S_d_csdl, VT_d_csdl, action='i,ij->ij')
-
-		# loss0d = csdl.sum(S_d_csdl)
-		# loss1d = csdl.sum(U_d_csdl)
-		# loss2d = csdl.sum(VT_d_csdl)
-		# loss3d = csdl.sum(U_d_csdl) + csdl.sum(VT_d_csdl)
-		# loss4d = csdl.sum(U_d_csdl.T() @ U_d_csdl)
-		# loss5d = csdl.experimental.mpi.mpi_sum(csdl.sum((A_reconstructed - A_local_csdl)**2), comm=comm)
-	
-		# mpi_region.set_as_global_output(loss0d)
-		# mpi_region.set_as_global_output(loss1d)
-		# mpi_region.set_as_global_output(loss2d)
-		# mpi_region.set_as_global_output(loss3d)
-		# mpi_region.set_as_global_output(loss4d)
-		# mpi_region.set_as_global_output(loss5d)
-		# mpi_region.set_as_global_output(U_d_csdl)
-		# mpi_region.set_as_global_output(S_d_csdl)
-		# mpi_region.set_as_global_output(VT_d_csdl)
-
-
-
-
-
-
-	# from csdl_dafoam.utils.training_interface import TrainingDataInterface
-	# from csdl_dafoam.core.csdl_dafoam import instantiateDAFoam
-	# import os
-	# from pathlib import Path
-
-	# # DAFoam
-	# problem_name        = 'rom_test2'
-	# dafoam_directory    = "/media/edward/DATA/Edward/AFRL_project/csdl_dafoam_workspace/airfoil_case/results/rom_test2"
-	# dafoamPrintInterval = 100
-	# dataset_keyword 	= 'training_data2'
-	# storage_location    = Path(dafoam_directory)
-
-	# # Initial/reference values for DAFoam (best to use base conditions)
-	# U0        = 206.53653128321116         # used for normalizing CD and CL
-	# p0        = 19509.303373738785
-	# T0        = 216.65227163736915
-	# nuTilda0  = 4.5e-5
-	# aoa0      = 1.416e-1
-	# A0        = 0.1           #
-	# rho0      = p0 / T0 / 287 # used for normalizing CD and CL
-
-	# # Input parameters for DAFoam
-	# da_options = {
-	# 	"designSurfaces": ["wing"],
-	# 	"solverName": "DARhoSimpleCFoam",
-	# 	"primalMinResTol": 1.0e-8,
-	# 	"primalVarBounds": {"pMin": 5000, "rhoMin": 0.05},
-	# 	"primalBC": {
-	# 		"U0": {"variable": "U", "patches": ["inout"], "value": [U0, 0.0, 0.0]},
-	# 		"p0": {"variable": "p", "patches": ["inout"], "value": [p0]},
-	# 		"T0": {"variable": "T", "patches": ["inout"], "value": [T0]},
-	# 		"nuTilda0": {"variable": "nuTilda", "patches": ["inout"], "value": [nuTilda0]},
-	# 		"useWallFunction": True,
-	# 	},
-	# 	"function": {
-	# 		"drag": {
-	# 			"type": "force",
-	# 			"source": "patchToFace",
-	# 			"patches": ["wing"],
-	# 			"directionMode": "parallelToFlow",
-	# 			"patchVelocityInputName": "patch_velocity",
-	# 			"scale": 1.0, #1.0 / (0.5 * U0 * U0 * A0 * rho0),
-	# 		},
-	# 		"lift": {
-	# 			"type": "force",
-	# 			"source": "patchToFace",
-	# 			"patches": ["wing"],
-	# 			"directionMode": "normalToFlow",
-	# 			"patchVelocityInputName": "patch_velocity",
-	# 			"scale": 1.0, #1.0 / (0.5 * U0 * U0 * A0 * rho0),
-	# 		},
-	# 	},
-	# 	"adjEqnOption": {"gmresRelTol": 1.0e-6, "pcFillLevel": 1, "jacMatReOrdering": "rcm", "useNonZeroInitGuess": False},
-	# 	# transonic preconditioner to speed up the adjoint convergence
-	# 	"transonicPCOption": 1,
-	# 	"normalizeStates": {
-	# 		"U": U0,
-	# 		"p": p0,
-	# 		"T": T0,
-	# 		"nuTilda": nuTilda0 * 10.0,
-	# 		"phi": 1.0,
-	# 	},
-	# 	"inputInfo": {
-	# 		"aero_vol_coords": {
-	# 			"type": "volCoord", 
-	# 			"components": ["solver", "function"],
-	# 		},
-	# 		"patch_velocity": {
-	# 			"type": "patchVelocity",
-	# 			"patches": ["inout"],
-	# 			"flowAxis": "x",
-	# 			"normalAxis": "z",
-	# 			"components": ["solver", "function"],
-	# 		},
-	# 		"pressure": {
-	# 			"type": "patchVar",
-	# 			"varName": "p",
-	# 			"varType": "scalar",
-	# 			"patches": ["inout"],
-	# 			"components": ["solver", "function"],
-	# 		},
-	# 		"temperature": {
-	# 			"type": "patchVar",
-	# 			"varName": "T",
-	# 			"varType": "scalar",
-	# 			"patches": ["inout"],
-	# 			"components": ["solver", "function"],
-	# 		},
-	# 	},
-	# 	"writeAdjointFields": False,
-	# 	"debug": False,
-	# 	"printDAOptions": True,
-	# 	"printInterval": dafoamPrintInterval
-	# }
-
-	# # region Mesh options
-	# mesh_options = {
-	# 	"gridFile": dafoam_directory,
-	# 	"fileType": "OpenFOAM",
-	# 	"symmetryPlanes": [],
-	# }
-
-	# dafoam_instance = instantiateDAFoam(da_options, comm, dafoam_directory, mesh_options)
-	# data_generator  = TrainingDataInterface(dafoam_instance=dafoam_instance, 
-    #                                     storage_location=storage_location, 
-    #                                     dataset_keyword=dataset_keyword,
-    #                                     h5_file_base_name="point")
-
-	# data = data_generator.load_h5(Path(storage_location)/dataset_keyword/"point_0.h5", only_distributed_data=False)
-
-	# state_info    = data_generator.state_info # Get our state variable names
-	# A_local       = np.array(np.concatenate([data["pod"]["modes"][state_var] for state_var in state_info.keys()], axis=0))[:, 0:n]
+	df = pd.DataFrame.from_dict(grad_norm, orient="index")
+	pd.set_option("display.float_format", "{:.8f}".format)
+	print(f"------------ \n Rank {rank} \n {df}")
