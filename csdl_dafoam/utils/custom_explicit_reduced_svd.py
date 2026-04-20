@@ -172,436 +172,13 @@ class customExplicitReducedSVD(csdl.CustomExplicitOperation):
 from mpi4py import MPI
 from csdl_dafoam.utils.decompositions import svd_distributed
 
-# region CUSTOMEXPLICITREDUCEDSVDROOTDISTRIBUTED
-class customExplicitReducedSVDRootDistributed(csdl.CustomExplicitOperation):
-	def __init__(self, comm:MPI.Comm, distribution:Literal["block", "strided"]="block"):
-		super().__init__()
-		self.comm = comm
-		self.distribution = distribution
-
-    # region evaluate
-	def evaluate(self, A_rows_local:csdl.Variable):
-		self.declare_input("A_local", A_rows_local)
-		
-		dimensions = A_rows_local.shape
-		
-		if len(dimensions) > 2:
-			leading_dims = dimensions[:-2]
-		else:
-			leading_dims = None
-		
-		m = dimensions[-2]
-		n = dimensions[-1]
-		
-		k = min(m, n)
-
-		if leading_dims is not None:
-			U_local  = self.create_output("U_local", (*leading_dims, m, k))
-			S  		 = self.create_output("S",  	 (*leading_dims, k))
-			VT 		 = self.create_output("VT", 	 (*leading_dims, k, n))
-		else:
-			U_local  = self.create_output("U_local", (m, k))
-			S  		 = self.create_output("S",  	 (k,))
-			VT 		 = self.create_output("VT", 	 (k, n))
-
-		return U_local, S, VT
-	
-
-	# region compute
-	def compute(self, input_vals, output_vals):
-		comm 	= self.comm
-		rank    = comm.Get_rank()
-		A_local = input_vals["A_local"]
-
-		if np.iscomplexobj(A_local):
-			print('WARING: Complex array found. customExplicitReducedSVD currently only defines derivatives for real valued arrays.')
-
-		A_global, counts_rows = self.gather_rows(A_local)
-		
-		if rank == 0:
-			U, S, VT = np.linalg.svd(A_global, full_matrices=False)
-		else:
-			U  = None
-			S  = None
-			VT = None
-		
-		# Broadcast S and VT
-		S  = self.broadcast_array(S)
-		VT = self.broadcast_array(VT)
-
-		U_local = self.scatter_rows(U, counts_rows=counts_rows)
-
-		output_vals["U_local"]  = U_local
-		output_vals["S"]  = S
-		output_vals["VT"] = VT
-
-
-	# region compute_jacvec_product
-	def compute_jacvec_product(self, input_vals, output_vals, d_inputs, d_outputs, mode):
-		# Extract input and output vals
-		A_local  = input_vals["A_local"]
-		U_local  = output_vals["U_local"]
-		S  = output_vals["S"]
-		VT = output_vals["VT"]
-
-		U, U_counts_rows = self.gather_rows(U_local)
-		
-		# Extract output cotangents (default to zeros if not provided)
-		U_bar_local  = d_outputs["U_local"]  if d_outputs["U_local"]  is not None else np.zeros_like(U)
-		U_bar, _  = self.gather_rows(U_bar_local)
-
-		# Have to gather all of the upstream gradient contributions for our "global variables" (S and VT)
-		VT_bar_local = d_outputs["VT"].copy() if d_outputs["VT"] is not None else np.zeros_like(VT)
-		VT_bar = np.zeros_like(VT_bar_local)
-		comm.Allreduce(VT_bar_local, VT_bar, op=MPI.SUM)
-		V_bar = VT_bar.swapaxes(-2, -1)
-
-		S_bar_local = d_outputs["S"].copy() if d_outputs["S"] is not None else np.zeros_like(S)
-		S_bar = np.zeros_like(S_bar_local)
-		comm.Allreduce(S_bar_local, S_bar, op=MPI.SUM)
-		
-		if self.comm.Get_rank() == 0:
-			UT = U.swapaxes(-2, -1)
-			V  = VT.swapaxes(-2, -1)
-
-			# Get our dimensions
-			m = U.shape[-2]
-			n = V.shape[-2]
-			k = S.shape[-1]	
-
-			if mode == 'fwd':
-				raise NotImplementedError(
-					'forward mode has not been implemented for customExplicitReducedSVD'
-				)
-
-			elif mode == 'rev':
-				skip_full = False
-				# Some easy cases
-				if d_outputs["U_local"] is None and d_outputs["VT"] is None:
-					# Trivial case where no gradients are specified
-					if d_outputs["S"] is None:
-						A_bar = np.zeros_like(A_local)
-						skip_full = True
-					
-					# Just only singular value gradient
-					else:
-						S_bar 	  = d_outputs["S"]	
-						A_bar = U @ (S_bar[..., :, None] * VT) if m >= n else (U * S_bar[..., None, :]) @ VT
-						skip_full = True
-
-				if not skip_full:
-					V_bar  = VT_bar.swapaxes(-2, -1)
-
-					# Premultiply and skew some arrays
-					UTU_bar = UT @ U_bar
-					VTV_bar = VT @ V_bar
-
-					skew_UTU_bar = UTU_bar - UTU_bar.swapaxes(-2, -1)
-					skew_VTV_bar = VTV_bar - VTV_bar.swapaxes(-2, -1)
-
-					# Construct our E array
-					tol = 1e-12
-					S2 = S**2
-					E = S2[..., None, :] - S2[..., :, None]
-					E[..., np.eye(k, dtype=bool)] = 1.0
-					E = np.where(np.abs(E) > tol, E, np.inf)
-					invS = np.where(S > tol, 1.0 / S, 0.0)
-
-					# Build our M array
-					numerator = skew_UTU_bar*S[..., None, :] + S[..., :, None]*skew_VTV_bar
-					M = numerator / E
-					I = np.eye(S.shape[-1], dtype=S.dtype)
-					M += S_bar[..., :, None] * I
-
-					# Square case
-					if m == n:
-						A_bar            = U @ M @ VT
-
-					# Rectangular correction cases
-					elif m > n:
-						U_barSinv        = U_bar * invS[..., None, :]
-						U_barSinv_proj   = U_barSinv - U @ (UT @ U_barSinv)
-						A_bar            = U @ M + U_barSinv_proj
-						A_bar            = A_bar @ VT
-					
-					elif m < n:
-						Sinv_V_barT      = (V_bar * invS[..., None, :]).swapaxes(-2, -1)
-						Sinv_V_barT_proj = Sinv_V_barT - (Sinv_V_barT @ V) @ VT
-						A_bar            = M @ VT + Sinv_V_barT_proj
-						A_bar 			 = U @ A_bar
-
-			else:
-				raise ValueError(f'"{mode}" not recognized. Only support "fwd" and "rev" modes')
-		
-		else:
-			A_bar = None
-			
-		# Accumulate into input adjoints
-		A_bar_local = self.scatter_rows(A_bar, U_counts_rows)
-		d_inputs["A_local"] += A_bar_local
-		
-
-	# # region gather_rows
-	# def gather_rows(self, A_local, root=0):
-	# 	comm = self.comm
-	# 	rank = comm.Get_rank()
-
-	# 	A_local = np.ascontiguousarray(A_local)
-	# 	m_local, n = A_local.shape
-
-	# 	counts_rows = comm.allgather(m_local)
-
-	# 	# Convert to element counts (as Python ints)
-	# 	counts = [int(c * n) for c in counts_rows]
-	# 	displs = [int(sum(counts[:i])) for i in range(len(counts))]
-
-	# 	if rank == root:
-	# 		m_global = sum(counts_rows)
-	# 		A_global = np.empty((m_global, n), dtype=A_local.dtype)
-	# 	else:
-	# 		A_global = None
-
-	# 	comm.Gatherv(
-	# 		sendbuf=A_local.ravel(),
-	# 		recvbuf=(A_global.ravel(), (counts, displs)) if rank == root else None,
-	# 		root=root
-	# 	)
-
-	# 	return A_global, counts_rows
-	
-
-	# # region scatter_rows
-	# def scatter_rows(self, A_global, counts_rows, root=0):
-	# 	"""
-	# 	Scatter a row-partitioned matrix from root to all ranks.
-
-	# 	Parameters
-	# 	----------
-	# 	A_global : (m_global, n) ndarray on root, None elsewhere
-	# 	counts_rows : list of row counts per rank
-	# 	comm : MPI communicator
-
-	# 	Returns
-	# 	-------
-	# 	A_local : (m_local, n) ndarray on each rank
-	# 	"""
-	# 	comm = self.comm
-	# 	rank = comm.Get_rank()
-
-	# 	# Broadcast n (number of columns)
-	# 	if rank == root:
-	# 		n = A_global.shape[1]
-	# 	else:
-	# 		n = None
-	# 	n = comm.bcast(n, root=root)
-
-	# 	m_local = counts_rows[rank]
-
-	# 	A_local = np.empty((m_local, n), dtype=A_global.dtype if rank == root else float)
-
-	# 	counts = np.array(counts_rows) * n
-	# 	displs = np.cumsum([0] + list(counts[:-1]))
-
-	# 	comm.Scatterv(
-	# 		sendbuf=(A_global.ravel(), (counts, displs)) if rank == root else None,
-	# 		recvbuf=A_local.ravel(),
-	# 		root=root
-	# 	)
-
-	# 	return A_local
-
-	def _row_counts_block(self, m_global):
-		comm = self.comm
-		size = comm.Get_size()
-		base = m_global // size
-		rem = m_global % size
-		return [base + (r < rem) for r in range(size)]
-
-
-	def _row_counts_strided(self, m_global):
-		comm = self.comm
-		size = comm.Get_size()
-		return [len(range(r, m_global, size)) for r in range(size)]
-
-
-	def gather_rows(self, A_local, root=0):
-		"""
-		Gather a row-distributed matrix to root.
-
-		Parameters
-		----------
-		A_local : ndarray
-			Local rows on each rank.
-		root : int
-			Root rank.
-		distribution : {'block', 'strided'}
-			Row ownership pattern.
-
-		Returns
-		-------
-		A_global : ndarray on root, None elsewhere
-		counts_rows : list[int]
-			Number of rows on each rank.
-		"""
-		comm = self.comm
-		rank = comm.Get_rank()
-		size = comm.Get_size()
-		distribution = self.distribution
-		A_local = np.ascontiguousarray(A_local)
-		m_local, n = A_local.shape
-
-		counts_rows = comm.allgather(m_local)
-		counts = [int(c * n) for c in counts_rows]
-		displs = [int(sum(counts[:i])) for i in range(size)]
-
-		# Gather local data into a temporary rank-concatenated buffer on root
-		if rank == root:
-			dtype = A_local.dtype
-			tmp = np.empty((sum(counts_rows), n), dtype=dtype)
-		else:
-			tmp = None
-
-		comm.Gatherv(
-			sendbuf=A_local.ravel(),
-			recvbuf=(tmp.ravel(), (counts, displs)) if rank == root else None,
-			root=root,
-		)
-
-		if rank != root:
-			return None, counts_rows
-
-		if distribution == "block":
-			# For block partitioning, the rank-concatenated gather already matches the global order.
-			A_global = tmp
-
-		elif distribution == "strided":
-			# Rebuild global order by placing rank-r rows into rows r, r+size, r+2*size, ...
-			m_global = sum(counts_rows)
-			A_global = np.empty((m_global, n), dtype=tmp.dtype)
-
-			offset = 0
-			for r, m_r in enumerate(counts_rows):
-				local_block = tmp[offset : offset + m_r, :]
-				global_rows = np.arange(r, m_global, size)
-				A_global[global_rows, :] = local_block
-				offset += m_r
-
-		else:
-			raise ValueError(f"Unknown distribution='{distribution}'. Use 'block' or 'strided'.")
-
-		return A_global, counts_rows
-
-
-	def scatter_rows(self, A_global, counts_rows=None, root=0):
-		"""
-		Scatter a row-distributed matrix from root to all ranks.
-
-		Parameters
-		----------
-		A_global : ndarray on root, None elsewhere
-			Global matrix.
-		counts_rows : list[int] or None
-			Rows per rank. If None, it is inferred for the chosen distribution.
-		root : int
-			Root rank.
-		distribution : {'block', 'strided'}
-			Row ownership pattern.
-
-		Returns
-		-------
-		A_local : ndarray on each rank
-		"""
-		comm = self.comm
-		rank = comm.Get_rank()
-		size = comm.Get_size()
-		distribution = self.distribution
-
-		# Broadcast shape/dtype information from root
-		if rank == root:
-			m_global, n = A_global.shape
-			dtype_str = A_global.dtype.str
-		else:
-			m_global, n, dtype_str = None, None, None
-
-		m_global = comm.bcast(m_global, root=root)
-		n = comm.bcast(n, root=root)
-		dtype = np.dtype(comm.bcast(dtype_str, root=root))
-
-		if counts_rows is None:
-			if distribution == "block":
-				counts_rows = self._row_counts_block(m_global)
-			elif distribution == "strided":
-				counts_rows = self._row_counts_strided(m_global)
-			else:
-				raise ValueError(f"Unknown distribution='{distribution}'. Use 'block' or 'strided'.")
-
-		m_local = counts_rows[rank]
-		A_local = np.empty((m_local, n), dtype=dtype)
-
-		# Build a root send buffer in the order expected by Scatterv
-		if rank == root:
-			if distribution == "block":
-				sendbuf = np.ascontiguousarray(A_global).ravel()
-
-			elif distribution == "strided":
-				# Pack rows rank-by-rank: [rows for rank 0, rows for rank 1, ...]
-				packed = []
-				for r in range(size):
-					rows_r = A_global[r::size, :]
-					packed.append(np.ascontiguousarray(rows_r))
-				sendbuf = np.vstack(packed).ravel() if m_global > 0 else np.empty((0,), dtype=dtype)
-
-			else:
-				raise ValueError(f"Unknown distribution='{distribution}'. Use 'block' or 'strided'.")
-
-			counts = np.array(counts_rows, dtype=int) * n
-			displs = np.cumsum(np.r_[0, counts[:-1]]).astype(int)
-		else:
-			sendbuf = None
-			counts = None
-			displs = None
-
-		comm.Scatterv(
-			sendbuf=(sendbuf, (counts, displs)) if rank == root else None,
-			recvbuf=A_local.ravel(),
-			root=root,
-		)
-
-		return A_local
-		
-
-	# region broadcast_array
-	def broadcast_array(self, arr, root=0):
-		"""
-		Broadcast a NumPy array of arbitrary shape.
-		"""
-		comm = self.comm
-		rank = comm.Get_rank()
-
-		if rank == root:
-			shape = arr.shape
-			dtype = arr.dtype
-		else:
-			shape = None
-			dtype = None
-
-		shape = comm.bcast(shape, root=root)
-		dtype = comm.bcast(dtype, root=root)
-
-		if rank != root:
-			arr = np.empty(shape, dtype=dtype)
-
-		comm.Bcast(arr, root=root)
-
-		return arr
-
-
 
 # region CUSTOMEXPLICITREDUCEDSVDDISTRIBUTED
 class customExplicitReducedSVDDistributed(csdl.CustomExplicitOperation):
-	def __init__(self, comm:MPI.Comm,):
+	def __init__(self, comm:MPI.Comm, method:Literal["tsqr", "gram"]="tsqr"):
 		super().__init__()
-		self.comm = comm
+		self.comm 	= comm
+		self.method = method
 
     # region evaluate
 	def evaluate(self, A_rows_local:csdl.Variable):
@@ -639,7 +216,7 @@ class customExplicitReducedSVDDistributed(csdl.CustomExplicitOperation):
 		if np.iscomplexobj(A_local):
 			print('WARING: Complex array found. customExplicitReducedSVD currently only defines derivatives for real valued arrays.')
 
-		U_local, S, VT = svd_distributed(matrix_local=A_local, method="tsqr", comm=comm)
+		U_local, S, VT = svd_distributed(matrix_local=A_local, method=self.method, comm=comm)
 
 		# TODO: Implement some checks for S. See if we have any zero values or small differences between valuess
 		
@@ -748,9 +325,6 @@ class customExplicitReducedSVDDistributed(csdl.CustomExplicitOperation):
 			# Accumulate into input adjoints
 			d_inputs["A_local"] += A_bar_local
 
-			### DEBUG
-			# print(f"[Rank {rank}] A_bar_local norm: {np.linalg.norm(A_bar_local)}", flush=True)
-			###
 		else:
 			raise ValueError(f'"{mode}" not recognized. Only support "fwd" and "rev" modes')
 
@@ -827,8 +401,8 @@ if __name__ == "__main__":
 	weights = csdl.Variable(value=np.random.rand(n))
 	alpha   = csdl.Variable(value=1.)
 
-	loss_dict = {name:{loss_name:None for loss_name in ["loss_1", "loss_2", "loss_3", "loss_4", "loss_5"]} for name in ["base", "root", "dist"]}
-	grad_norm = {name:{loss_name:None for loss_name in ["loss_1", "loss_2", "loss_3", "loss_4", "loss_5"]} for name in ["base", "root", "dist"]}
+	loss_dict = {name:{loss_name:None for loss_name in ["loss_1", "loss_2", "loss_3", "loss_4", "loss_5"]} for name in ["base", "dist"]}
+	grad_norm = {name:{loss_name:None for loss_name in ["loss_1", "loss_2", "loss_3", "loss_4", "loss_5"]} for name in ["base", "dist"]}
 
 	# # BASE CASE
 	A 	  	  = alpha * A_np #csdl.Variable(value=A_np)
@@ -861,30 +435,10 @@ if __name__ == "__main__":
 			out_split        = op(global_var, local_var_split)
 			out = region.merge_custom(out_split, lambda x:x)
 			return out
-		
-	def local_global_op(local_var, global_var, op):
-		with csdl.experimental.mpi.enter_mpi_region(rank, comm) as region:
-			if isinstance(local_var, csdl.Variable):
-				local_var_split = region.split_custom(local_var, lambda x:x)
-			else:
-				local_var_split = region.split_constant(local_var)
-			out_split        = op(local_var_split, global_var)
-			out = region.merge_custom(out_split, lambda x:x)
-			return out
 	
 	A_local = global_local_op(alpha, A_local_np, lambda x, y: x * y)
-	# A_local = alpha * A_local_np	 #csdl.Variable(value=A_local_np)
 	y_local = csdl.Variable(value=y_local_np)
 	w_local = csdl.Variable(value=w_local_np)
-
-	# ROOT THEN SCATTER
-	customSVDRootDist 			= customExplicitReducedSVDRootDistributed(comm=comm, distribution=distribution)
-	U_root, S_root, VT_root 	= customSVDRootDist.evaluate(A_rows_local=A_local)
-	loss_dict["root"]["loss_1"] = csdl.sum(S_root)
-	loss_dict["root"]["loss_2"] = csdl.sum(S_root * weights)
-	loss_dict["root"]["loss_3"] = (csdl.sum(w_local.reshape((m_local,1)) * (U_root @ mpi_allreduce(U_root.T() @ y_local.reshape((m_local,1))))))
-	loss_dict["root"]["loss_4"] = mpi_sum(csdl.sum(y_local.reshape((m_local,1)) * (U_root @ (csdl.einsum(S_root, VT_root, action='i,ij->ij')) @ x.reshape((n,1)))))
-	loss_dict["root"]["loss_5"] = mpi_sum(csdl.sum(y_local.reshape((m_local,1)) * local_global_op(A_local, x.reshape((n,1)), lambda x,y:x@y)))#(A_local @ x.reshape((n,1)))))
 
 	# FULLY DISTRIBUTED
 	customSVDDist 		 		= customExplicitReducedSVDDistributed(comm=comm)
@@ -894,15 +448,6 @@ if __name__ == "__main__":
 	loss_dict["dist"]["loss_3"] = (csdl.sum(w_local.reshape((m_local,1)) * (U_dist @ mpi_allreduce(U_dist.T() @ y_local.reshape((m_local,1))))))
 	loss_dict["dist"]["loss_4"] = (csdl.sum(y_local.reshape((m_local,1)) * (U_dist @ (csdl.einsum(S_dist, VT_dist, action='i,ij->ij')) @ x.reshape((n,1)))))
 	loss_dict["dist"]["loss_5"] = (csdl.sum(y_local.reshape((m_local,1)) * (A_local @ x.reshape((n,1)))))
-
-	# with csdl.experimental.mpi.enter_mpi_region(rank, comm) as mpi_region:
-	# 	mpi_region.split_custom(alpha, lambda x:x)
-	# 	# mpi_region.split_custom(y_local, lambda x:x)
-	# 	mpi_region.split_custom(x, lambda x:x)
-	# 	A_local2 = alpha * A_local_np
-		
-	# 	mpi_region.set_as_global_output(loss_dict["dist"]["loss_5"])
-
 	
 	recorder.stop()
 	sim = csdl.experimental.PySimulator(recorder=recorder)
@@ -913,11 +458,7 @@ if __name__ == "__main__":
 			# wrt = A if svd_type == "base" else A_local
 			wrt = alpha
 			analytical_grad       		   = sim.compute_totals(loss_var, wrt)[loss_var, wrt]
-			
-			if svd_type == "base":
-				grad_norm[svd_type][loss_case] = analytical_grad #np.linalg.norm(analytical_grad)
-			else:
-				grad_norm[svd_type][loss_case] = analytical_grad#np.sqrt(comm.allreduce(np.sum(analytical_grad** 2), op=MPI.SUM))
+			grad_norm[svd_type][loss_case] = analytical_grad
 
 	import pandas as pd
 

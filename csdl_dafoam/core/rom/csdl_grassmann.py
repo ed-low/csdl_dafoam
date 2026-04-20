@@ -213,17 +213,21 @@ if __name__ == "__main__":
     U0_np    = U0_np[:, :k]
     U1_np    = U1_np[:, :k]
 
-    # Block partitioning
-    rows_per_rank = m // comm_size
-    remainder = m % comm_size
-    start = rank * rows_per_rank + min(rank, remainder)
-    end   = start + rows_per_rank + (1 if rank < remainder else 0)
-    U0_local_np = U0_np[start:end, :]
-    U1_local_np = U1_np[start:end, :]
+    # Partitioning selection
+    distribution = "block" #strided
 
-    # # Strided partitioning
-    # U0_local_np = U0_np[rank::comm_size, :]
-    # U1_local_np = U1_np[rank::comm_size, :]
+	# # Block partitioning
+    if distribution == "block":
+        rows_per_rank = m // comm_size
+        remainder = m % comm_size
+        start = rank * rows_per_rank + min(rank, remainder)
+        end   = start + rows_per_rank + (1 if rank < remainder else 0)
+        U0_local_np = U0_np[start:end, :]
+        U1_local_np = U1_np[start:end, :]
+
+    elif distribution == "strided":
+        U0_local_np = U0_np[rank::comm_size, :]
+        U1_local_np = U1_np[rank::comm_size, :]
 
     # CSDL Setup
     recorder = csdl.Recorder(inline=True, debug=True)
@@ -233,9 +237,9 @@ if __name__ == "__main__":
     alpha    = csdl.Variable(value=1)
     U0       = alpha * U0_np
     U1       = alpha * U1_np
-    U0_local = global_local_op(alpha, U0_local_np, lambda x,y:x*y, comm=comm) #csdl.Variable(value=U0_local_np)
-    U1_local = global_local_op(alpha, U1_local_np, lambda x,y:x*y, comm=comm) #csdl.Variable(value=U1_local_np) 
-
+    U0_local = global_local_op(alpha, U0_local_np, lambda x,y:x*y, comm=comm)
+    U1_local = global_local_op(alpha, U1_local_np, lambda x,y:x*y, comm=comm)
+    
     manifold_local  = Grassmann(m, k, comm=comm)
 
     gamma_local = manifold_local.log(U0_local, U1_local)
@@ -244,10 +248,6 @@ if __name__ == "__main__":
     obj_local   = csdl.norm(angles) / comm_size
     obj_global  = csdl.experimental.mpi.mpi_sum(obj_local, comm)
     
-    # obj_local   = csdl.experimental.mpi.mpi_sum(csdl.sum(U05_local), comm=comm)
-    #     mpi_region.set_as_global_output(obj_local)
-    
-    # obj_local = csdl.experimental.mpi.mpi_sum(csdl.sum(gamma_local), comm=comm)
     dv  = alpha
     obj = obj_global
 
@@ -255,207 +255,9 @@ if __name__ == "__main__":
     sim = csdl.experimental.PySimulator(recorder=recorder)
 
     analytical_grad  = sim.compute_totals(obj, dv)[obj, dv]
-    # finite_diff_grad = sim.compute_totals(obj, dv, use_finite_difference=True)[obj, dv]
-
 
     print(f"Rank {rank} obj         : {obj.value}")
     print(f"Rank {rank} Analytical  : {analytical_grad}")
-    # print(f"Rank {rank} Finite Diff : {finite_diff_grad}")
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-##################################
-####### ORIGINAL CHECK ###########
-##################################
-
-
-    # # Make a timer for the funciton calls
-    # def timed_call(func, *args, **kwargs):
-    #     start = time.perf_counter()
-    #     result = func(*args, **kwargs)
-    #     end = time.perf_counter()
-    #     dt  = comm.allreduce(end - start, op=MPI.MAX) #op=MPI.SUM) / comm_size
-    #     return result, dt
-    
-    # # We'll put all of the repeated operations in a single function
-    # def log_and_exp(manifold:Grassmann, Y0:csdl.Variable|np.ndarray, Y1:csdl.Variable|np.ndarray):
-    #     Ydot,       time_log = timed_call(manifold.log, Y0=Y0, Y1=Y1)
-    #     Ydot_eval = 0.5 * Ydot
-    #     Y1_mapped,  time_exp = timed_call(manifold.exp, Y0=Y0, Ydot=Ydot_eval)
-    #     return {"tangent":Ydot, "predicted":Y1_mapped, "log_time":time_log, "exp_time":time_exp}
-
-    # # mxn matrix retaining k modes
-    # m = 10
-    # n = 6
-    # k = 3
-
-    # # Generate bases
-    # np.random.seed(0) # Set seed for rank consistency
-    # print(f"Generating arrays...") if rank == 0 else None
-    # A0 = np.random.random((m, n))
-    # A1 = np.random.random((m, n))
-
-    # print(f"Forming bases...") if rank == 0 else None
-    # U0, _ = np.linalg.qr(A0)
-    # U1, _ = np.linalg.qr(A1)
-
-    # # Numpy variables
-    # U0       = U0[:, :k]
-    # U1       = U1[:, :k]
-
-    # # Block partitioning
-    # rows_per_rank = m // comm_size
-    # remainder = m % comm_size
-    # start = rank * rows_per_rank + min(rank, remainder)
-    # end   = start + rows_per_rank + (1 if rank < remainder else 0)
-    # U0_local = U0[start:end, :]
-    # U1_local = U1[start:end, :]
-
-    # # # Strided partitioning
-    # # U0_local = U0[rank::comm_size, :]
-    # # U1_local = U1[rank::comm_size, :]
-
-    # # CSDL Setup
-    # recorder = csdl.Recorder(inline=True, debug=True)
-    # recorder.start()
-
-    # # CSDL variables
-    # U0_csdl       = csdl.Variable(value=U0)
-    # U1_csdl       = csdl.Variable(value=U1)
-    # U0_local_csdl = csdl.Variable(value=U0_local)
-    # U1_local_csdl = csdl.Variable(value=U1_local)
-
-    # # Prepping the manifolds
-    # manifold_serial       = Grassmann(m, k)
-    # manifold_distributed  = Grassmann(m, k, comm=comm)
-
-    # # CASES
-    # # 1) Y0, Y1: NUMPY,  NUMPY
-    # # 2) Y0, Y1: CSDL,   NUMPY
-    # # 3) Y0, Y1: NUMPY,  CSDL
-    # # 4) Y0, Y1: CSDL,   CSDL
-
-    # # Diagnostic value setup
-    # data = {f"case{i}": {"serial": {}, "distributed": {}} for i in range(1, 5)}
-
-    # data["case1"]["serial"]      = {"manifold":manifold_serial,      "Y0":U0,            "Y1":U1}
-    # data["case2"]["serial"]      = {"manifold":manifold_serial,      "Y0":U0_csdl,       "Y1":U1}
-    # data["case3"]["serial"]      = {"manifold":manifold_serial,      "Y0":U0,            "Y1":U1_csdl}
-    # data["case4"]["serial"]      = {"manifold":manifold_serial,      "Y0":U0_csdl,       "Y1":U1_csdl}
-
-    # data["case1"]["distributed"] = {"manifold":manifold_distributed, "Y0":U0_local,      "Y1":U1_local}
-    # data["case2"]["distributed"] = {"manifold":manifold_distributed, "Y0":U0_local_csdl, "Y1":U1_local}
-    # data["case3"]["distributed"] = {"manifold":manifold_distributed, "Y0":U0_local,      "Y1":U1_local_csdl}
-    # data["case4"]["distributed"] = {"manifold":manifold_distributed, "Y0":U0_local_csdl, "Y1":U1_local_csdl}
-    
-    # with csdl.experimental.mpi.enter_mpi_region(rank, comm) as mpi_region:
-
-    #     # Loop through cases
-    #     for case, type_dict in data.items():
-    #         for type, value_dict in type_dict.items():
-    #             print(f"Running {case}, {type}...") if rank == 0 else None
-    #             manifold = value_dict.pop("manifold")
-    #             Y0       = value_dict.pop("Y0")
-    #             Y1       = value_dict.pop("Y1")
-                
-    #             out_values = log_and_exp(manifold=manifold, Y0=Y0, Y1=Y1)
-
-    #             Y1_pred = out_values["predicted"]
-                
-    #             comm_or_none = comm if type == "distributed" else None
-
-    #             init_angles = manifold.subspace_angles(Y0=Y0, Y1=Y1)
-    #             pred_angles = manifold.subspace_angles(Y0=Y1, Y1=Y1_pred)
-
-    #             init_dist   = csdl.norm(init_angles) if _is_csdl(init_angles) else np.linalg.norm(init_angles)
-    #             pred_dist   = csdl.norm(pred_angles) if _is_csdl(pred_angles) else np.linalg.norm(pred_angles)
-            
-    #             value_dict.update({"exp_time":out_values["exp_time"],
-    #                             "log_time":out_values["log_time"],
-    #                             "Y0Y1_angle": init_dist.value[0] if _is_csdl(init_dist) else init_dist,
-    #                             "Y1Y1_angle": pred_dist.value[0] if _is_csdl(pred_dist) else pred_dist})
-                
-    #             obj = pred_dist
-                    
-    #     mpi_region.set_as_global_output(obj)
-            
-    # # Print the output
-    # if rank == 0:
-    #     for key, case_dict in data.items():
-    #         df = pd.DataFrame.from_dict(case_dict, orient="index")
-    #         pd.set_option("display.float_format", "{:.3e}".format)
-    #         print(key)
-    #         print("-------")
-    #         print(df)
-    #         print("")
-
-    # U0_local_csdl.set_as_design_variable()
-    # obj.set_as_objective()
-
-    # recorder.stop()
-
-    # sim = csdl.experimental.PySimulator(recorder=recorder)
-
-    # # Manual derivative check
-    # analytical_grad  = sim.compute_totals(obj, U0_local_csdl)[obj, U0_local_csdl]
-    # finite_diff_grad = sim.compute_totals(obj, U0_local_csdl, use_finite_difference=True, )[obj, U0_local_csdl]
-
-    # print(f"Rank {rank} Analytical  : {analytical_grad}")
-    # print(f"Rank {rank} Finite Diff : {finite_diff_grad}")
-
-    # # # Check derivatives
-    # # import modopt as mo
-
-    # # sim         = csdl.experimental.PySimulator(recorder=recorder)
-    # # prob        = mo.CSDLAlphaProblem(problem_name="test", simulator=sim)
-    # # optimizer   = mo.SLSQP(problem=prob, solver_options={'ftol':1e-6, 'maxiter':20})
-    # # optimizer.check_first_derivatives(step=1e-6)
-
-
-
-
-
-
-##################################
-####### OLD CODE SNIPPETS ########
-##################################
-
-    # # region subspace_angles
-    # def subspace_angles(self, Y0:csdl.Variable|np.ndarray, Y1:csdl.Variable|np.ndarray):
-    #     G = self._inner_product(Y0, Y1)
-    #     U, sigma, VT = self._svd(G, is_global=True)
-
-    #     # Residual matrix directly — its singular values ARE sin(theta)
-    #     # R = Y1 - Y0 @ U @ VT  (shape: n_dof x n_modes, distributed)
-    #     Q = U @ VT         # n_modes x n_modes, global
-    #     R = Y1 - Y0 @ Q             # n_dof x n_modes, distributed
-
-    #     # All ranks should agree on Q
-    #     Q_rank0 = comm.bcast(Q.value if isinstance(Q, csdl.Variable) else Q, root=0)
-    #     assert np.allclose(Q.value if isinstance(Q, csdl.Variable) else Q, Q_rank0), f"Q mismatch on rank {comm.rank}"
-
-    #     # SVD of R directly (not R^T R) — singular values in [0,1], no sqrt needed
-    #     _, sin_sigma, _ = self._svd(R, is_global=False)  # distributed SVD of R
-
-    #     # arctan2: both inputs are clean, no clipping, no sqrt of near-zero
-    #     angles = self._arctan2(sin_sigma, sigma)
-    #     return angles

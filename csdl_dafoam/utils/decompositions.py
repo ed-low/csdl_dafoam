@@ -412,6 +412,7 @@ def orthogonality_check_distributed(matrix_local:np.ndarray, comm:MPI.Comm, weig
     return orth_err
 
 
+# region _make_test_matrix
 def _make_test_matrix(m, n, rank, decay='linear'):
     # Set seed for consistency among ranks
     np.random.seed(seed=42)
@@ -527,76 +528,3 @@ if __name__ == "__main__":
         df = pd.DataFrame.from_dict(results, orient="index")
         pd.set_option("display.float_format", "{:.3e}".format)
         print(df.T)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-# # region randomized_svd_distributed
-# def randomized_svd_distributed(A_local, n_components, n_oversampling=10, comm=MPI.Comm):
-#     rank    = comm.Get_rank()
-#     n_cols  = A_local.shape[1]
-#     k       = n_components + n_oversampling
-
-#     # Random sketch Y = A @ Omega  (each rank does its own rows)
-#     if rank == 0:
-#         Omega = np.random.randn(n_cols, k)
-#     else:
-#         Omega = np.empty((n_cols, k))
-
-#     comm.Bcast(Omega, root=0)
-
-#     Y_local = A_local @ Omega   # (local_rows x k)
-
-#     # # Orthogonalize Y via distributed QR (TSQR) -- simple version:
-#     # # gather, QR, scatter (fine for small k)
-#     # Y_global   = None
-#     # sendcounts = np.array(comm.allgather(Y_local.shape[0]))
-#     # if rank == 0:
-#     #     Y_global = np.empty((sendcounts.sum(), k))
-    
-#     # comm.Gatherv(Y_local, (Y_global, sendcounts * k), root=0)
-
-#     # Q_global = None
-#     # if rank == 0:
-#     #     Q_global, _ = np.linalg.qr(Y_global, mode='reduced')
-
-#     # # Scatter Q back
-#     # Q_local = np.empty((Y_local.shape[0], k))
-#     # comm.Scatterv((Q_global, sendcounts * k), Q_local, root=0)
-
-#     Q_local, _ = tsqr(Y_local, comm)
-
-#     # B = Q^T A  (small k x n matrix)
-#     B = comm.allreduce(Q_local.T @ A_local, op=MPI.SUM)
-
-#     # SVD of small B
-#     if rank == 0:
-#         U_hat, S, VT = np.linalg.svd(B, full_matrices=False)
-#         U_hat = np.ascontiguousarray(U_hat[:, :n_components])
-#         S     = S[:n_components]
-#         VT    = VT[:n_components, :]
-    
-#     else:
-#         U_hat = np.ascontiguousarray(np.empty((k, n_components)))
-#         S     = np.empty(n_components)
-#         VT    = np.empty((n_components, n_cols))
-
-#     comm.Bcast(U_hat, root=0)
-#     comm.Bcast(S,     root=0)
-#     comm.Bcast(VT,    root=0)
-
-#     # Recover distributed U
-#     U_local = Q_local @ U_hat   # (local_rows x n_components)
-
-#     return U_local, S, VT
