@@ -1,239 +1,434 @@
 import numpy as np
 import csdl_alpha as csdl
-import os
-from csdl_dafoam.utils.custom_explicit_reduced_svd import customExplicitReducedSVD
+from csdl_dafoam.utils.custom_explicit_reduced_svd import customExplicitReducedSVD, customExplicitReducedSVDDistributed
+from csdl_dafoam.utils.decompositions import svd_distributed
 from mpi4py import MPI
+from typing import List
 
 
 # region GRASSMANN
 class Grassmann:
-    def __init__(self, n: int, k: int):
+    def __init__(self, m:int, k:int, comm:MPI.Comm|None=None, inner_product_weights:np.ndarray|None=None):
         """
         Represent the Grassmann manifold Gr(n, k):
         - n: ambient dimension
         - k: subspace dimension
         """
-        self.n = n
-        self.k = k
+        self.m       = m
+        self.k       = k
+        self.comm    = comm
+        self.weights = inner_product_weights
+
 
     # region exp
-    def exp(self, Y0, Ydot):
+    def exp(self, Y0:csdl.Variable|np.ndarray, Ydot:csdl.Variable|np.ndarray):
         """Exponential map at point Y0 with tangent vector Ydot."""
-
+        
         if len(Y0.shape) > 2 or len(Ydot.shape) > 2:
             raise NotImplementedError("Batch mode not implemented yet for Grassmann exp map.")
-
-        else:
-            csdl_svd = customExplicitReducedSVD()
-            U, S, VT  = csdl_svd.evaluate(Ydot)
-            return U @ (csdl.einsum(VT.T(), csdl.cos(S), action='ij,j->ij')) + csdl.einsum(U, csdl.sin(S), action='ij,j->ij')
+        U, S, VT  = self._svd(Ydot)
+        V         = self._T(VT)
+        return Y0 @ self._A_times_diagB(V, self._cos(S)) + self._A_times_diagB(U, self._sin(S))
 
 
     # region log
-    def log(self, Y0, Y1):
+    def log(self, Y0:csdl.Variable|np.ndarray, Y1:csdl.Variable|np.ndarray):
         """Logarithm map: tangent vector at Y0 pointing to Y1."""
 
         if len(Y0.shape) > 2 or len(Y1.shape) > 2:
             raise NotImplementedError("Batch mode not implemented yet for Grassmann log map.")
-
-        else:
-            csdl_svd1 = customExplicitReducedSVD()
-            csdl_svd2 = customExplicitReducedSVD()
-            I = np.eye(Y0.shape[0])
-
-            P, S, RT = csdl_svd1.evaluate(Y1.T() @ Y0)
-            Y_star   = Y1 @ (P @ RT)
-            L        = (I - Y0 @ Y0.T()) @ Y_star
-            Q, E, VT = csdl_svd2.evaluate(L)
-            theta    = csdl.arcsin(E)
-            return Q @ csdl.einsum(theta, VT, action='i,ij->ij')
-
-
-    # region distance
-    def distance(self, Y0, Y1):
-        """Geodesic distance between two points on the manifold."""
-        pass
-
-
-    # region geodesic
-    def geodesic(self, Y0, Ydot, t):
-        """Point along geodesic starting at Y0 in direction Ydot."""
-        pass
+        P, _, RT = self._svd(self._inner_product(Y1, Y0), is_global=True)
+        Y_star   = Y1 @ (P @ RT)
+        L        = Y_star - Y0 @ self._inner_product(Y0, Y_star)
+        Q, E, VT = self._svd(L)
+        theta    = self._arcsin(E)
+        return Q @ self._diagA_times_B(theta, VT)
     
 
-    # region project_tangent
-    def project_tangent(self, Y, Z):
-        """Project matrix Z onto tangent space at Y."""
-        pass
+    # region subspace_angles
+    def subspace_angles(self, Y0, Y1):
+        G = self._inner_product(Y0, Y1)
+        _, sigma, _ = self._svd(G, is_global=True, clip_range=[-1., 1.])
+        angles = self._arccos(sigma)
+        return angles
+    
+
+    # The below functions abstract the CSDL/Numpy variables and the MPI handling
 
 
-# region GRASSMANNINTERPOLATOR
-class GrassmannInterpolator:
-    def __init__(self, manifold: Grassmann, parameters:list[np.ndarray]=[], points:list[np.ndarray]=[], normalize_parameters:bool=True):
-        self.manifold   = manifold
-        self.parameters = parameters
-        self.points     = points
-        self.normalize_parameters = normalize_parameters
-
-    def add_point(self, mu, Y):
-        """Add new sample point (parameter mu, basis Y)."""
-        self.parameters.append(mu)
-        self.points.append(Y)
-
-    def interpolate(self, mu_new):
-        """
-        Interpolate subspace at new parameter.
-        Typically: choose reference Y_ref,
-        log map all others to tangent space,
-        interpolate tangent vectors,
-        map back with exp.
-        """
-
-        manifold = self.manifold
-
-        # Find closest point as reference (in parameter space)
-        distances = [np.linalg.norm(mu_new - mu) for mu in self.parameters]
-        sorted_indices = np.argsort(distances)
-        idx_ref   = sorted_indices[0]
-        Y_ref     = self.points[idx_ref]
-
-        # Log map all points to tangent space at Y_ref
-        tangent_vectors = []
-        for i, Y in enumerate(self.points):
-            if i == idx_ref:
-                tangent_vectors.append(np.zeros_like(Y_ref))
+    # region _svd
+    def _svd(self, matrix:csdl.Variable|np.ndarray, is_global:bool=False, clip_range:List[float]|None=None):
+        comm = self.comm
+        if _is_csdl(matrix):
+            if comm is None or is_global:
+                U, S, VT = customExplicitReducedSVD(clip_singular_vals=clip_range).evaluate(matrix)
             else:
-                Ydot = manifold.log(Y_ref, Y)
-                tangent_vectors.append(Ydot)
-        
-        # Interpolate tangent vectors
-
-        # Exp map back to manifold
-
-        
-        pass
-
-
-
-def weighted_interp(values:np.ndarray, desired_value:np.ndarray, normalize:bool=True, method:str='idw', 
-                    basis_function:str='gaussian', distance_exponent:float=2.0, gauss_constant:float=np.inf,
-                    multi_constant:float=np.inf, thin_constant:float=np.inf, element_weights:np.ndarray=None, semivariogram:str='linear'):
-    
-    """ Interpolation function for scalar or vector values based on various methods.
-
-    Parameters
-    ----------
-    values : np.ndarray
-        Array of known values to interpolate from. Shape (num_samples, value_dim).
-    desired_value : np.ndarray
-        The point at which to interpolate. Shape (value_dim,).
-    normalize : bool, optional
-        If True, min-max normalize each column using values' min and max, by default True.
-    method : str, optional
-        Interpolation method: 'idw', 'rbf', 'kriging', by default 'idw'.
-    basis_function : str, optional
-        Basis function for RBF: 'gaussian', 'multiquadric', 'thin_plate', by default 'gaussian'.
-    distance_exponent : float, optional
-        Exponent for distance in IDW, by default 2.0. (1/x^p)
-    guass_constant, multi_constant, thin_constant : float, optional
-        Tuning constants for RBF basis functions, by default np.inf.
-    element_weights : np.ndarray, optional
-        Weights for each sample point, by default None.
-    semivariogram : str, optional
-        Semivariogram model for Kriging: 'linear', 'spherical', 'exponential', by default 'linear'.
-
-    Returns
-    -------
-    np.ndarray
-        Interpolation weights for each row of values. Shape (num_samples,).
-    np.ndarray
-        Euclidian distances (with element_weights applied) from desired_value to each row in values. Shape (num_samples,).
-    """
-
-    # Make sure arrays are numpy ndarrays and have correct shapes
-    values        = np.asarray(values, dtype=float)
-    desired_value = np.asarray(desired_value, dtype=float).flatten()
-
-    if values.ndim != 2:
-        raise ValueError("values must be a 2D array with shape (num_samples, value_dim).")
-    m, n = values.shape
-
-    # Dimension checks
-    if n != desired_value.size:
-        if m == desired_value.size:
-            warnings.warn("desired_value has incompatible shape; attempting to reshape.")
-            values = values.T
-            m, n = values.shape
+                U, S, VT = customExplicitReducedSVDDistributed(comm=comm).evaluate(matrix)
         else:
-            raise ValueError("Incompatible shapes between values and desired_value.")
+            if comm is None or is_global:
+                U, S, VT = np.linalg.svd(matrix, full_matrices=False)
+                if clip_range is not None:
+                    S = np.clip(S, clip_range[0], clip_range[1])
+            else:
+                U, S, VT = svd_distributed(matrix, comm=comm)
+        return U, S, VT
     
-    # Normalize values and desired_value if specified
-    if element_weights is None:
-        element_weights = np.ones(n)
-    else:
-        element_weights = np.asarray(element_weights, dtype=float).flatten()
-        if element_weights.size != n:
-            raise ValueError("element_weights must have shape (value_dim,).")
 
-    s = element_weights.sum()
+    # region _inner_product
+    def _inner_product(self, A:csdl.Variable|np.ndarray, B:csdl.Variable|np.ndarray):
+        comm = self.comm
+        m    = self.weights
 
-    if s == 0:
-        raise ValueError("Sum of element_weights cannot be zero.")
-    if not np.isclose(s, 1.0):
-        element_weights = element_weights / s
+        # Check if we have csdl variables
+        csdl_vars = _is_csdl(A) or _is_csdl(B)
 
-    # Normalize columns if requested (min-max per column)
-    if normalize:
-        min_values = np.min(values, axis=0)
-        max_values = np.max(values, axis=0)
-        denom      = max_values - min_values
-        denom[denom == 0] = 1.0  # Prevent division by zero
-        values = (values - min_values) / denom
-        desired_value = (desired_value - min_values) / denom
+        prod = self._T(A) @ B if self.weights is None else self._T(A) @ self._diagA_times_B(m, B)
 
-    # Compute weighted Euclidean distances
-    diffs     = (values - desired_value) * element_weights
-    distances = np.sqrt(np.sum(diffs **2, axis=1))
-
-    # Default parameters
-    method_ls = method.lower()
-    p         = distance_exponent
-    basis     = basis_function.lower()
-
-    # Sigma logic: min(gauss_constant, min(distances))
-    dist_min = distances.min()
-    dist_max = distances.max()
-    sigma    = min(gauss_constant, dist_min)
-    if sigma == 0:
-        sigma = 0.1 * (dist_max - dist_min)
-
-    b = min(multi_constant, np.mean([distances.mean(), dist_max]))
-    c = min(thin_constant, dist_min)
-
-    # Case for exact match
-    zero_idx = np.where(distances == 0)[0]
-    if zero_idx.size > 0:
-        weights = np.zeros(m)
-        weights[zero_idx[0]] = 1.0
-        return weights, distances
-
-    # Choose weighting / basis
-    if method_lc == "idw":
-        def phi(x): return 1.0 / np.power(x, p)
-    
-    elif method_lc == "rbf":
-        if basis == "gaussian":
-            def phi(x): return np.exp(- (x ** 2) / (2 * sigma ** 2))
-        elif basis == "multiquadric":
-            def phi(x): return np.sqrt(x ** 2 + b ** 2)
-        elif basis == "thin_plate":
-            def phi(x): return (x ** 2) * np.log(x / c)
+        # Perform the reduction for the distributed case (assumed when the communicator is passed)
+        if comm is None:
+            out_value = prod
         else:
-            raise ValueError(f"Unknown basis_function '{basis_function}' for RBF.")
-    
-    elif method_lc == "kriging":
+            out_value = csdl.experimental.mpi.mpi_sum(prod, comm=comm) if csdl_vars else comm.allreduce(prod, op=MPI.SUM)
+        return out_value
+        
 
-        var_vec = 1 / element_weights
+    # region _diagA_times_B
+    def _diagA_times_B(self, A:csdl.Variable|np.ndarray, B:csdl.Variable|np.ndarray):
+        if _is_csdl(A) or _is_csdl(B):
+            diagA_B = csdl.einsum(A, B, action='i,ij->ij')
+        else:
+            diagA_B = A[:, None] * B
+        return diagA_B
+    
+
+    # region _A_times_diagB
+    def _A_times_diagB(self, A:csdl.Variable|np.ndarray, B:csdl.Variable|np.ndarray):
+        if _is_csdl(A) or _is_csdl(B):
+            A_diagB = csdl.einsum(A, B, action='ij,j->ij')
+        else:
+            A_diagB = A * B[None, :]
+        return A_diagB
+    
+
+    # region _sin
+    def _sin(self, value:csdl.Variable|np.ndarray):
+        return csdl.sin(value) if _is_csdl(value) else np.sin(value)
+    
+
+    # region _cos
+    def _cos(self, value:csdl.Variable|np.ndarray):
+        return csdl.cos(value) if _is_csdl(value) else np.cos(value)
+    
+
+    # region _arcsin
+    def _arcsin(self, value:csdl.Variable|np.ndarray):
+        return csdl.arcsin(value) if _is_csdl(value) else np.arcsin(value)
+    
+
+    # region _arccos
+    def _arccos(self, value:csdl.Variable|np.ndarray):
+        return csdl.arccos(value) if _is_csdl(value) else np.arccos(value)
+    
+
+    # region _T
+    def _T(self, matrix:csdl.Variable|np.ndarray):
+        return matrix.T() if _is_csdl(matrix) else matrix.T
+    
+
+    # region _sqrt
+    def _sqrt(self, x:csdl.Variable|np.ndarray):
+        return csdl.sqrt(x) if _is_csdl(x) else np.sqrt(x)
+
+
+    # region _arctan2
+    def _arctan2(self, y:csdl.Variable|np.ndarray, x:csdl.Variable|np.ndarray):
+        # csdl does not have arctan2... Use csdl.arctan with care!
+        # arctan(y/x) is fine for principal angles since x=sigma >= 0 
+        if _is_csdl(y) or _is_csdl(x):
+            return csdl.arctan(y / (x + 1e-30))  # x>=0 always, tiny guard only for grad
+        else:
+            return np.arctan2(y, x)
+
+
+# region _is_csdl
+def _is_csdl(var:csdl.Variable|np.ndarray):
+    return isinstance(var, csdl.Variable)
+
+
 
     
+
+# region MAIN
+if __name__ == "__main__":
+
+    import time
+    import pandas as pd
+
+    # Set up communicator
+    comm      = MPI.COMM_WORLD
+    rank      = comm.Get_rank()
+    comm_size = comm.Get_size()
+
+    # mxn matrix retaining k modes
+    m = 9
+    n = 6
+    k = 3
+
+    # Generate bases
+    np.random.seed(0) # Set seed for rank consistency
+    print(f"Generating arrays...") if rank == 0 else None
+    A0 = np.random.random((m, n))
+    A1 = np.random.random((m, n))
+
+    print(f"Forming bases...") if rank == 0 else None
+    U0, _ = np.linalg.qr(A0)
+    U1, _ = np.linalg.qr(A1)
+
+    # Numpy variables
+    U0       = U0[:, :k]
+    U1       = U1[:, :k]
+
+    # Block partitioning
+    rows_per_rank = m // comm_size
+    remainder = m % comm_size
+    start = rank * rows_per_rank + min(rank, remainder)
+    end   = start + rows_per_rank + (1 if rank < remainder else 0)
+    U0_local = U0[start:end, :]
+    U1_local = U1[start:end, :]
+
+    # # Strided partitioning
+    # U0_local = U0[rank::comm_size, :]
+    # U1_local = U1[rank::comm_size, :]
+
+    # CSDL Setup
+    recorder = csdl.Recorder(inline=True, debug=True)
+    recorder.start()
+
+    # CSDL variables
+    U0_csdl       = csdl.Variable(value=U0)
+    U1_csdl       = csdl.Variable(value=U1)
+
+    U0_local_csdl = csdl.Variable(value=U0_local)
+    U1_local_csdl = csdl.Variable(value=U1_local) 
+
+    manifold_local  = Grassmann(m, k, comm=comm)
+
+    # with csdl.experimental.mpi.enter_mpi_region(rank=rank, comm=comm) as mpi_region:
+    #     U0_local_csdl = mpi_region.split_custom(U0_local_csdl, split_func=lambda x: x)
+    #     U1_local_csdl = mpi_region.split_custom(U1_local_csdl, split_func=lambda x: x)
+    #     print(rank, U0_local_csdl.shape)
+        
+    gamma_local = manifold_local.log(U0_local_csdl, U1_local_csdl)
+    obj_local   = csdl.experimental.mpi.mpi_sum(csdl.sum(gamma_local), comm=comm)
+    #     mpi_region.set_as_global_output(obj_local)
     
+    # obj_local = csdl.experimental.mpi.mpi_sum(csdl.sum(gamma_local), comm=comm)
+    dv  = U0_local_csdl
+    obj = obj_local
+
+    recorder.stop()
+    sim = csdl.experimental.PySimulator(recorder=recorder)
+
+    analytical_grad  = sim.compute_totals(obj, dv)[obj, dv]
+    # finite_diff_grad = sim.compute_totals(obj, dv, use_finite_difference=True)[obj, dv]
+
+    print(f"Rank {rank} Analytical  : {analytical_grad}")
+    # print(f"Rank {rank} Finite Diff : {finite_diff_grad}")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+##################################
+####### ORIGINAL CHECK ###########
+##################################
+
+
+    # # Make a timer for the funciton calls
+    # def timed_call(func, *args, **kwargs):
+    #     start = time.perf_counter()
+    #     result = func(*args, **kwargs)
+    #     end = time.perf_counter()
+    #     dt  = comm.allreduce(end - start, op=MPI.MAX) #op=MPI.SUM) / comm_size
+    #     return result, dt
+    
+    # # We'll put all of the repeated operations in a single function
+    # def log_and_exp(manifold:Grassmann, Y0:csdl.Variable|np.ndarray, Y1:csdl.Variable|np.ndarray):
+    #     Ydot,       time_log = timed_call(manifold.log, Y0=Y0, Y1=Y1)
+    #     Ydot_eval = 0.5 * Ydot
+    #     Y1_mapped,  time_exp = timed_call(manifold.exp, Y0=Y0, Ydot=Ydot_eval)
+    #     return {"tangent":Ydot, "predicted":Y1_mapped, "log_time":time_log, "exp_time":time_exp}
+
+    # # mxn matrix retaining k modes
+    # m = 10
+    # n = 6
+    # k = 3
+
+    # # Generate bases
+    # np.random.seed(0) # Set seed for rank consistency
+    # print(f"Generating arrays...") if rank == 0 else None
+    # A0 = np.random.random((m, n))
+    # A1 = np.random.random((m, n))
+
+    # print(f"Forming bases...") if rank == 0 else None
+    # U0, _ = np.linalg.qr(A0)
+    # U1, _ = np.linalg.qr(A1)
+
+    # # Numpy variables
+    # U0       = U0[:, :k]
+    # U1       = U1[:, :k]
+
+    # # Block partitioning
+    # rows_per_rank = m // comm_size
+    # remainder = m % comm_size
+    # start = rank * rows_per_rank + min(rank, remainder)
+    # end   = start + rows_per_rank + (1 if rank < remainder else 0)
+    # U0_local = U0[start:end, :]
+    # U1_local = U1[start:end, :]
+
+    # # # Strided partitioning
+    # # U0_local = U0[rank::comm_size, :]
+    # # U1_local = U1[rank::comm_size, :]
+
+    # # CSDL Setup
+    # recorder = csdl.Recorder(inline=True, debug=True)
+    # recorder.start()
+
+    # # CSDL variables
+    # U0_csdl       = csdl.Variable(value=U0)
+    # U1_csdl       = csdl.Variable(value=U1)
+    # U0_local_csdl = csdl.Variable(value=U0_local)
+    # U1_local_csdl = csdl.Variable(value=U1_local)
+
+    # # Prepping the manifolds
+    # manifold_serial       = Grassmann(m, k)
+    # manifold_distributed  = Grassmann(m, k, comm=comm)
+
+    # # CASES
+    # # 1) Y0, Y1: NUMPY,  NUMPY
+    # # 2) Y0, Y1: CSDL,   NUMPY
+    # # 3) Y0, Y1: NUMPY,  CSDL
+    # # 4) Y0, Y1: CSDL,   CSDL
+
+    # # Diagnostic value setup
+    # data = {f"case{i}": {"serial": {}, "distributed": {}} for i in range(1, 5)}
+
+    # data["case1"]["serial"]      = {"manifold":manifold_serial,      "Y0":U0,            "Y1":U1}
+    # data["case2"]["serial"]      = {"manifold":manifold_serial,      "Y0":U0_csdl,       "Y1":U1}
+    # data["case3"]["serial"]      = {"manifold":manifold_serial,      "Y0":U0,            "Y1":U1_csdl}
+    # data["case4"]["serial"]      = {"manifold":manifold_serial,      "Y0":U0_csdl,       "Y1":U1_csdl}
+
+    # data["case1"]["distributed"] = {"manifold":manifold_distributed, "Y0":U0_local,      "Y1":U1_local}
+    # data["case2"]["distributed"] = {"manifold":manifold_distributed, "Y0":U0_local_csdl, "Y1":U1_local}
+    # data["case3"]["distributed"] = {"manifold":manifold_distributed, "Y0":U0_local,      "Y1":U1_local_csdl}
+    # data["case4"]["distributed"] = {"manifold":manifold_distributed, "Y0":U0_local_csdl, "Y1":U1_local_csdl}
+    
+    # with csdl.experimental.mpi.enter_mpi_region(rank, comm) as mpi_region:
+
+    #     # Loop through cases
+    #     for case, type_dict in data.items():
+    #         for type, value_dict in type_dict.items():
+    #             print(f"Running {case}, {type}...") if rank == 0 else None
+    #             manifold = value_dict.pop("manifold")
+    #             Y0       = value_dict.pop("Y0")
+    #             Y1       = value_dict.pop("Y1")
+                
+    #             out_values = log_and_exp(manifold=manifold, Y0=Y0, Y1=Y1)
+
+    #             Y1_pred = out_values["predicted"]
+                
+    #             comm_or_none = comm if type == "distributed" else None
+
+    #             init_angles = manifold.subspace_angles(Y0=Y0, Y1=Y1)
+    #             pred_angles = manifold.subspace_angles(Y0=Y1, Y1=Y1_pred)
+
+    #             init_dist   = csdl.norm(init_angles) if _is_csdl(init_angles) else np.linalg.norm(init_angles)
+    #             pred_dist   = csdl.norm(pred_angles) if _is_csdl(pred_angles) else np.linalg.norm(pred_angles)
+            
+    #             value_dict.update({"exp_time":out_values["exp_time"],
+    #                             "log_time":out_values["log_time"],
+    #                             "Y0Y1_angle": init_dist.value[0] if _is_csdl(init_dist) else init_dist,
+    #                             "Y1Y1_angle": pred_dist.value[0] if _is_csdl(pred_dist) else pred_dist})
+                
+    #             obj = pred_dist
+                    
+    #     mpi_region.set_as_global_output(obj)
+            
+    # # Print the output
+    # if rank == 0:
+    #     for key, case_dict in data.items():
+    #         df = pd.DataFrame.from_dict(case_dict, orient="index")
+    #         pd.set_option("display.float_format", "{:.3e}".format)
+    #         print(key)
+    #         print("-------")
+    #         print(df)
+    #         print("")
+
+    # U0_local_csdl.set_as_design_variable()
+    # obj.set_as_objective()
+
+    # recorder.stop()
+
+    # sim = csdl.experimental.PySimulator(recorder=recorder)
+
+    # # Manual derivative check
+    # analytical_grad  = sim.compute_totals(obj, U0_local_csdl)[obj, U0_local_csdl]
+    # finite_diff_grad = sim.compute_totals(obj, U0_local_csdl, use_finite_difference=True, )[obj, U0_local_csdl]
+
+    # print(f"Rank {rank} Analytical  : {analytical_grad}")
+    # print(f"Rank {rank} Finite Diff : {finite_diff_grad}")
+
+    # # # Check derivatives
+    # # import modopt as mo
+
+    # # sim         = csdl.experimental.PySimulator(recorder=recorder)
+    # # prob        = mo.CSDLAlphaProblem(problem_name="test", simulator=sim)
+    # # optimizer   = mo.SLSQP(problem=prob, solver_options={'ftol':1e-6, 'maxiter':20})
+    # # optimizer.check_first_derivatives(step=1e-6)
+
+
+
+
+
+
+##################################
+####### OLD CODE SNIPPETS ########
+##################################
+
+    # # region subspace_angles
+    # def subspace_angles(self, Y0:csdl.Variable|np.ndarray, Y1:csdl.Variable|np.ndarray):
+    #     G = self._inner_product(Y0, Y1)
+    #     U, sigma, VT = self._svd(G, is_global=True)
+
+    #     # Residual matrix directly — its singular values ARE sin(theta)
+    #     # R = Y1 - Y0 @ U @ VT  (shape: n_dof x n_modes, distributed)
+    #     Q = U @ VT         # n_modes x n_modes, global
+    #     R = Y1 - Y0 @ Q             # n_dof x n_modes, distributed
+
+    #     # All ranks should agree on Q
+    #     Q_rank0 = comm.bcast(Q.value if isinstance(Q, csdl.Variable) else Q, root=0)
+    #     assert np.allclose(Q.value if isinstance(Q, csdl.Variable) else Q, Q_rank0), f"Q mismatch on rank {comm.rank}"
+
+    #     # SVD of R directly (not R^T R) — singular values in [0,1], no sqrt needed
+    #     _, sin_sigma, _ = self._svd(R, is_global=False)  # distributed SVD of R
+
+    #     # arctan2: both inputs are clean, no clipping, no sqrt of near-zero
+    #     angles = self._arctan2(sin_sigma, sigma)
+    #     return angles

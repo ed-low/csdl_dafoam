@@ -34,7 +34,7 @@ def instantiateDAFoam(options, comm, run_directory=None, mesh_options=None):
         mesh = USMesh(options=mesh_options, comm=comm)
         dafoam_instance.setMesh(mesh)
 
-    # CHANGE DIRECTORY WORKAROUND 2/4
+    # CHANGE DIRECTORY WORKAROUND 2/5
     if USE_CHANGE_DIRECTORY_WORKAROUND:
         dafoam_instance.run_directory = run_directory
         os.chdir(current_directory)

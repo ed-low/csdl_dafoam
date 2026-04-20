@@ -293,6 +293,7 @@ class InverseDistanceWeightingComponent(CustomExplicitOperation):
 
 
 
+
 # region main
 if __name__ == "__main__":
 
@@ -306,20 +307,17 @@ if __name__ == "__main__":
     margin             = 0.2
 
 
-    x_i_min  = np.array([0, 5])
-    x_i_max  = np.array([7000, 13000])
+    x_i_min  = np.array([0, 7000])
+    x_i_max  = np.array([5, 13000])
     x_i_span = x_i_max - x_i_min
 
     # Generate samples
     xlimits     = np.array([x_i_min, x_i_max]).T
-    sampler     = LHS(xlimits=xlimits, criterion='m', random_state=0)
+    sampler     = LHS(xlimits=xlimits, criterion='m', seed=0)
     x_i         = sampler(num_samples)  # Shape: (num_samples, total_elements)
 
     # Generate value
     x_value  = x_i_min + x_i_span * (margin + (1 - 2 * margin) * np.random.random(size=(variable_dimension, )))
-
-    print(x_i)
-    print(x_value)
 
     recorder = csdl.Recorder(inline=True, debug=True)
     recorder.start()

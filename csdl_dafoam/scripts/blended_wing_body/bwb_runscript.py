@@ -663,56 +663,68 @@ recorder.stop()
 
 
 
-# ===============================
-# region SIM
-# ===============================
-sim = csdl.experimental.PySimulator(recorder)
+# # ===============================
+# # region SIM
+# # ===============================
+# sim = csdl.experimental.PySimulator(recorder)
 
-# Only allow visualization and modopt output files on the root rank
-visualize_on_this_rank           = True  if rank == 0 and not is_headless() else False
-turn_off_outputs_on_nonroot_rank = False if rank == 0 else True
-recording_on_root_rank           = True  if rank == 0 else False
-rank_outputs                     = ['x'] if rank == 0 else []
+# # Only allow visualization and modopt output files on the root rank
+# visualize_on_this_rank           = True  if rank == 0 and not is_headless() else False
+# turn_off_outputs_on_nonroot_rank = False if rank == 0 else True
+# recording_on_root_rank           = True  if rank == 0 else False
+# rank_outputs                     = ['x'] if rank == 0 else []
 
-# Optimization solver setup and run
-prob                = CSDLAlphaProblem(problem_name=f'{problem_name}', simulator=sim)
-optimizer_choice    = 2 # Set to 1 for PySLSQP, 2 for OpenSQP, or 3 for InteriorPoint
+# # Optimization solver setup and run
+# prob                = CSDLAlphaProblem(problem_name=f'{problem_name}', simulator=sim)
+# optimizer_choice    = 2 # Set to 1 for PySLSQP, 2 for OpenSQP, or 3 for InteriorPoint
 
-if optimizer_choice == 1:
-    # PySLSQP optimizer setup
-    solver_options = {'maxiter': 20,
-                    'iprint': 2,
-                    'readable_outputs': rank_outputs,
-                    'recording': recording_on_root_rank,
-                    'turn_off_outputs': turn_off_outputs_on_nonroot_rank}
-    optimizer   = PySLSQP(prob, solver_options=solver_options)
-    optimizer.solve()
-    optimizer.print_results()
+# if optimizer_choice == 1:
+#     # PySLSQP optimizer setup
+#     solver_options = {'maxiter': 20,
+#                     'iprint': 2,
+#                     'readable_outputs': rank_outputs,
+#                     'recording': recording_on_root_rank,
+#                     'turn_off_outputs': turn_off_outputs_on_nonroot_rank}
+#     optimizer   = PySLSQP(prob, solver_options=solver_options)
+#     optimizer.solve()
+#     optimizer.print_results()
 
-elif optimizer_choice == 2:
-    # OpenSQP optimizer setup
-    open_sqp_options = {'maxiter': 80,
-                        'readable_outputs': rank_outputs,
-                        'recording': recording_on_root_rank,
-                        'ls_max_step': 1.,
-                        'turn_off_outputs': turn_off_outputs_on_nonroot_rank,
-                        'hot_start_from': '/media/edward/DATA/Edward/AFRL_project/csdl_dafoam_workspace/blended_wing_body_case/results/case5_opensqp/case5_opensqp_outputs/2026-02-05_07.59.06.838711/record.hdf5',
-                        'hot_start_rtol': 1e-4}
-    optimizer = OpenSQP(prob, **open_sqp_options)
-    optimizer.solve()
-    optimizer.print_results()
+# elif optimizer_choice == 2:
+#     # OpenSQP optimizer setup
+#     open_sqp_options = {'maxiter': 80,
+#                         'readable_outputs': rank_outputs,
+#                         'recording': recording_on_root_rank,
+#                         'ls_max_step': 1.,
+#                         'turn_off_outputs': turn_off_outputs_on_nonroot_rank,
+#                         'hot_start_from': '/media/edward/DATA/Edward/AFRL_project/csdl_dafoam_workspace/blended_wing_body_case/results/case5_opensqp/case5_opensqp_outputs/2026-02-05_07.59.06.838711/record.hdf5',
+#                         'hot_start_rtol': 1e-4}
+#     optimizer = OpenSQP(prob, **open_sqp_options)
+#     optimizer.solve()
+#     optimizer.print_results()
 
-elif optimizer_choice == 3:
-    # InteriorPoint optimizer setup
-    interior_point_options = {'maxiter': 40,
-                            'readable_outputs': rank_outputs,
-                            'recording': recording_on_root_rank,
-                            'ls_max_step': 1.,
-                            'turn_off_outputs': turn_off_outputs_on_nonroot_rank}
-    optimizer   = InteriorPoint(prob, **interior_point_options)
-    optimizer.solve()
-    optimizer.print_results()
+# elif optimizer_choice == 3:
+#     # InteriorPoint optimizer setup
+#     interior_point_options = {'maxiter': 40,
+#                             'readable_outputs': rank_outputs,
+#                             'recording': recording_on_root_rank,
+#                             'ls_max_step': 1.,
+#                             'turn_off_outputs': turn_off_outputs_on_nonroot_rank}
+#     optimizer   = InteriorPoint(prob, **interior_point_options)
+#     optimizer.solve()
+#     optimizer.print_results()
     
-else:
-    print(f'Check optimizer choice. {optimizer_choice} is not an option.')
+# else:
+#     print(f'Check optimizer choice. {optimizer_choice} is not an option.')
+
+
+
+# ===============================
+# region COMPONENT TESTS
+# ===============================
+from csdl_dafoam.utils.csdl_test_functions import CustomComponentChecks
+import matplotlib.pyplot as plt
+
+component_testing = CustomComponentChecks(idwarp_model, comm=comm)
+# component_testing.run_inverse_jacobian_fd_sweep(eps_test_values=10. ** np.array(range(-2, -10, -1)))
+component_testing.run_jacvec_fd_sweep(eps_test_values=10. ** np.array(range(-10, -2)))
 

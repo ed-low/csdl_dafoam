@@ -288,7 +288,7 @@ class CustomComponentChecks():
             raise ValueError(f'"{mode}" not recognized. Only support "fwd" and "rev" modes') 
 
         # --- Compare ---
-        err = np.abs((lhs - rhs) / (rhs))
+        err = np.abs((lhs - rhs) / (lhs))
 
         self.print0(f"LHS (w^T J^T v): {lhs}")
         self.print0(f"RHS (v^T J w): {rhs}")
@@ -390,7 +390,7 @@ class CustomComponentChecks():
                 rhs += name_dot
 
         # --- Compare ---
-        err = np.abs((lhs - rhs) / (rhs))
+        err = np.abs((lhs - rhs) / (lhs))
 
         self.print0(f"LHS (v^T v): {lhs}")
         self.print0(f"RHS ((J^-T v)^T (J v)): {rhs}")
