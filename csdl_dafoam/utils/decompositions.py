@@ -175,14 +175,9 @@ def method_of_snapshots_tsqr(matrix_local:np.ndarray, comm:MPI.Comm, weights_loc
     else:
         A_weighted_local = A_local
 
-    # Distributed TSQR on Ã: condition number of R = condition number of Ã
-    # (NOT squared, unlike forming AᵀWA directly)
-    _, R = tsqr(A_weighted_local, comm)
-
-    # SVD of small R (n×n): cheap, replicated on all ranks
-    # This is the key: SVD of R avoids squaring the condition number
-    _, s_vals, VT = np.linalg.svd(R, full_matrices=False)
-    V = VT.T  # (n x n)
+    # # Distributed SVD on Ã: condition number of R = condition number of Ã
+    _, s_vals, VT = svd_tsqr(A_weighted_local, comm)
+    V = VT.T
 
     # Recover distributed modes in ORIGINAL (unweighted) space
     # Weights were baked into Ã, so A_local here is the original unweighted data
@@ -264,12 +259,12 @@ def svd_tsqr(matrix_local:np.ndarray, comm:MPI.Comm):
     # This is exact — no approximation
     U_R, s_vals, VT = np.linalg.svd(R, full_matrices=False)
 
-    idx = np.argmax(np.abs(U_R), axis=0)
+    # Orient
+    idx   = np.argmax(np.abs(U_R), axis=0)
     signs = np.sign(U_R[idx, np.arange(U_R.shape[1])])
     signs[signs == 0] = 1.0
-
-    U_R = U_R * signs
-    VT = VT * signs[:, None]
+    U_R   = U_R * signs
+    VT    = VT * signs[:, None]
     
     # Recover distributed U
     U_local = Q_local @ U_R  # (local_rows x n_retained)
