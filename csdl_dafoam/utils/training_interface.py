@@ -10,6 +10,7 @@ from mpi4py import MPI
 from vedo import Arrows, Points, Plotter, Text2D
 from csdl_dafoam.utils.runscript_helper_functions import quiet_barrier
 from csdl_dafoam.utils.standard_atmosphere_model import compute_ambient_conditions_group
+from csdl_dafoam.utils.decompositions import method_of_snapshots_distributed
 import matplotlib.pyplot as plt
 
 
@@ -750,13 +751,15 @@ class TrainingDataInterface():
             data_dict["states"][state_var] = 1/scaling_values[state_var] * (data_dict["states"][state_var] - reference_state[state_var][:, None])
 
         # Only need state data and number of samples for POD computation
-        data                = data_dict["states"]
-
-        # Number of samples correction
-        data["num_samples"] = data[next(iter(data))].shape[1] # Get the number of columns of first state entry
+        data_array    = np.concatenate([data_dict["states"][state_var] for state_var in self.state_info.keys()])
+        weights_array = np.concatenate([weights[state_var] for state_var in self.state_info.keys()])
 
         # Actual POD computation
-        local_modes, singular_values = self._method_of_snapshots(data, weights)
+        modes_array, singular_values = method_of_snapshots_distributed(matrix_local=data_array,
+                                                                       comm=self.comm, method="tsqr",
+                                                                       weights_local=weights_array)
+        
+        local_modes = {state_name:modes_array[info["indices"], :] for state_name, info in self.state_info.items()}
 
         if write_h5:
             # Change file path name if new file requested
@@ -823,115 +826,6 @@ class TrainingDataInterface():
 
         return local_modes, reference_state, weights, scaling_values
         
-
-    # region _method_of_snapshots
-    def _method_of_snapshots(self, local_data, local_weights):
-        comm = self.comm
-        rank = self.rank
-
-        # Method of snapshots (referenced https://willcox-research-group.github.io/rom-operator-inference-Python3/_modules/opinf/basis/_pod.html#method_of_snapshots)
-        min_thresh      = 1e-15
-        if isinstance(local_data, dict):
-            n_snapshots     = local_data["num_samples"]
-            local_gramian   = np.zeros((n_snapshots, n_snapshots))
-            for state_var in self.state_info.keys():
-                if local_weights is None:
-                    local_gramian += local_data[state_var].T @ local_data[state_var]
-                else:
-                    local_gramian += local_data[state_var].T @ (local_weights[state_var][:, None] * local_data[state_var])   
-        else:
-            n_snapshots     = local_data.shape[1]
-            if local_weights is None:
-                local_gramian   = local_data.T @ local_data
-            else:
-                local_gramian   = local_data.T @ (local_weights[:, None] * local_data)
-
-        total_gramian   = np.zeros_like(local_gramian) if rank == 0 else None
-        comm.Reduce(local_gramian, total_gramian, op=MPI.SUM, root=0)
-
-        if rank == 0:
-            eigvals, eigvecs = np.linalg.eigh(total_gramian)
-
-            # Re-order (largest to smallest).
-            eigvals     = eigvals[::-1]
-            eigvecs     = eigvecs[:, ::-1]
-
-            # By definition the Gramian is symmetric positive semi-definite.
-            # If any eigenvalues are smaller than zero, they are only measuring
-            # numerical error and can be truncated.
-            positives   = eigvals > max(min_thresh, abs(np.min(eigvals)))
-            eigvecs     = eigvecs[:, positives]
-            eigvals     = eigvals[positives]
-            s_vals      = np.sqrt(eigvals) # * n_global_states)
-
-        quiet_barrier(comm)
-
-        # Broadcast eigenvalues/vectors and singular values
-        if rank == 0:
-            n_retained_modes = eigvals.size
-        else:
-            n_retained_modes = None
-        n_retained_modes = comm.bcast(n_retained_modes, root=0)
-
-        # ALL ranks need to allocate buffers, including rank 0!
-        eigvals_bcast = np.empty((n_retained_modes, ),                dtype=np.float64)
-        eigvecs_bcast = np.empty((n_snapshots, n_retained_modes),     dtype=np.float64)
-        s_vals_bcast  = np.empty((n_retained_modes, ),                dtype=np.float64)
-
-        # Copy from rank 0's computed values into broadcast buffer
-        if rank == 0:
-            eigvals_bcast[:] = eigvals
-            eigvecs_bcast[:] = eigvecs
-            s_vals_bcast[:]  = s_vals
-
-        comm.Bcast([eigvals_bcast, MPI.DOUBLE], root=0)
-        comm.Bcast([eigvecs_bcast, MPI.DOUBLE], root=0)
-        comm.Bcast([s_vals_bcast,  MPI.DOUBLE], root=0)
-
-        # Use the broadcast versions
-        eigvals = eigvals_bcast
-        eigvecs = eigvecs_bcast
-        s_vals = s_vals_bcast
-
-        # Rescale and square root eigenvalues to get singular values.
-        if isinstance(local_data, dict):
-            local_modes = {}
-            for state_var in self.state_info.keys():
-                local_modes[state_var] = local_data[state_var] @ (eigvecs / s_vals)
-        else:
-            local_modes = local_data @ (eigvecs / s_vals)
-
-        # Orthogonality check: should be I by construction
-        # Uses the same weights as the Gramian, so any violation is numerical, not a mismatch
-        if isinstance(local_data, dict):
-            PhiTMPhi_local = np.zeros((local_modes[next(iter(self.state_info))].shape[1],) * 2)
-            for state_var in self.state_info.keys():
-                Phi_var = local_modes[state_var]
-                if local_weights is None:
-                    PhiTMPhi_local += Phi_var.T @ Phi_var
-                else:
-                    PhiTMPhi_local += Phi_var.T @ (local_weights[state_var][:, None] * Phi_var)
-        else:
-            if local_weights is None:
-                PhiTMPhi_local = local_modes.T @ local_modes
-            else:
-                PhiTMPhi_local = local_modes.T @ (local_weights[:, None] * local_modes)
-
-        PhiTMPhi = np.zeros_like(PhiTMPhi_local)
-        self.comm.Allreduce(PhiTMPhi_local, PhiTMPhi, op=MPI.SUM)
-
-        orth_err = np.linalg.norm(PhiTMPhi - np.eye(PhiTMPhi.shape[0]), ord='fro')
-        tol      = 1e-10 * PhiTMPhi.shape[0]  # scale tolerance with number of modes
-
-        if self.rank == 0:
-            if orth_err > 1e-6:
-                print(f"  POD orthogonality check (internal, same M as Gramian): WARNING ({orth_err:.2e})")
-                print(f"  --> This is a numerical issue in the POD computation itself, not an M mismatch.")
-            else:
-                print(f"  POD orthogonality check (internal, same M as Gramian): PASSED ({orth_err:.2e})")
-
-        return local_modes, s_vals
-    
 
     # region _leave_one_out_test
     def _leave_one_out_test(self, h5filepath, num_modes=None, pod_options={}):
