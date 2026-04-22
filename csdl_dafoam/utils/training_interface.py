@@ -619,7 +619,7 @@ class TrainingDataInterface():
     
 
     # region _compute_pod_modes
-    def _compute_pod_modes(self, h5filepath, inner_product=None, centering='mean', scaling="reference", write_h5=True, new_h5_file=True, new_file_suffix="modes", write_modes_using_write_adjoint_fields=True):
+    def _compute_pod_modes(self, h5filepath, inner_product=None, centering='mean', scaling="reference", write_h5=True, new_h5_file=True, overwrite_datasets=False, new_file_suffix="modes", write_modes_using_write_adjoint_fields=True):
         
         # Option to pass a dict containing similar data structure as what would be read from the load_h5
         # This is currently an internal option and kind of sketchy - should update to a proper interface
@@ -751,8 +751,8 @@ class TrainingDataInterface():
             data_dict["states"][state_var] = 1/scaling_values[state_var] * (data_dict["states"][state_var] - reference_state[state_var][:, None])
 
         # Only need state data and number of samples for POD computation
-        data_array    = np.concatenate([data_dict["states"][state_var] for state_var in self.state_info.keys()])
-        weights_array = np.concatenate([weights[state_var] for state_var in self.state_info.keys()])
+        data_array    = np.concatenate([data_dict["states"][state_var] for state_var in self.state_info.keys()], axis=0)
+        weights_array = np.concatenate([weights[state_var] for state_var in self.state_info.keys()], axis=0)
 
         # Actual POD computation
         modes_array, singular_values = method_of_snapshots_distributed(matrix_local=data_array,
@@ -782,27 +782,37 @@ class TrainingDataInterface():
                     elif    state_type == "volVectorStates":                                num_rows = 3 * self.num_cells_global
                     elif    state_type == "surfaceScalarStates":                            num_rows = self.num_faces_no_proc_boundaries_global
 
+                    if overwrite_datasets and state_var in mode_group:
+                        del mode_group[state_var]
                     mode_group.require_dataset(state_var,        (num_rows, num_modes),              dtype="f8")
                     self._write_field_data_to_dataset(mode_group[state_var], local_modes[state_var], state_type)
                     mode_group[state_var].attrs.create("addressing_type", state_type)
-                    if state_type == "scalarSurfaceStates":
+                    if state_type == "surfaceScalarStates":
                         mode_group[state_var].attrs.create("apply_sign_convention", True)
 
+                    if overwrite_datasets and state_var in reference_group:
+                        del reference_group[state_var]
                     reference_group.require_dataset(state_var,   (num_rows, ),                       dtype="f8")
                     self._write_field_data_to_dataset(reference_group[state_var], reference_state[state_var], state_type)
                     reference_group[state_var].attrs.create("addressing_type", state_type)
 
                     if weights is not None:
+                        if overwrite_datasets and state_var in weights_group:
+                            del weights_group[state_var]
                         weights_group.require_dataset(state_var, (num_rows, ),                       dtype="f8")
                         self._write_field_data_to_dataset(weights_group[state_var], weights[state_var], state_type)
                         weights_group[state_var].attrs.create("addressing_type", state_type)
-                        if state_type == "scalarSurfaceStates":
+                        if state_type == "surfaceScalarStates":
                             weights_group[state_var].attrs.create("apply_sign_convention", False) # Flag to tell that we want magnitudes when loading face data (no negatives for processor boundaries)
                     
                     if scaling is not None:
-                        dset = scaling_group.require_dataset(state_var, shape=scaling_values[state_var].shape, dtype="f8")
+                        if overwrite_datasets and state_var in scaling_group:
+                            del scaling_group[state_var]
+                        dset = scaling_group.require_dataset(state_var, shape=(1,), dtype="f8")
                         dset[...] = scaling_values[state_var]
-
+                
+                if overwrite_datasets and 'singular_values' in pod_group:
+                    del pod_group['singular_values']
                 dset = pod_group.require_dataset('singular_values',     shape=singular_values.shape,               dtype="f8")
                 dset[...] = singular_values
 
