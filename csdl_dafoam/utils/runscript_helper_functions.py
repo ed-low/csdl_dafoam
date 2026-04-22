@@ -7,6 +7,7 @@ import contextlib
 from contextlib import contextmanager
 import pickle
 from mpi4py import MPI
+import csdl_alpha as csdl
 
 
 
@@ -323,3 +324,36 @@ def write_dv_names(filepath, sim):
             end = meta['u_ind'] - 1  # convert exclusive -> inclusive
             f.write(f"{name:30s} {start:8d} {end:8d}\n")
             dv_num += 1
+
+
+
+# region global_local_op
+def global_local_op(global_var, local_var, op, comm):
+    rank = comm.Get_rank()
+    with csdl.experimental.mpi.enter_mpi_region(rank, comm) as region:
+        if isinstance(local_var, csdl.Variable):
+            local_var_split = region.split_custom(local_var, lambda x:x)
+        else:
+            local_var_split = region.split_constant(local_var)
+        out_split        = op(global_var, local_var_split)
+        out = region.merge_custom(out_split, lambda x:x)
+        return out
+
+
+# region local_global_op
+def local_global_op(local_var, global_var, op, comm):
+    rank = comm.Get_rank()
+    with csdl.experimental.mpi.enter_mpi_region(rank, comm) as region:
+        if isinstance(local_var, csdl.Variable):
+            local_var_split = region.split_custom(local_var, lambda x:x)
+        else:
+            local_var_split = region.split_constant(local_var)
+        out_split        = op(local_var_split, global_var)
+        out = region.merge_custom(out_split, lambda x:x)
+        return out
+    
+
+
+# region is_csdl
+def is_csdl(var:csdl.Variable|np.ndarray):
+    return isinstance(var, csdl.Variable)

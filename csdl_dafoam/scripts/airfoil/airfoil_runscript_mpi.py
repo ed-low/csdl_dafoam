@@ -452,17 +452,16 @@ else:
 
 recorder.stop()
 
-states = dafoam_instance.getStates()
+# ===============================
+# region SIM
+# ===============================
+sim = csdl.experimental.PySimulator(recorder)
 
-states[6 * dafoam_instance.solver.getNLocalCells():] = 0
-dafoam_instance.setStates(states)
+loss_var    = objective_fun
+wrt         = flight_conditions_group.angle_of_attack_deg
+grad        = sim.compute_totals(loss_var, wrt)[loss_var, wrt]
 
-dafoam_instance()
-
-# # ===============================
-# # region SIM
-# # ===============================
-# sim = csdl.experimental.PySimulator(recorder)
+print(f"Rank {rank} grad : {grad}")
 
 
 

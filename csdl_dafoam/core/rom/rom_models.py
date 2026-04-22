@@ -80,8 +80,8 @@ class BaseModel(ABC):
 class DAFoamProjectionROMModel(BaseModel):  
     def __init__(self,
                  dafoam_input_variables_group:VariableGroup,
-                 pod_modes:np.ndarray,
-                 reference_fom_state:np.ndarray,
+                 pod_modes:Variable|np.ndarray,
+                 reference_fom_state:Variable|np.ndarray,
                  scaling:np.ndarray,
                  weights:np.ndarray,
                  dafoam_instance:PYDAFOAM,

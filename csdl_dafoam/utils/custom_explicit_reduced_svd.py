@@ -443,8 +443,8 @@ if __name__ == "__main__":
 	# FULLY DISTRIBUTED
 	customSVDDist 		 		= customExplicitReducedSVDDistributed(comm=comm)
 	U_dist, S_dist, VT_dist 	= customSVDDist.evaluate(A_rows_local=A_local)
-	loss_dict["dist"]["loss_1"] = csdl.sum(S_dist)
-	loss_dict["dist"]["loss_2"] = csdl.sum(S_dist * weights)
+	loss_dict["dist"]["loss_1"] = csdl.sum(S_dist) / comm_size
+	loss_dict["dist"]["loss_2"] = csdl.sum(S_dist * weights) / comm_size
 	loss_dict["dist"]["loss_3"] = (csdl.sum(w_local.reshape((m_local,1)) * (U_dist @ mpi_allreduce(U_dist.T() @ y_local.reshape((m_local,1))))))
 	loss_dict["dist"]["loss_4"] = (csdl.sum(y_local.reshape((m_local,1)) * (U_dist @ (csdl.einsum(S_dist, VT_dist, action='i,ij->ij')) @ x.reshape((n,1)))))
 	loss_dict["dist"]["loss_5"] = (csdl.sum(y_local.reshape((m_local,1)) * (A_local @ x.reshape((n,1)))))
@@ -458,7 +458,7 @@ if __name__ == "__main__":
 			# wrt = A if svd_type == "base" else A_local
 			wrt = alpha
 			analytical_grad       		   = sim.compute_totals(loss_var, wrt)[loss_var, wrt]
-			grad_norm[svd_type][loss_case] = analytical_grad
+			grad_norm[svd_type][loss_case] = analytical_grad[0][0]
 
 	import pandas as pd
 

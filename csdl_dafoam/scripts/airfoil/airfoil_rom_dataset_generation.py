@@ -157,13 +157,13 @@ mesh_options = {
 # region Training options
 # ===============================
 # Storage options
-dataset_keyword       = 'training_data2'
+dataset_keyword       = 'training_data4'
 storage_location      = dafoam_directory
 
 # Sampling options
 # grassmann_variables indicates the variables which correspond to points on the Grassmann manifold
 # snapshot_variables indicates the variables which correspond to "snapshots" or realizations
-num_grassmann_samples     = 2
+num_grassmann_samples     = 5
 num_snapshot_samples      = 100
 random_state_seed         = 0
 
@@ -411,63 +411,83 @@ data_generator = TrainingDataInterface(dafoam_instance=dafoam_instance,
                                             gather_raw_files=True)
 
 
-# data = data_generator.read_h5_file(Path(dafoam_directory)/dataset_keyword/"point_0.h5", visualize_data=True)
-# print(data)
-
 # data_generator.sample_variables()
 # data_generator.run_sweep(pod_options={"write_modes_using_write_adjoint_fields":False})
 
-local_mode_computed, reference_state, weights_computed, scaling_values = data_generator._compute_pod_modes(Path(dafoam_directory)/dataset_keyword/"point_0.h5", 
-                                  inner_product="reference", 
-                                  centering='reference', 
-                                  scaling="reference", 
-                                  write_h5=True, 
-                                  new_h5_file=False, 
-                                  new_file_suffix="modes", 
-                                  write_modes_using_write_adjoint_fields=False)
+import glob
+files = glob.glob(str(Path(storage_location)/dataset_keyword/f"point_*.h5"))
 
-data = data_generator.load_h5(Path(storage_location)/dataset_keyword/"point_0.h5", only_distributed_data=False)
+ref_vals = dafoam_instance.getPatchStateAverages("inout")
 
-local_mode_read = data["pod"]["modes"]
+ref_vals ["nuTilda"] *= 1000
+ref_vals["phi"]       = ref_vals["p"] / ref_vals["T"] / 287. * ref_vals["U"]
 
-weights_read = data["pod"]["weights"]
+for file in files:
+    data_generator._compute_pod_modes(file, 
+                    inner_product="reference", 
+                    centering='reference', 
+                    scaling=ref_vals, 
+                    write_h5=True, 
+                    new_h5_file=False, 
+                    overwrite_datasets=True,
+                    new_file_suffix="modes", 
+                    write_modes_using_write_adjoint_fields=False)
 
 
-indices      = np.concatenate(comm.allgather(data_generator.face_global_indices), axis=0)
-mode_compute = np.concatenate(comm.allgather(local_mode_computed["phi"][:, 0]), axis=0)
-mode_read    = np.concatenate(comm.allgather(local_mode_read["phi"][:, 0]), axis=0)
 
-indices_abs = np.abs(indices) - 1
-indices_neg = indices < 0
-sign_mask   = np.ones_like(indices_abs)
-sign_mask[indices_neg] = -1
 
-import matplotlib.pyplot as plt
 
-if rank == 0:
-    plt.scatter(indices_abs, mode_compute, label='Computed, abs')
-    plt.scatter(indices_abs[indices_neg], mode_compute[indices_neg], marker='x', label='Computed, negated boundaries')
-    plt.scatter(indices_abs, mode_read, marker='+', label='Read, abs')
-    plt.scatter(indices_abs[indices_neg], mode_read[indices_neg], marker='x', label='Read, negated boundaries')
-    plt.legend()
-    plt.ylabel("phi")
+# local_mode_computed, reference_state, weights_computed, scaling_values = data_generator._compute_pod_modes(Path(dafoam_directory)/dataset_keyword/"point_0.h5", 
+#                                   inner_product="reference", 
+#                                   centering='reference', 
+#                                   scaling="reference", 
+#                                   write_h5=True, 
+#                                   new_h5_file=True, 
+#                                   new_file_suffix="modes", 
+#                                   write_modes_using_write_adjoint_fields=False)
+
+# data = data_generator.load_h5(Path(storage_location)/dataset_keyword/"point_0.h5", only_distributed_data=False)
+
+# local_mode_read = data["pod"]["modes"]
+
+# weights_read = data["pod"]["weights"]
+
+
+# indices      = np.concatenate(comm.allgather(data_generator.face_global_indices), axis=0)
+# mode_compute = np.concatenate(comm.allgather(local_mode_computed["phi"][:, 0]), axis=0)
+# mode_read    = np.concatenate(comm.allgather(local_mode_read["phi"][:, 0]), axis=0)
+
+# indices_abs = np.abs(indices) - 1
+# indices_neg = indices < 0
+# sign_mask   = np.ones_like(indices_abs)
+# sign_mask[indices_neg] = -1
+
+# import matplotlib.pyplot as plt
+
+# if rank == 0:
+#     plt.scatter(indices_abs, mode_compute, label='Computed, abs')
+#     plt.scatter(indices_abs[indices_neg], mode_compute[indices_neg], marker='x', label='Computed, negated boundaries')
+#     plt.scatter(indices_abs, mode_read, marker='+', label='Read, abs')
+#     plt.scatter(indices_abs[indices_neg], mode_read[indices_neg], marker='x', label='Read, negated boundaries')
+#     plt.legend()
+#     plt.ylabel("phi")
     
-    plt.figure()
-    plt.scatter(range(mode_compute.size), mode_compute, marker='x', label='compute')
-    plt.scatter(range(mode_read.size), mode_read, marker='+', label='read')
+#     plt.figure()
+#     plt.scatter(range(mode_compute.size), mode_compute, marker='x', label='compute')
+#     plt.scatter(range(mode_read.size), mode_read, marker='+', label='read')
     
-    diff_greater_than_tol = np.abs(mode_compute - mode_read) > 1e-12
+#     diff_greater_than_tol = np.abs(mode_compute - mode_read) > 1e-12
 
-    plt.scatter(np.where(diff_greater_than_tol), mode_compute[diff_greater_than_tol], marker='.', label='marked errors')
-    plt.legend()
+#     plt.scatter(np.where(diff_greater_than_tol), mode_compute[diff_greater_than_tol], marker='.', label='marked errors')
+#     plt.legend()
 
     
 
-    plt.figure()
-    plt.scatter(range(mode_read[indices_neg].size), mode_compute[indices_neg]/mode_read[indices_neg])
+#     plt.figure()
+#     plt.scatter(range(mode_read[indices_neg].size), mode_compute[indices_neg]/mode_read[indices_neg])
 
-    plt.show()
-quiet_barrier(comm)
+#     plt.show()
+# quiet_barrier(comm)
 
 
 

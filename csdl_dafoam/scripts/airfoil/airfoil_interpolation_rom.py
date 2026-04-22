@@ -164,6 +164,7 @@ mesh_options = {
 # Storage options
 dataset_keyword       = 'training_data4'
 storage_location      = Path(dafoam_directory)
+h5_file_base_name     = "point"
 
 
 # ===============================
@@ -202,18 +203,6 @@ geometry_pickle_file_path         = Path(geometry_directory)/geometry_pickle_fil
 stp_file_path                     = Path(geometry_directory)/stp_file_name
 surface_mesh_projection_file_path = Path(dafoam_directory)/f'projected_surface_mesh_{x_surf_hash}.pickle'
 
-# Manually obtaining the file for now
-# POD Data import
-data_generator = TrainingDataInterface(dafoam_instance=dafoam_instance, 
-                                        storage_location=storage_location, 
-                                        dataset_keyword=dataset_keyword,
-                                        h5_file_base_name="point")
-
-data = data_generator.load_h5(Path(storage_location)/dataset_keyword/"point_0.h5", only_distributed_data=False)
-
-# data_generator._leave_one_out_test(Path(storage_location)/dataset_keyword/"point_0.h5", 20, 
-#                                    {"inner_product": "reference", "centering": "reference", "scaling": "reference"})
-
 
 # ===============================
 # region CSDL RECORDER
@@ -238,32 +227,14 @@ else:
     if rank == 0:
         print(f'No projected surface mesh file found at {surface_mesh_projection_file_path}')
         try:
-            # ORIGINAL CODE
-            # with Timer('projecting on surface mesh'):
-            #     projected_surf_mesh_dafoam = geometry.project(
-            #         x_surf_dafoam_initial, 
-            #         grid_search_density_parameter = 1,      # 1     (ORIGINAL)
-            #         projection_tolerance          = 1e-4,   #1.e-3m (ORIGINAL)
-            #         grid_search_density_cutoff    = 50,     # 20    (ORIGINAL) 50
-            #         force_reprojection            = False,
-            #         plot                          = False    # UCSD_LAB
-            #     )
-
-            # Debugging/timing
-            import cProfile
-            import pstats
-            with cProfile.Profile() as pr:
-                projected_surf_mesh_dafoam = geometry.project(
-                    x_surf_dafoam_initial, 
-                    grid_search_density_parameter = 1,      # 1     (ORIGINAL)
-                    projection_tolerance          = 1e-10,   #1.e-3m (ORIGINAL)
-                    grid_search_density_cutoff    = 50,     # 20    (ORIGINAL) 50
-                    force_reprojection            = False,
-                    plot                          = False    # UCSD_LAB
-                )
-            # Summarize top time-consuming functions
-            stats = pstats.Stats(pr)
-            stats.strip_dirs().sort_stats(pstats.SortKey.TIME).print_stats(30)
+            projected_surf_mesh_dafoam = geometry.project(
+                x_surf_dafoam_initial, 
+                grid_search_density_parameter = 1,      # 1     (ORIGINAL)
+                projection_tolerance          = 1e-10,   #1.e-3m (ORIGINAL)
+                grid_search_density_cutoff    = 50,     # 20    (ORIGINAL) 50
+                force_reprojection            = False,
+                plot                          = False    # UCSD_LAB
+            )
 
             print('Writing surface mesh projection pickle...')
             write_simple_pickle(projected_surf_mesh_dafoam, surface_mesh_projection_file_path)
@@ -336,19 +307,131 @@ geometry.set_coefficients(geometry_coefficients)
 with Timer(f'evaluating geometry component', rank, TIMING_ENABLED):
     x_surf_dafoam_full = geometry.evaluate(projected_surf_mesh_dafoam, plot=False)
 
+
 # region Surface mesh distribution
 i0, i1          = x_surf_dafoam_initial_indices[rank]
 
 # Flight condition variables
 flight_conditions_group                 = csdl.VariableGroup()
 flight_conditions_group.mach_number     = csdl.Variable(value=0.7, name="mach_number")
-flight_conditions_group.angle_of_attack_deg = csdl.Variable(value=data["parameters"]["primary_variables"]["angle_of_attack_deg"], name="angle_of_attack_deg")
-flight_conditions_group.altitude_m      = csdl.Variable(value=data["parameters"]["primary_variables"]["altitude_m"], name="altitude (m)")
+flight_conditions_group.angle_of_attack_deg = csdl.Variable(value=3.60663577576718, name="angle_of_attack_deg")
+flight_conditions_group.altitude_m      = csdl.Variable(value=12922.086908545323, name="altitude (m)")
 
 # Atmospheric condition variables
 ambient_conditions_group = sam.compute_ambient_conditions_group(flight_conditions_group.altitude_m)
 
+
+#===============================================================================================================================================
+# IN CONSTRUCTION
+#===============================================================================================================================================
+# region MODE IMPORT AND SETUP
+import glob
+
+# Setup interface
+data_interface = TrainingDataInterface(dafoam_instance=dafoam_instance, 
+                                        storage_location=storage_location, 
+                                        dataset_keyword=dataset_keyword,
+                                        h5_file_base_name=h5_file_base_name)
+state_info = data_interface.state_info
+
+# Find files
+files = glob.glob(str(Path(storage_location)/dataset_keyword/f"{h5_file_base_name}*.h5"))
+
+# Primary variable names (these should be the names found in the files)
+primary_var_names = ["angle_of_attack_deg", "altitude_m"]
+
+# Setup the value array corresponding to the primary variables
+# NOTE: We are assuming that the primary variables are scalars for now.
+primary_var_array = np.zeros((len(files), len(primary_var_names)))
+
+# Initialize our data arrays/lists
+pod_mode_store        = []
+scaling               = None
+weights               = None
+reference_state_store = []
+
+# modes to retain
+variance = 0.9999
+
+num_modes = 0
+# Load our parameters and POD modes
+for i, file in enumerate(files):
+    print(f"Reading file : {file}") if rank == 0 else None
+    parameter_data = data_interface.load_h5(file, "parameters")
+    for j, primary_var in enumerate(primary_var_names):
+        primary_var_array[i, j] = parameter_data["primary_variables"][primary_var].item()
+
+    pod_data = data_interface.load_h5(file, "pod")
+    this_mode_set        = np.array(np.concatenate([pod_data["modes"][state_name]            for state_name in state_info.keys()], axis=0))
+    this_scaling         = np.array(np.concatenate([pod_data["scaling"][state_var] * np.ones((np.size(info["indices"]), )) for state_var, info in state_info.items()], axis=0))
+    this_weights         = np.array(np.concatenate([pod_data["weights"][state_var]           for state_var in state_info.keys()], axis=0))
+    this_reference_state = np.array(np.concatenate([pod_data["reference_state"][state_var]   for state_var in state_info.keys()], axis=0))
+    this_singular_vals   = pod_data["singular_values"]
+
+    def compute_k(S, energy_tol=0.9999):
+        energy = S**2
+        cumulative = np.cumsum(energy)
+        total = cumulative[-1]
+        ratio = cumulative / total
+        k = np.searchsorted(ratio, energy_tol) + 1
+        return k
+    
+    this_num_modes = compute_k(this_singular_vals, variance)
+    num_modes = this_num_modes if this_num_modes > num_modes else num_modes
+
+    pod_mode_store.append(this_mode_set)
+    reference_state_store.append(this_reference_state)
+
+    if scaling is None:
+        scaling = this_scaling
+    elif not np.array_equal(scaling, this_scaling):
+        raise ValueError("Scaling values are not consistent among files. Might need to recompute POD?")
+    
+    if weights is None:
+        weights = this_weights
+    elif not np.array_equal(weights, this_weights):
+        raise ValueError("Weights values are not consistent among files. Might need to recompute POD?")
+
+for i, pod_modes in enumerate(pod_mode_store):
+    pod_mode_store[i] = pod_modes[:, :num_modes]
+    
+residual_scaling = np.ones_like(dafoam_instance.getStateWeights())
+residual_scaling[state_info["T"]["indices"]] *= 1005
+
+
+from csdl_dafoam.core.rom.csdl_grassmann import Grassmann
+# Compute our tangent vectors
+m = comm.allreduce(dafoam_instance.getNLocalAdjointStates(), op=MPI.SUM)
+manifold_local = Grassmann(m, num_modes, comm=comm, inner_product_weights=weights)
+
+pod_modes_mean = manifold_local.karcher_mean(pod_mode_store[0], pod_mode_store)
+
+log_maps = []
+for pod_modes_i in pod_mode_store:
+    log_map_i = manifold_local.log(pod_modes_mean, pod_modes_i)
+    log_maps.append(log_map_i)
+
+# Setup interpolation
+from csdl_dafoam.utils.interpolation import RBFInterpolator
+
+# Setup interpolation
+query_point    = csdl.concatenate((flight_conditions_group.angle_of_attack_deg, flight_conditions_group.altitude_m))
+interp_weights = RBFInterpolator(query_point=query_point, sample_points=primary_var_array).weights()
+
+from csdl_dafoam.utils.runscript_helper_functions import global_local_op
+log_map_interp         = global_local_op(interp_weights, np.array(log_maps), lambda x,y: csdl.einsum(x, y, action="i,ijk->jk"), comm=comm)
+reference_state_interp = global_local_op(interp_weights, np.array(reference_state_store), lambda x,y: csdl.einsum(x, y, action="i,ij->j"), comm=comm)
+pod_modes_interp       = manifold_local.exp(pod_modes_mean, log_map_interp)
+
+
+#===============================================================================================================================================
+
+
+
 with csdl.experimental.mpi.enter_mpi_region(rank, comm) as mpi_region:
+
+    pod_modes_interp = mpi_region.split_custom(pod_modes_interp, split_func=lambda x:x)
+    reference_state_interp = mpi_region.split_custom(reference_state_interp, split_func=lambda x:x)
     
     x_surf_dafoam   = x_surf_dafoam_full[i0:i1, :]
     x_surf_dafoam   = x_surf_dafoam.flatten()
@@ -368,24 +451,15 @@ with csdl.experimental.mpi.enter_mpi_region(rank, comm) as mpi_region:
                                                                 flight_conditions_group,
                                                                 x_vol_dafoam)
 
-    # Assemble POD modes and relevant vectors:
-    state_info      = data_generator.state_info # Get our state variable names
-    pod_modes       = np.array(np.concatenate([data["pod"]["modes"][state_var]              for state_var in state_info.keys()], axis=0))[:, 0:20]
-    scaling         = np.array(np.concatenate([data["pod"]["scaling"][state_var] * np.ones((np.size(info["indices"]), )) for state_var, info in state_info.items()], axis=0))
-    weights         = np.array(np.concatenate([data["pod"]["weights"][state_var]            for state_var in state_info.keys()], axis=0))
-    reference_state = np.array(np.concatenate([data["pod"]["reference_state"][state_var]    for state_var in state_info.keys()], axis=0))
-
-    residual_scaling = np.ones_like(dafoam_instance.getStateWeights())
-    residual_scaling[state_info["T"]["indices"]] *= 1005
-
     dafoam_rom_model = DAFoamLSPGModel(dafoam_input_variables_group=dafoam_input_variables_group,
-                                 pod_modes=pod_modes,
-                                 reference_fom_state=reference_state,
+                                 pod_modes=pod_modes_interp,
+                                 reference_fom_state=reference_state_interp,
                                  scaling=scaling,
                                  weights=1 / residual_scaling ** 2,
                                  dafoam_instance=dafoam_instance,
                                  normalize_residuals=False,
                                  fd_step=1e-6)
+
     
     # dafoam_rom_model = DAFoamGalerkinModel(dafoam_input_variables_group=dafoam_input_variables_group,
     #                              pod_modes=pod_modes,
@@ -401,7 +475,7 @@ with csdl.experimental.mpi.enter_mpi_region(rank, comm) as mpi_region:
     dafoam_rom_states = dafoam_rom.evaluate()
 
     # Reconstruct state
-    dafoam_state_estimate = reference_state + scaling * (pod_modes @ dafoam_rom_states)
+    dafoam_state_estimate = reference_state_interp + scaling * (pod_modes_interp @ dafoam_rom_states)
 
     # DAFoamFunctions Explicit component setup and evaluation
     dafoam_functions = DAFoamFunctions(dafoam_instance, disable_jacvec_normalization=True)
@@ -421,7 +495,7 @@ with csdl.experimental.mpi.enter_mpi_region(rank, comm) as mpi_region:
 # 3: Maximize CL/CD wrt angle-of-attack, wing shape (thickness/camber ffd)
 # 4: Minimize D wrt angle-of-attack (test case)
 # 5: Maximize CL/CD wrt wing shape (thickness/camber ffd)
-optimization_case = 5
+optimization_case = 1
 
 
 if optimization_case == 1:
@@ -430,7 +504,7 @@ if optimization_case == 1:
     drag = dafoam_function_outputs.drag
 
     # Design variables
-    flight_conditions_group.angle_of_attack_deg.set_as_design_variable(lower=0, upper=10, scaler=1./10)
+    flight_conditions_group.angle_of_attack_deg.set_as_design_variable(lower=0, upper=5, scaler=1./5)
 
     # Objectives
     objective_fun = -lift/drag
@@ -510,7 +584,7 @@ recorder.stop()
 sim = csdl.experimental.PySimulator(recorder)
 
 # Quick write of the variable names to file
-write_dv_names(f"{problem_name}_outputs/design_variable_map.txt", sim)
+# write_dv_names(f"{problem_name}_outputs/design_variable_map.txt", sim)
 
 
 
