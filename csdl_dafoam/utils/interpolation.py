@@ -3,6 +3,7 @@ import numpy as np
 from abc import ABC, abstractmethod
 from typing import Union
 from csdl_alpha import CustomExplicitOperation, Variable
+import csdl_alpha as csdl
 
 
 # region BASEINTERPOLATOR
@@ -135,7 +136,7 @@ class RBFInterpolator(BaseInterpolatorClass):
                  query_point:Variable, 
                  sample_points:Union[np.ndarray, Variable],
                  kernel:str='gaussian', 
-                 kernel_parameter:float=None,
+                 kernel_parameter:float|None=None,
                  apply_scaling:bool=True
     ):
         super().__init__(query_point=query_point,
@@ -156,26 +157,26 @@ class RBFInterpolator(BaseInterpolatorClass):
         A   = self.interpolation_matrix
 
         diffs    = csdl.expand(x, x_i.shape, 'j->ij') - x_i
-        r        = csdl.norm(diffs, axes=(1,))
-        b        = self._phi(r)
+        r        = csdl.sum(diffs * diffs, axes=(1, ))
+        b        = self._phi_from_r2(r)
 
         return csdl.solve_linear(A, b)
 
 
     # region _phi
-    def _phi(self, r):
+    def _phi_from_r2(self, r2):
         eps     = self.kernel_parameter
         kernel  = self.kernel
-        is_csdl = isinstance(r, Variable)
+        is_csdl = isinstance(r2, Variable)
 
         if kernel.lower()=="gaussian":
-            return csdl.exp(-eps * r ** 2) if is_csdl else np.exp(-eps * r ** 2)
+            return csdl.exp(-eps * eps * r2) if is_csdl else np.exp(-eps * eps * r2)
 
         elif kernel.lower()=="inverse_quadratic":
-            return 1 / (1 + (eps * r) ** 2)
+            return 1 / (1 + (eps * eps * r2))
             
         elif kernel.lower()=="inverse_multiquadratic":
-            return 1 / csdl.sqrt(1 + (eps * r) ** 2) if is_csdl else 1 / np.sqrt(1 + (eps * r) ** 2)
+            return 1 / csdl.sqrt(1 + (eps * eps * r2)) if is_csdl else 1 / np.sqrt(1 + (eps * eps * r2))
             
         else:
             raise NotImplementedError(f"RBF kernel, {kernel}, not yet implemented.")
@@ -184,7 +185,7 @@ class RBFInterpolator(BaseInterpolatorClass):
     # region _setup_interpolation_matrix
     def _setup_interpolation_matrix(self):
         x_i = self._sample_points
-        phi = self._phi
+        phi_from_r2 = self._phi_from_r2
 
         # Compute assuming CSDL variable
         if self.samples_are_variable:
@@ -192,8 +193,8 @@ class RBFInterpolator(BaseInterpolatorClass):
         
         elif isinstance(x_i, np.ndarray):
             diff = x_i[:, None, :] - x_i[None, :, :]
-            d    = np.linalg.norm(diff, axis=2)
-            A    = phi(d)
+            r2   = np.sum(diff * diff, axis=2)
+            A    = phi_from_r2(r2)
 
         return A
     
