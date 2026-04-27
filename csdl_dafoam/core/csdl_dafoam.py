@@ -556,6 +556,121 @@ class DAFoamFunctions(csdl.CustomExplicitOperation):
 
 
 
+# region DAFOAMFORCES
+class DAFoamForces(csdl.CustomExplicitOperation):
+    def __init__(self, dafoam_instance, disable_jacvec_normalization=False):
+        super().__init__()
+        self.dafoam_instance = dafoam_instance
+        self.comm            = dafoam_instance.comm
+
+        # Option to turn off jacvec normalization. This may be useful when linking with ROM component.
+        self.disable_jacvec_normalization = disable_jacvec_normalization
+
+
+    # region evaluate
+    def evaluate(self, dafoam_solver_states:csdl.Variable, dafoam_input_variables_group:csdl.VariableGroup):
+        # Solver states is the easy one
+        self.declare_input("dafoam_solver_states", dafoam_solver_states)
+        
+        # Read daOptions to set proper inputs
+        input_dict = self.dafoam_instance.getOption("inputInfo")
+        for input_name, input_info in input_dict.items():
+            if "volCoord" in input_info["type"]:
+                self.declare_input(input_name, getattr(dafoam_input_variables_group, input_name))
+                self.vol_coords_name = input_name  
+        
+        # Initialize output
+        dafoam_forces_outputs = csdl.VariableGroup()
+        num_outputs           = 0
+
+        # Read daOptions to get outputs (we'll also create a local dict for this class
+        # for convenience and add only the relevant outputs)
+        da_output_dict      = self.dafoam_instance.getOption("outputInfo")
+        force_output_dict   = {}
+
+        for output_name, output_info in da_output_dict.items():
+            output_type = output_info["type"]
+            if "forceCoupling" in output_info["components"]:
+                force_output_dict[output_name] = output_info
+                output_size = self.dafoam_instance.solver.getOutputSize(output_name, output_type)
+                print(output_size)
+                setattr(dafoam_forces_outputs, output_name, self.create_output(output_name, (output_size,)))
+                force_output_dict[output_name]["output_size"] = output_size
+                num_outputs += 1
+
+        self.force_output_dict = force_output_dict
+
+        # We'll return a VariableGroup if we have more than one output. Otherwise we'll just
+        # return the Variable
+        if num_outputs > 1:
+            return dafoam_forces_outputs
+        else:
+            return getattr(dafoam_forces_outputs, output_name)
+
+
+    # region compute
+    def compute(self, input_vals, output_vals):
+        dafoam_instance = self.dafoam_instance
+
+        states      = input_vals["dafoam_solver_states"]
+        vol_coords  = input_vals[self.vol_coords_name]
+
+        dafoam_instance.setStates(states)
+        dafoam_instance.setVolCoords(vol_coords)
+        for output_name, output_info in self.force_output_dict.items():
+            output_type = output_info["type"]
+            forces      = np.zeros((output_info["output_size"],))
+            self.dafoam_instance.solver.calcOutput(output_name, output_type, forces)
+            output_vals[output_name] = forces
+
+
+    # region compute_jacvec_product
+    def compute_jacvec_product(self, input_vals, output_vals, d_inputs, d_outputs, mode):
+        dafoam_instance = self.dafoam_instance
+
+        # TODO: Implement the "descaling" of the states (for compatibility with ROM)
+
+        # Can't do forward mode
+        if mode == 'fwd':
+            raise NotImplementedError('forward mode has not been implemented for DAFoamForces')
+        
+        for output_name, output_info in self.force_output_dict.items():
+            seeds        = d_outputs[output_name]
+            output_type  = output_info["type"]
+
+            if "dafoam_solver_states" in d_inputs:
+                
+                jac_input   = input_vals["dafoam_solver_states"]
+                product     = np.zeros_like(jac_input)
+                dafoam_instance.solverAD.calcJacTVecProduct(
+                    "dafoam_solver_states",
+                    "stateVar",
+                    jac_input,
+                    output_name,
+                    output_type,
+                    seeds,
+                    product
+                )
+                d_inputs["dafoam_solver_states"] += product
+
+            if self.vol_coords_name in d_inputs:
+
+                jac_input   = input_vals[self.vol_coords_name]
+                product     = np.zeros_like(jac_input)
+                dafoam_instance.solverAD.calcJacTVecProduct(
+                    self.vol_coords_name,
+                    "volCoord",
+                    jac_input,
+                    output_name,
+                    output_type,
+                    seeds,
+                    product
+                )
+                d_inputs[self.vol_coords_name] += product
+
+
+
+
 # region COMPUTE_DAFOAM_INPUT_VARIABLES
 def compute_dafoam_input_variables(dafoam_instance, ambient_conditions_group:csdl.VariableGroup, flight_conditions_group:csdl.VariableGroup, aerodynamic_volume_coordinates:csdl.Variable):
     # Currently expect the ambient_conditions_group to, at minimum, contain the following variables:
