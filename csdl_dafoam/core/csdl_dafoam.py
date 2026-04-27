@@ -334,11 +334,12 @@ class DAFoamSolver(csdl.experimental.CustomImplicitOperation):
 
         # Check if states contain any NaN values (NaNs would be passed from optimizer)
         # Update solver states only if no NaNs exist
-        if not has_global_nan_or_inf(states, comm):
-            dafoam_instance.setStates(states)
-        else:
-            if rank == 0:
-                print('DAFoamSolver.compute_jacvec_product: Detected NaN(s) in input_vals. Skipping DAFoam setStates')
+        guarded_set_states(states, dafoam_instance=dafoam_instance, component_name='DAFoamSolver.compute_jacvec_product')
+        # if not has_global_nan_or_inf(states, comm):
+        #     dafoam_instance.setStates(states)
+        # else:
+        #     if rank == 0:
+        #         print('DAFoamSolver.compute_jacvec_product: Detected NaN(s) in input_vals. Skipping DAFoam setStates')
 
         # Can't do forward mode
         if mode == 'fwd':
@@ -466,10 +467,12 @@ class DAFoamFunctions(csdl.CustomExplicitOperation):
 
         if not has_nan_or_inf:
             dafoam_instance.set_solver_input(input_vals)
-            dafoam_instance.setStates(states)
+            # dafoam_instance.setStates(states)
         else:
             if rank == 0:
                 print(f'DAFoamFunctions.compute: Detected NaN(s) in input_vals[{k}]. Skipping DAFoam setStates and set_solver_input')
+
+        guarded_set_states(states, dafoam_instance=dafoam_instance, component_name='DAFoamFunctions.compute')
 
         # Read daOptions to get outputs, and assign them to respective outputs.
         # Assign NaN if NaN existed in state
@@ -753,3 +756,15 @@ def has_global_nan_or_inf(arr, comm):
     local_has_nan_or_inf  = np.any(np.isnan(arr) | np.isinf(arr))
     global_has_nan_or_inf = comm.allreduce(local_has_nan_or_inf, op=MPI.LOR)
     return global_has_nan_or_inf
+
+
+
+# region GUARDEDSETSTATES
+def guarded_set_states(states, dafoam_instance, component_name=None):
+    rank = dafoam_instance.comm.Get_rank()
+    if not has_global_nan_or_inf(states, dafoam_instance.comm):
+            dafoam_instance.setStates(states)
+    else:
+        if rank == 0:
+            leading_string = f"{component_name} :" if component_name is not None else ""
+            print(f'{leading_string} Detected NaN(s) in input_vals. Skipping DAFoam setStates')
