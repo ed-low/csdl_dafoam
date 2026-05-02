@@ -29,7 +29,6 @@ from modopt import PySLSQP, OpenSQP, InteriorPoint
 # IDWarp and DAFoam
 from csdl_dafoam.core.csdl_idwarp import DAFoamMeshWarper
 from csdl_dafoam.core.csdl_dafoam import instantiateDAFoam, DAFoamFunctions, DAFoamSolver, compute_dafoam_input_variables
-from csdl_dafoam.core.rom.csdl_dafoam_rom import DAFoamROM
 from csdl_dafoam.utils.training_interface import TrainingDataInterface
 import csdl_dafoam.utils.standard_atmosphere_model as sam
 from csdl_dafoam.utils.runscript_helper_functions import *
@@ -50,7 +49,7 @@ print_runscript_info()
 # region USER INPUT
 # ===============================
 # Keyword for optimization name (optimization results folder will be saved with this name in dafoam directory)
-problem_name              = 'rom_fom'
+problem_name              = 'rom_fom2'
 
 # Geometry
 geometry_directory        =  os.path.join(os.getcwd(), 'airfoil_geometry/')
@@ -160,7 +159,7 @@ mesh_options = {
 # region Training data options
 # ===============================
 # Storage options
-dataset_keyword       = 'training_data'
+dataset_keyword       = 'training_data4'
 storage_location      = Path(dafoam_directory)
 
 
@@ -208,7 +207,7 @@ data_generator = TrainingDataInterface(dafoam_instance=dafoam_instance,
                                         h5_file_base_name="point")
 
 # Manually obtaining the file for now
-data = data_generator.load_h5(Path(storage_location)/dataset_keyword/"point_0.h5", only_distributed_data=False)
+data = data_generator.load_h5(Path(storage_location)/dataset_keyword/"300_samples_9.h5", only_distributed_data=False)
 
 
 # ===============================
@@ -365,57 +364,95 @@ with csdl.experimental.mpi.enter_mpi_region(rank, comm) as mpi_region:
                                                                 x_vol_dafoam)
     
     # Assemble POD modes and relevant vectors:
+    n_modes     = 20
     state_info  = data_generator.state_info # Get our state variable names
-    pod_modes   = np.array(np.concatenate([data["pod"]["modes"][state_var] for state_var in state_info.keys()], axis=0))[:, 0:20]
+    pod_modes   = np.array(np.concatenate([data["pod"]["modes"][state_var] for state_var in state_info.keys()], axis=0))[:, :n_modes]
     scaling     = np.array(np.concatenate([data["pod"]["scaling"][state_var] * np.ones((np.size(state_info[state_var]["indices"]),)) for state_var in state_info.keys()]))
     weights     = np.array(np.concatenate([data["pod"]["weights"][state_var] for state_var in state_info.keys()]))
     reference_state = np.array(np.concatenate([data["pod"]["reference_state"][state_var] for state_var in state_info.keys()]))
+    s_vals      = data["pod"]["singular_values"]
+    residual_scaling = np.ones_like(dafoam_instance.getStateWeights())
+    residual_scaling[state_info["T"]["indices"]] *= 1005
 
-    residual_scaling_by_state = {}
-    rms_values = {}
 
-    for state_var, info in state_info.items():
-        res = data["samples"]["residuals"][state_var][:, 0]
+    ### DIAGNOSTICS
+    cumulative_ratio = np.cumsum(s_vals) / np.sum(s_vals)
+    # print(cumulative_ratio)
 
-        # Correct global RMS
-        sum_sq   = comm.allreduce(np.sum(res ** 2), op=MPI.SUM)
-        n_global = comm.allreduce(np.size(res),     op=MPI.SUM)
-        rms      = np.sqrt(sum_sq / n_global)
-
-        rms_values[state_var] = rms
-        if rank == 0:
-            print(f"{state_var} rms: {rms}")
-
-    # Apply floor: no variable can be more than floor_factor times smaller than the max
-    global_max   = max(rms_values.values())
-    floor_factor = 1e-1  # tune: keeps m_eff ratio <= 1e4 (or 1e8 for LSPG after squaring)
-    floor        = floor_factor * global_max
-
-    for state_var, info in state_info.items():
-        clipped = max(rms_values[state_var], floor)
-        res     = data["samples"]["residuals"][state_var][:, 0]
-        residual_scaling_by_state[state_var] = np.ones_like(res) * clipped
-        if rank == 0 and clipped != rms_values[state_var]:
-            print(f"  {state_var}: clipped {rms_values[state_var]:.3e} -> {clipped:.3e}")
-
-    residual_scaling = np.concatenate([
-                                    residual_scaling_by_state[state_var] for state_var in state_info.keys()
-                                        ])
+    cutoff_index = np.where(cumulative_ratio >= 0.999)
+    cutoff_index = cutoff_index[0][0]
+    # print(np.where(np.cumsum(s_vals) / np.sum(s_vals) >= 0.999))
+    print(cutoff_index, cumulative_ratio[cutoff_index])
     
-    # DAFoamSolver Implicit component setup and evaluation
-    dafoam_rom           = DAFoamROM(dafoam_instance, 
-                                     pod_modes=pod_modes, 
-                                     reference_state=reference_state, 
-                                     weights=weights, 
-                                     scaling=scaling, 
-                                     residual_scaling=None,#residual_scaling, 
-                                     rom_type="lspg",
-                                     jac_mode="fd",
-                                     exclude_from_projection=None,#["nuTilda", "phi"], #["T", "phi", "nuTilda"],
-                                     newton_options={"jac_fd_step": 1e-8, "verbose" : 3, "tol_rel": 1e-8, 'ls_freeze_basis': True},
-                                     use_normalized_residuals=True,
-                                     write_residuals_with_solutions=True)
-    dafoam_rom_states    = dafoam_rom.evaluate(dafoam_input_variables_group)
+    # snapshots   = np.array(np.concatenate([data["samples"]["states"][state_var] for state_var in state_info.keys()], axis=0))
+    # scld_cntrd  = 1 / scaling[:, None] * (snapshots - reference_state[:, None])
+    # phi_tmp     = pod_modes[:,:10]
+
+    # coeffs      = comm.allreduce(phi_tmp.T @ (weights[:, None] * scld_cntrd), op=MPI.SUM)
+    
+    # import numpy as np
+    # import pandas as pd
+    # import seaborn as sns
+    # import matplotlib.pyplot as plt
+    # import matplotlib.pyplot as plt
+
+    # camber_samples = data["parameters"]["secondary_variables"]["%_camber_change"]
+    # thick_samples  = data["parameters"]["secondary_variables"]["%_thickness_change"]
+    # params = np.concatenate([camber_samples, thick_samples], axis=1)
+
+    # # if rank == 0:
+    # # --- Build DataFrame ---
+    # n_modes = coeffs.shape[0]
+    # df = pd.DataFrame(
+    #     coeffs.T,
+    #     columns=[f"a{i+1}" for i in range(n_modes)]
+    # )
+
+    # # choose ONE parameter dimension to color by
+    # # for i in range(params.shape[1]):
+    # df["param"] = params[:, rank]
+
+    # # --- Pairplot ---
+    # sns.pairplot(
+    #     df,
+    #     vars=[f"a{i+1}" for i in range(n_modes)],
+    #     hue="param",
+    #     palette="viridis",
+    #     corner=True,        # avoids redundant upper triangle
+    #     plot_kws={"s": 25, "alpha": 0.8}
+    # )
+
+    # plt.suptitle(f"POD Coefficient Pairplot Colored by Parameter (index {rank})", y=1.02)
+    # plt.show()
+
+    # quiet_barrier(comm)
+    ###
+
+    from csdl_dafoam.core.rom.csdl_rom import CSDLROMWrapper
+    from csdl_dafoam.core.rom.rom_models import DAFoamLSPGModel, DAFoamGalerkinModel
+    from csdl_dafoam.core.rom.rom_solver import NewtonSolver
+
+    dafoam_rom_model = DAFoamLSPGModel(dafoam_input_variables_group=dafoam_input_variables_group,
+                                 pod_modes=pod_modes,
+                                 reference_fom_state=reference_state,
+                                 scaling=scaling,
+                                 weights=1 / residual_scaling ** 2,
+                                 dafoam_instance=dafoam_instance_rom,
+                                 normalize_residuals=False,
+                                 fd_step=1e-6)
+    
+    # dafoam_rom_model = DAFoamGalerkinModel(dafoam_input_variables_group=dafoam_input_variables_group,
+    #                              pod_modes=pod_modes,
+    #                              reference_fom_state=reference_state,
+    #                              scaling=scaling,
+    #                              weights=weights / residual_scaling,
+    #                              dafoam_instance=dafoam_instance_rom,
+    #                              normalize_residuals=False,
+    #                              fd_step=1e-6,
+    #                              jac_mode="fd")
+
+    dafoam_rom = CSDLROMWrapper(model=dafoam_rom_model, solver=NewtonSolver(options={"tol_rel":1e-9, "tol_step_abs":1e-13}))   
+    dafoam_rom_states = dafoam_rom.evaluate()
 
     # Reconstruct state
     dafoam_state_estimate = reference_state + scaling * (pod_modes @ dafoam_rom_states)
@@ -431,8 +468,13 @@ with csdl.experimental.mpi.enter_mpi_region(rank, comm) as mpi_region:
     
     dafoam_functions_rom = DAFoamFunctions(dafoam_instance_rom, disable_jacvec_normalization=True)
     dafoam_function_rom_outputs = dafoam_functions_rom.evaluate(dafoam_state_estimate, 
-                                                        dafoam_input_variables_group)
+                                                        dafoam_input_variables_group)    
+    
+    x = 1 / scaling * (dafoam_solver_states - reference_state)
 
+    error = x - pod_modes @ csdl.experimental.mpi.mpi_sum(pod_modes.T @ (weights * x), comm=comm)
+    mpi_region.set_as_global_output(error)
+    
     outputDict = dafoam_instance.getOption("function")
     for outputName in outputDict.keys():
         mpi_region.set_as_global_output(getattr(dafoam_function_rom_outputs, outputName))
@@ -545,6 +587,21 @@ rank_outputs                     = ['x'] if rank == 0 else []
 
 # Optimization solver setup and run
 prob                = CSDLAlphaProblem(problem_name=f'{problem_name}', simulator=sim)
+
+# Print the FOM projection error norm after each model evaluation
+_orig_run_model = prob.check_if_warm_and_run_model
+def _run_model_with_proj_error(dvs, *args, **kwargs):
+    result = _orig_run_model(dvs, *args, **kwargs)
+    
+    numerator = np.sqrt(comm.allreduce(error.value.T @ (weights * error.value), op=MPI.SUM))
+    denominator = np.sqrt(comm.allreduce(x.value.T @ (weights * x.value), op=MPI.SUM))
+    if rank == 0:
+        print(f'[proj_error] L2 norm: {numerator:.6e}', flush=True)
+        print(f'[proj_error] relative norm: {numerator / denominator:.6e}', flush=True)
+    return result
+
+prob.check_if_warm_and_run_model = _run_model_with_proj_error
+
 optimizer_choice    = 3 # Set to 1 for PySLSQP, 2 for OpenSQP, or 3 for InteriorPoint
 
 if optimizer_choice == 1:

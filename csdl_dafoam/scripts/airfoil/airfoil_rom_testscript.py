@@ -52,7 +52,7 @@ print_runscript_info()
 # region USER INPUT
 # ===============================
 # Keyword for optimization name (optimization results folder will be saved with this name in dafoam directory)
-problem_name              = 'rom_with_interpolation'
+problem_name              = 'rom_test'
 
 # Geometry
 geometry_directory        =  os.path.join(os.getcwd(), 'airfoil_geometry/')
@@ -349,7 +349,50 @@ flight_conditions_group.altitude_m      = csdl.Variable(value=data["parameters"]
 ambient_conditions_group = sam.compute_ambient_conditions_group(flight_conditions_group.altitude_m)
 
 with csdl.experimental.mpi.enter_mpi_region(rank, comm) as mpi_region:
+
+    normals = dafoam_instance.getPatchFaceAreaNormals()
+    centers = dafoam_instance.getPatchFaceCenters()
+
+   
+    import matplotlib.pyplot as plt
+
+    def set_axes_equal(ax):
+        x_limits = ax.get_xlim3d()
+        y_limits = ax.get_ylim3d()
+        z_limits = ax.get_zlim3d()
+
+        x_range = x_limits[1] - x_limits[0]
+        y_range = y_limits[1] - y_limits[0]
+        z_range = z_limits[1] - z_limits[0]
+
+        max_range = max(x_range, y_range, z_range) / 2.0
+
+        x_mid = sum(x_limits) / 2.0
+        y_mid = sum(y_limits) / 2.0
+        z_mid = sum(z_limits) / 2.0
+
+        ax.set_xlim3d([x_mid - max_range, x_mid + max_range])
+        ax.set_ylim3d([y_mid - max_range, y_mid + max_range])
+        ax.set_zlim3d([z_mid - max_range, z_mid + max_range])
+
+    normals = -np.concatenate(comm.allgather(normals), axis=0)
+    centers =  np.concatenate(comm.allgather(centers), axis=0)
+    print(normals.shape)
+    print(centers.shape)
     
+    if rank == 0:
+        fig = plt.figure()
+        ax = fig.add_subplot(111, projection='3d')
+
+        ax.quiver(
+            centers[:, 0], centers[:, 1], centers[:, 2],
+            normals[:, 0], normals[:, 1], normals[:, 2]
+        )
+        set_axes_equal(ax)
+
+        plt.show()
+    quiet_barrier(comm)
+
     x_surf_dafoam   = x_surf_dafoam_full[i0:i1, :]
     x_surf_dafoam   = x_surf_dafoam.flatten()
 
@@ -421,7 +464,7 @@ with csdl.experimental.mpi.enter_mpi_region(rank, comm) as mpi_region:
 # 3: Maximize CL/CD wrt angle-of-attack, wing shape (thickness/camber ffd)
 # 4: Minimize D wrt angle-of-attack (test case)
 # 5: Maximize CL/CD wrt wing shape (thickness/camber ffd)
-optimization_case = 5
+optimization_case = 1
 
 
 if optimization_case == 1:
@@ -509,60 +552,67 @@ recorder.stop()
 # ===============================
 sim = csdl.experimental.PySimulator(recorder)
 
-# Quick write of the variable names to file
-write_dv_names(f"{problem_name}_outputs/design_variable_map.txt", sim)
+loss_var    = objective_fun
+wrt         = flight_conditions_group.angle_of_attack_deg
+grad        = sim.compute_totals(loss_var, wrt)[loss_var, wrt]
+
+print(f"Rank {rank} grad : {grad}")
+
+
+# # Quick write of the variable names to file
+# write_dv_names(f"{problem_name}_outputs/design_variable_map.txt", sim)
 
 
 
-# ===============================
-# region OPTIMIZER
-# ===============================
-# Only allow visualization and modopt output files on the root rank
-visualize_on_this_rank           = True  if rank == 0 and not is_headless() else False
-turn_off_outputs_on_nonroot_rank = False if rank == 0 else True
-recording_on_root_rank           = True  if rank == 0 else False
-rank_outputs                     = ['x'] if rank == 0 else []
+# # ===============================
+# # region OPTIMIZER
+# # ===============================
+# # Only allow visualization and modopt output files on the root rank
+# visualize_on_this_rank           = True  if rank == 0 and not is_headless() else False
+# turn_off_outputs_on_nonroot_rank = False if rank == 0 else True
+# recording_on_root_rank           = True  if rank == 0 else False
+# rank_outputs                     = ['x'] if rank == 0 else []
 
-# Optimization solver setup and run
-prob                = CSDLAlphaProblem(problem_name=f'{problem_name}', simulator=sim)
+# # Optimization solver setup and run
+# prob                = CSDLAlphaProblem(problem_name=f'{problem_name}', simulator=sim)
 
-optimizer_choice    = 3 # Set to 1 for PySLSQP, 2 for OpenSQP, or 3 for InteriorPoint
+# optimizer_choice    = 3 # Set to 1 for PySLSQP, 2 for OpenSQP, or 3 for InteriorPoint
 
-if optimizer_choice == 1:
-    # PySLSQP optimizer setup
-    solver_options = {'maxiter': 20,
-                    'iprint': 2,
-                    'readable_outputs': rank_outputs,
-                    'recording': recording_on_root_rank,
-                    'turn_off_outputs': turn_off_outputs_on_nonroot_rank}
-    optimizer   = PySLSQP(prob, solver_options=solver_options)
-    optimizer.solve()
-    optimizer.print_results()
+# if optimizer_choice == 1:
+#     # PySLSQP optimizer setup
+#     solver_options = {'maxiter': 20,
+#                     'iprint': 2,
+#                     'readable_outputs': rank_outputs,
+#                     'recording': recording_on_root_rank,
+#                     'turn_off_outputs': turn_off_outputs_on_nonroot_rank}
+#     optimizer   = PySLSQP(prob, solver_options=solver_options)
+#     optimizer.solve()
+#     optimizer.print_results()
 
-elif optimizer_choice == 2:
-    # OpenSQP optimizer setup
-    open_sqp_options = {'maxiter': 100,
-                        'readable_outputs': rank_outputs,
-                        'recording': recording_on_root_rank,
-                        'ls_max_step': 1.,
-                        'turn_off_outputs': turn_off_outputs_on_nonroot_rank,}
-    optimizer = OpenSQP(prob, **open_sqp_options)
-    optimizer.solve()
-    optimizer.print_results()
+# elif optimizer_choice == 2:
+#     # OpenSQP optimizer setup
+#     open_sqp_options = {'maxiter': 100,
+#                         'readable_outputs': rank_outputs,
+#                         'recording': recording_on_root_rank,
+#                         'ls_max_step': 1.,
+#                         'turn_off_outputs': turn_off_outputs_on_nonroot_rank,}
+#     optimizer = OpenSQP(prob, **open_sqp_options)
+#     optimizer.solve()
+#     optimizer.print_results()
 
-elif optimizer_choice == 3:
-    # InteriorPoint optimizer setup
-    interior_point_options = {'maxiter': 100,
-                            'readable_outputs': rank_outputs,
-                            'recording': recording_on_root_rank,
-                            'ls_max_step': 1.,
-                            'turn_off_outputs': turn_off_outputs_on_nonroot_rank}
-    optimizer   = InteriorPoint(prob, **interior_point_options)
-    optimizer.solve()
-    optimizer.print_results()
+# elif optimizer_choice == 3:
+#     # InteriorPoint optimizer setup
+#     interior_point_options = {'maxiter': 100,
+#                             'readable_outputs': rank_outputs,
+#                             'recording': recording_on_root_rank,
+#                             'ls_max_step': 1.,
+#                             'turn_off_outputs': turn_off_outputs_on_nonroot_rank}
+#     optimizer   = InteriorPoint(prob, **interior_point_options)
+#     optimizer.solve()
+#     optimizer.print_results()
     
-else:
-    print(f'Check optimizer choice. {optimizer_choice} is not an option.')
+# else:
+#     print(f'Check optimizer choice. {optimizer_choice} is not an option.')
 
 
 # # ===============================

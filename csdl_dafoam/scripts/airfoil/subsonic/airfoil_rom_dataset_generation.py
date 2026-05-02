@@ -50,7 +50,7 @@ os.environ["PETSC_OPTIONS"] = "-malloc_debug"
 # region USER INPUT
 # ===============================
 # Keyword for optimization name (optimization results folder will be saved with this name)
-problem_name              = 'rom_test'
+problem_name              = 'training_data'
 
 # Geometry
 geometry_directory        =  Path.cwd()/'airfoil_geometry'
@@ -64,19 +64,21 @@ TIMING_ENABLED = True  # True if we want timing printed for the CSDL operations
 # DAFoam
 dafoam_directory = Path.cwd()/'results'/f'{problem_name}'
 
-# Initial/reference values for DAFoam (Values for M=0.7 @ 30k ft)
-U0        = 212.2218        # used for normalizing CD and CL
-p0        = 30089.6
-T0        = 228.714
-nuTilda0  = 3.272e-5
-aoa0      = 0
-A0        = 0.1           #
-rho0      = p0 / T0 / 287 # used for normalizing CD and CL
+# Initial/reference values for DAFoam
+U0 = 100.0
+p0 = 101325.0
+T0 = 300.0
+nuTilda0 = 4.5e-5
+CL_target = 0.5
+aoa0 = 4.0
+A0 = 0.1
+# rho is used for normalizing CD and CL
+rho0 = p0 / T0 / 287
 
 # Input parameters for DAFoam
 da_options = {
     "designSurfaces": ["wing"],
-    "solverName": "DARhoSimpleCFoam",
+    "solverName": "DARhoSimpleFoam",
     "primalMinResTol": 1.0e-8,
     "primalBC": {
         "U0": {"variable": "U", "patches": ["inout"], "value": [U0, 0.0, 0.0]},
@@ -84,10 +86,6 @@ da_options = {
         "T0": {"variable": "T", "patches": ["inout"], "value": [T0]},
         "nuTilda0": {"variable": "nuTilda", "patches": ["inout"], "value": [nuTilda0]},
         "useWallFunction": True,
-    },
-    "primalVarBounds": {
-        "pMin":   1000,
-        "rhoMin": 0.05,
     },
     "function": {
         "drag": {
@@ -157,14 +155,14 @@ mesh_options = {
 # region Training options
 # ===============================
 # Storage options
-dataset_keyword       = 'training_data4'
+dataset_keyword       = 'training_set1'
 storage_location      = dafoam_directory
 
 # Sampling options
 # grassmann_variables indicates the variables which correspond to points on the Grassmann manifold
 # snapshot_variables indicates the variables which correspond to "snapshots" or realizations
-num_grassmann_samples     = 10
-num_snapshot_samples      = 300
+num_grassmann_samples     = 2
+num_snapshot_samples      = 100
 random_state_seed         = 0
 
 
@@ -294,9 +292,9 @@ x_vol_dafoam    = idwarp_model.evaluate(x_surf_dafoam)
 
 # Flight condition variables
 flight_conditions_group                     = csdl.VariableGroup()
-flight_conditions_group.mach_number         = csdl.Variable(value=0.7,      name="mach_number")
-flight_conditions_group.angle_of_attack_deg = csdl.Variable(value=aoa0,     name="angle_of_attack_deg")
-flight_conditions_group.altitude_m          = csdl.Variable(value=9144.,    name="altitude (m)")
+flight_conditions_group.mach_number         = csdl.Variable(value=0.2941176471,      name="mach_number")
+flight_conditions_group.angle_of_attack_deg = csdl.Variable(value=0,     name="angle_of_attack_deg")
+flight_conditions_group.altitude_m          = csdl.Variable(value=0.,    name="altitude (m)")
 
 # Atmospheric condition variables
 ambient_conditions_group = sam.compute_ambient_conditions_group(flight_conditions_group.altitude_m)
@@ -363,21 +361,21 @@ grassmann_vars_and_limits = {
         'name': 'angle_of_attack_deg',     
         'range': [0., 5],
     },
-    flight_conditions_group.altitude_m: {
-        'name': 'altitude_m', 
-        'range': [7000., 13000],
-        }
+    # flight_conditions_group.altitude_m: {
+    #     'name': 'altitude_m', 
+    #     'range': [7000., 13000],
+    #     }
 }
 
 snapshot_vars_and_limits = {
     percent_change_in_thickness_dof: {
         'name': '%_thickness_change',
-        'range': [-10, 10],
+        'range': [-20, 20],
         'ref_value': 0, 
     },
     normalized_percent_camber_change_dof: {
         'name': '%_camber_change',
-        'range': [-10, 10],
+        'range': [-20, 20],
         'ref_value': 0, 
     }
 }
@@ -387,10 +385,10 @@ snapshot_vars_and_limits = {
 important_non_sampled_variables = {
     flight_conditions_group.airspeed_m_s: {
         "name": "airspeed_m_s"
-    }, 
-    # flight_conditions_group.altitude_m: {
-    #     "name": "altitude_m"
-    # }
+    },
+    flight_conditions_group.altitude_m: {
+        "name": "altitude_m"
+    }
 }
 
 
@@ -411,27 +409,27 @@ data_generator = TrainingDataInterface(dafoam_instance=dafoam_instance,
                                             gather_raw_files=True)
 
 
-# data_generator.sample_variables()
-# data_generator.run_sweep(pod_options={"centering":"reference", "write_modes_using_write_adjoint_fields":False})
+data_generator.sample_variables()
+data_generator.run_sweep(pod_options={"centering":"reference", "write_modes_using_write_adjoint_fields":False})
 
-import glob
-files = glob.glob(str(Path(storage_location)/dataset_keyword/f"300_samples_*.h5"))
+# import glob
+# files = glob.glob(str(Path(storage_location)/dataset_keyword/f"300_samples_*.h5"))
 
-ref_vals = dafoam_instance.getPatchStateAverages("inout")
+# ref_vals = dafoam_instance.getPatchStateAverages("inout")
 
-ref_vals ["nuTilda"] *= 1000
-ref_vals["phi"]       = ref_vals["p"] / ref_vals["T"] / 287. * ref_vals["U"]
+# ref_vals ["nuTilda"] *= 1000
+# ref_vals["phi"]       = ref_vals["p"] / ref_vals["T"] / 287. * ref_vals["U"]
 
-for file in files:
-    data_generator._compute_pod_modes(file, 
-                    inner_product="reference", 
-                    centering='reference', 
-                    scaling=ref_vals, 
-                    write_h5=True, 
-                    new_h5_file=False, 
-                    overwrite_datasets=True,
-                    new_file_suffix="modes", 
-                    write_modes_using_write_adjoint_fields=False)
+# for file in files:
+#     data_generator._compute_pod_modes(file, 
+#                     inner_product="reference", 
+#                     centering='reference', 
+#                     scaling=ref_vals, 
+#                     write_h5=True, 
+#                     new_h5_file=False, 
+#                     overwrite_datasets=True,
+#                     new_file_suffix="modes", 
+#                     write_modes_using_write_adjoint_fields=False)
     
 
 
