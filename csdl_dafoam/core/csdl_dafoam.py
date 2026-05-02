@@ -242,7 +242,7 @@ class DAFoamSolver(csdl.experimental.CustomImplicitOperation):
                             print("---------------------------------------------", flush=True)
 
                         if self.write_residual_fields:
-                            dafoam_instance.solver.writeAdjointFields("res_", self.solution_counter / 10000, dafoam_instance.getResiduals(), True)
+                            dafoam_instance.solver.writeAdjointFields("res_", round(self.solution_counter / 10000, 4), dafoam_instance.getResiduals(), True)
 
                         self.solution_counter += 1
 
@@ -701,16 +701,19 @@ def compute_dafoam_input_variables(dafoam_instance, ambient_conditions_group:csd
         if input_type == "volCoord":
             # TODO: Logic for checking dimensions
             setattr(dafoam_input_variables_group, input_name, aerodynamic_volume_coordinates)
+            # setattr(getattr(dafoam_input_variables_group, input_name), "name", "volCoord" )
 
         # If the type is patchVelocity, we get the velocity and angle of attack and assign it to a CSDL variable
         elif input_type == "patchVelocity":
             # Compute the airspeed if not in the flight conditions group, and add to it
             if not hasattr(flight_conditions_group, "airspeed_m_s"):
                 flight_conditions_group.airspeed_m_s = flight_conditions_group.mach_number*ambient_conditions_group.a_m_s
+                # flight_conditions_group.airspeed_m_s.name = "airspeed_m_s"
 
             # Create the patchVelocity input
             patchVelocity = csdl.concatenate((flight_conditions_group.airspeed_m_s, flight_conditions_group.angle_of_attack_deg))
             setattr(dafoam_input_variables_group, input_name, patchVelocity)
+            # setattr(getattr(dafoam_input_variables_group, input_name), "name", "patchVelocity" )
         
         # If the type is a patchVar, we assign the appropriate value to the CSDL variable
         elif input_type == "patchVar":
@@ -719,10 +722,12 @@ def compute_dafoam_input_variables(dafoam_instance, ambient_conditions_group:csd
             # Pressure case
             if input_variable_name == "p":
                 setattr(dafoam_input_variables_group, input_name, ambient_conditions_group.P_Pa)
+                # setattr(getattr(dafoam_input_variables_group, input_name), "name", "patchVar_P" )
             
             # Temperature case
             elif input_variable_name == "T":
                 setattr(dafoam_input_variables_group, input_name, ambient_conditions_group.T_K)
+                # setattr(getattr(dafoam_input_variables_group, input_name), "name", "patchVar_T" )
 
             # Not implemented case
             else:
