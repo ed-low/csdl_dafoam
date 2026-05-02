@@ -12,15 +12,18 @@ from csdl_dafoam.utils.runscript_helper_functions import quiet_barrier
 from csdl_dafoam.utils.standard_atmosphere_model import compute_ambient_conditions_group
 from csdl_dafoam.utils.decompositions import method_of_snapshots_distributed
 import matplotlib.pyplot as plt
+import matplotlib as mpl
+from scipy.spatial import distance
+from sklearn.neighbors import NearestNeighbors
 
 
 # region TRAININGDATAINTERFACE
 class TrainingDataInterface():  
-    def __init__(self, 
-                 dafoam_instance,  
+    def __init__(self,
+                 dafoam_instance,
                  storage_location,
                  dataset_keyword,
-                 primary_variables=None, 
+                 primary_variables=None,
                  secondary_variables=None,
                  non_sampled_variables=None,
                  csdl_simulator=None,
@@ -30,7 +33,9 @@ class TrainingDataInterface():
                  random_state_seed=0,
                  store_residuals=False,
                  h5_file_base_name="point",
-                 gather_raw_files=True
+                 gather_raw_files=True,
+                 parallel_write=True,
+                 parallel_read=True,
                  ):
         
         # TODO: See if there is DAFoam API to get whether a variable is volVectorStates, volScalarStates, modelStates, or surfaceScalarStates.
@@ -58,6 +63,8 @@ class TrainingDataInterface():
         self.random_state_seed          = random_state_seed
         self.h5_file_base_name          = h5_file_base_name
         self.gather_raw_files           = gather_raw_files
+        self.parallel_write             = parallel_write
+        self.parallel_read              = parallel_read
 
         # MPI values for easier access
         self.comm                       = dafoam_instance.comm
@@ -121,7 +128,7 @@ class TrainingDataInterface():
                                "centering":"reference",
                                "scaling":"reference",
                                "new_h5_file":separate_pod_file}
-        
+
         # Assign default pod options to user supplied if not present
         pod_options = {} if pod_options is None else pod_options
         for key in default_pod_options.keys():
@@ -136,7 +143,7 @@ class TrainingDataInterface():
         if not self.ran_sampling:
             self.print0("Must run sample_variables before run_sweep.")
             return
-        
+
         # Throw error if we don't have a reference patch
         if self.reference_patch is None:
             self.print0("Please supply reference_patch to the TrainingDataInterface before running a sweep.")
@@ -146,48 +153,79 @@ class TrainingDataInterface():
         adj_num_primary_samples   = self.num_primary_samples   + self.primary_has_ref
         adj_num_secondary_samples = self.num_secondary_samples + self.secondary_has_ref
 
+        # Check for an interrupted sweep to resume from
+        resume_primary_idx, resume_secondary_start, skip_h5_init = self._check_for_interrupted_sweep(adj_num_secondary_samples)
+
         for primary_idx in range(adj_num_primary_samples):
             h5file_path = self.storage_location/self.dataset_keyword/f'{self.h5_file_base_name}_{primary_idx}.h5'
-            
-            self.initialize_h5_file(h5file_path, primary_idx)
+
+            # Skip primary indices already fully written before the resume point
+            if resume_primary_idx is not None and primary_idx < resume_primary_idx:
+                self.print0(f'Skipping primary index {primary_idx} (already complete).')
+                continue
+
+            # is_first_resumed: True only for the very first primary index we actually process
+            is_first_resumed = (resume_primary_idx is not None and primary_idx == resume_primary_idx)
+            secondary_start  = resume_secondary_start if is_first_resumed else 0
+
+            # skip_h5_init is True only when resuming mid-file (file already exists on disk).
+            # When the previous primary completed fully and we're starting a fresh file for the
+            # next primary, skip_h5_init is False and the file must be initialised normally.
+            if not (is_first_resumed and skip_h5_init):
+                self.initialize_h5_file(h5file_path, primary_idx)
 
             if self.rank == 0 and self.gather_raw_files:
-                # Make a folder for the raw OpenFOAM save
-                raw_directory = self.storage_location/self.dataset_keyword/f'{self.h5_file_base_name}_{primary_idx}_raw'
-                print(f'Setting up raw data folder.')
-
-                for i in range(10): # max rename attempts
-                    candidate = raw_directory if i == 0 else raw_directory.with_name(f"{raw_directory.name}_{i}")
-
-                    try:
-                        os.makedirs(candidate)
-                        raw_directory = candidate
-                        print(f'Set up raw data directory: {raw_directory}')
-                        break
-                    except FileExistsError:
-                        print('Raw file directory seems to exist. Trying again with incremented name...')
-                        continue
-
+                if is_first_resumed and skip_h5_init:
+                    raw_directory = self._find_existing_raw_directory(primary_idx)
+                    print(f'Resuming into existing raw data folder: {raw_directory}')
                 else:
-                    raise RuntimeError("Could not create a unique directory name.")
+                    # Make a folder for the raw OpenFOAM save
+                    raw_directory = self.storage_location/self.dataset_keyword/f'{self.h5_file_base_name}_{primary_idx}_raw'
+                    print(f'Setting up raw data folder.')
 
-                # Copy the constant folder to the raw directory
-                current_directory = Path.cwd()
-                os.chdir(dafoam_directory)
-                shutil.copytree('./constant', raw_directory/'constant')
-                os.chdir(current_directory)
+                    for i in range(10): # max rename attempts
+                        candidate = raw_directory if i == 0 else raw_directory.with_name(f"{raw_directory.name}_{i}")
+
+                        try:
+                            os.makedirs(candidate)
+                            raw_directory = candidate
+                            print(f'Set up raw data directory: {raw_directory}')
+                            break
+                        except FileExistsError:
+                            print('Raw file directory seems to exist. Trying again with incremented name...')
+                            continue
+
+                    else:
+                        raise RuntimeError("Could not create a unique directory name.")
+
+                    # Copy the constant folder to the raw directory
+                    current_directory = Path.cwd()
+                    os.chdir(dafoam_directory)
+                    shutil.copytree('./constant', raw_directory/'constant')
+                    os.chdir(current_directory)
 
             # Update all of the primary parameters for current point
             for var, info in primary_variables.items():
                 sim[var] = info["samples"][primary_idx]
 
-            for secondary_idx in range(adj_num_secondary_samples):
+            # Before the first solve of a resumed primary point, clean up any stale
+            # OpenFOAM time directories left by the interrupted run.  This prevents:
+            #   (a) a leftover 0.9998/ from causing renameSolution to move the wrong
+            #       solution into the raw directory (yielding duplicate snapshots), and
+            #   (b) partial time directories from a mid-solve interrupt being picked up
+            #       as the initial condition for the next solve.
+            if is_first_resumed and skip_h5_init:
+                self._cleanup_openfoam_for_resume(dafoam_directory)
+
+            for secondary_idx in range(secondary_start, adj_num_secondary_samples):
                 if rank == 0:
                     print('\n\n\n\n')
                     print('=============================================')
                     print(f'Primary sample {primary_idx+1}/{adj_num_primary_samples}, secondary sample {secondary_idx+1}/{adj_num_secondary_samples}')
+                    if is_first_resumed and secondary_idx == secondary_start and secondary_start > 0:
+                        print(f'(Resuming from secondary index {secondary_start})')
                     print('=============================================\n')
-                
+
                 # Update all of the primary parameters for current point and sample
                 for var, info in secondary_variables.items():
                     sim[var] = info["samples"][secondary_idx]
@@ -196,7 +234,7 @@ class TrainingDataInterface():
                 sim.run()
 
                 # We'll do a check to see if the first primal solve of the primary point failed
-                # If so, we'll retry by running with a new initial condition taken from 
+                # If so, we'll retry by running with a new initial condition taken from
                 # the freestream value (reference patch).
                 if secondary_idx == 0 and dafoam_instance.primalFail and self.reference_patch is not None:
 
@@ -217,6 +255,8 @@ class TrainingDataInterface():
                     # Try running again
                     sim.run()
 
+                # TODO: Add a derivative computation here
+
                 self.write_sample(h5file_path, secondary_idx)
 
                 # Move OpenFOAM solution to solution directory
@@ -224,21 +264,22 @@ class TrainingDataInterface():
                     current_directory = Path.cwd()
                     os.chdir(dafoam_directory)
                     dafoam_instance.renameSolution(9998)
-                    
+
+                    quiet_barrier(self.comm)
                     if rank == 0:
                         if comm_size > 1:
                             for i in range(comm_size):
-                                shutil.move(dafoam_directory/f'processor{i}'/'0.9998/', 
+                                shutil.move(dafoam_directory/f'processor{i}'/'0.9998/',
                                         raw_directory/f'processor{i}'/f'{secondary_idx:04}')
-                            
+
                                 # Copy constant folder to directory (only need to do this once)
-                                if primary_idx == 0 and secondary_idx == 0:
-                                    shutil.copytree(dafoam_directory/f'processor{i}'/'constant', 
+                                if secondary_idx == 0:
+                                    shutil.copytree(dafoam_directory/f'processor{i}'/'constant',
                                     raw_directory/f'processor{i}'/'constant')
                         else:
-                            shutil.move(dafoam_directory/'0.9998', 
+                            shutil.move(dafoam_directory/'0.9998',
                                     raw_directory/f'{secondary_idx:04}')
-                    
+                    quiet_barrier(self.comm)
                     os.chdir(current_directory)
 
                 else:
@@ -251,6 +292,169 @@ class TrainingDataInterface():
                 self._compute_pod_modes(h5filepath=h5file_path, **pod_options)
 
     
+    # region _check_for_interrupted_sweep
+    def _check_for_interrupted_sweep(self, adj_num_secondary_samples):
+        """
+        Scan the storage directory for the largest-indexed h5 data file and determine
+        where the sweep should resume.  Two cases are handled:
+
+          - Incomplete file: the largest file exists but has not had all secondary
+            samples written.  Resume mid-file; the h5 file and raw directory already
+            exist, so their initialisation must be skipped.
+
+          - Complete file, next primary missing: the largest file is fully written but
+            the next primary index has no h5 file.  Resume at the start of that next
+            primary index; the h5 file and raw directory must be created fresh.
+
+        Rank 0 performs all file I/O; the result is broadcast to every rank.
+
+        Returns
+        -------
+        (resume_primary_idx, resume_secondary_start, skip_h5_init)
+            resume_primary_idx      - first primary index that still needs work, or None
+                                      if no existing files were found / files don't match.
+            resume_secondary_start  - first secondary index to run for that primary (0 when
+                                      starting a brand-new primary file).
+            skip_h5_init            - True only when resuming mid-file (the h5 file already
+                                      exists and must not be re-initialised).
+        """
+        self.print0("Checking for interrupted sweep...")
+
+        result = (None, 0, False)
+
+        if self.rank == 0:
+            dataset_dir = self.storage_location / self.dataset_keyword
+
+            # Collect files whose stem ends with a bare integer (exclude _modes, etc.)
+            data_files = []
+            for f in dataset_dir.glob(f'{self.h5_file_base_name}_*.h5'):
+                suffix = f.stem[len(self.h5_file_base_name) + 1:]
+                if suffix.isdigit():
+                    data_files.append((int(suffix), f))
+
+            if data_files:
+                data_files.sort(key=lambda x: x[0])
+                largest_primary_idx, largest_file = data_files[-1]
+
+                try:
+                    with h5py.File(largest_file, "r") as f:
+                        sample_group   = f["samples"]
+                        param_group    = f["parameters"]
+                        sec_var_group  = param_group["secondary_variables"]
+                        prim_var_group = param_group["primary_variables"]
+
+                        last_written    = int(sample_group.attrs["last_written_sample_index"])
+                        total_snapshots = len(sample_group["converged"])
+                        file_complete   = last_written >= total_snapshots - 1
+
+                    # Validate secondary samples (same check regardless of which case)
+                    secondary_match = True
+                    with h5py.File(largest_file, "r") as f:
+                        sec_var_group = f["parameters"]["secondary_variables"]
+                        for var, info in self.secondary_variables.items():
+                            var_name = info["name"]
+                            if var_name not in sec_var_group:
+                                print(f"Resume check: secondary variable '{var_name}' not found in {largest_file.name}. Cannot resume.")
+                                secondary_match = False
+                                break
+                            if not np.allclose(sec_var_group[var_name][()], info["samples"]):
+                                print(f"Resume check: secondary variable '{var_name}' samples do not match. Cannot resume.")
+                                secondary_match = False
+                                break
+
+                    if secondary_match:
+                        with h5py.File(largest_file, "r") as f:
+                            prim_var_group = f["parameters"]["primary_variables"]
+                            primary_match = True
+                            for var, info in self.primary_variables.items():
+                                var_name = info["name"]
+                                if var_name not in prim_var_group:
+                                    print(f"Resume check: primary variable '{var_name}' not found in {largest_file.name}. Cannot resume.")
+                                    primary_match = False
+                                    break
+                                if not np.allclose(prim_var_group[var_name][()], info["samples"][largest_primary_idx]):
+                                    print(f"Resume check: primary variable '{var_name}' at index {largest_primary_idx} does not match. Cannot resume.")
+                                    primary_match = False
+                                    break
+
+                        if primary_match:
+                            if not file_complete:
+                                # Case: incomplete file — resume mid-secondary loop, skip h5 init
+                                resume_secondary_start = last_written + 1
+                                print(f"\nFound incomplete sweep file: {largest_file.name}")
+                                print(f"  Last written secondary index: {last_written} / {total_snapshots - 1}")
+                                print(f"  Resuming from primary index {largest_primary_idx}, secondary index {resume_secondary_start}.\n")
+                                result = (largest_primary_idx, resume_secondary_start, True)
+                            else:
+                                # Case: file complete but next primary not started — create it fresh
+                                next_primary_idx = largest_primary_idx + 1
+                                print(f"\nAll secondary samples in {largest_file.name} are complete.")
+                                print(f"  Resuming at the start of primary index {next_primary_idx}.\n")
+                                result = (next_primary_idx, 0, False)
+
+                except Exception as e:
+                    print(f"Warning: could not read existing h5 file for resume check: {e}")
+
+        result = self.comm.bcast(result, root=0)
+        return result
+
+
+    # region _find_existing_raw_directory
+    def _find_existing_raw_directory(self, primary_idx):
+        """Return the path of an existing raw directory for the given primary index."""
+        base = self.storage_location/self.dataset_keyword/f'{self.h5_file_base_name}_{primary_idx}_raw'
+        if base.exists():
+            return base
+        for i in range(1, 10):
+            candidate = base.with_name(f"{base.name}_{i}")
+            if candidate.exists():
+                return candidate
+        return base  # Fallback: return the canonical name even if missing
+
+
+    # region _cleanup_openfoam_for_resume
+    def _cleanup_openfoam_for_resume(self, dafoam_directory):
+        """
+        Remove stale OpenFOAM time directories left by an interrupted run.
+
+        Two failure modes are addressed:
+          1. A leftover 0.9998/ directory (rename completed but move did not).
+             If this is not removed, the next renameSolution call may fail or
+             silently leave the old directory in place, causing the wrong solution
+             to be moved into the raw directory — producing duplicate snapshots.
+          2. Partial time directories from a mid-solve interrupt (e.g. 0.0001/).
+             If these persist, DAFoam may pick up latestTime as the IC rather
+             than the intended initial condition, contaminating the resumed solve.
+
+        Only rank 0 performs filesystem operations; a barrier ensures all ranks
+        wait until cleanup is complete before the first sim.run() is called.
+        """
+        if self.rank == 0:
+            dafoam_directory = Path(dafoam_directory)
+
+            def is_numeric_time_dir(p):
+                try:
+                    t = float(p.name)
+                    return t > 0  # keep the 0/ IC directory
+                except ValueError:
+                    return False
+
+            if self.comm_size > 1:
+                dirs_to_check = [dafoam_directory / f'processor{i}' for i in range(self.comm_size)]
+            else:
+                dirs_to_check = [dafoam_directory]
+
+            for proc_dir in dirs_to_check:
+                if not proc_dir.exists():
+                    continue
+                for child in proc_dir.iterdir():
+                    if child.is_dir() and is_numeric_time_dir(child):
+                        print(f'  Resume cleanup: removing stale time directory {child}')
+                        shutil.rmtree(child)
+
+        quiet_barrier(self.comm)
+
+
     # region initialize_h5_file
     def initialize_h5_file(self, h5filepath, primary_idx):
         comm = self.comm
@@ -297,6 +501,12 @@ class TrainingDataInterface():
             mesh_group.create_dataset("centroid_coordinates",     (3 * num_cells_global, adj_num_secondary_samples),                dtype="f8")
             mesh_group.create_dataset("cell_volumes",             (num_cells_global, adj_num_secondary_samples),                    dtype="f8")
             mesh_group.create_dataset("face_areas",               (num_faces_no_proc_boundaries_global, adj_num_secondary_samples), dtype="f8") 
+            # The following two datasets are for debugging
+            mesh_group.create_dataset("cell_indices",             (num_cells_global, ),                                             dtype="i8")
+            mesh_group.create_dataset("face_indices",             (num_faces_no_proc_boundaries_global, ),                          dtype="i8")
+
+            self._write_field_data_to_dataset(mesh_group["cell_indices"],  self.cell_global_indices, "volScalarStates")
+            self._write_field_data_to_dataset(mesh_group["face_indices"], self.face_global_indices, "surfaceScalarStates")
 
             mesh_group["centroid_coordinates"].attrs.create("addressing_type",  "volVectorStates")
             mesh_group["cell_volumes"].attrs.create("addressing_type",          "volScalarStates")
@@ -334,55 +544,165 @@ class TrainingDataInterface():
     def write_sample(self, h5filepath, sample_idx):
         self.print0('Adding sample...')
         dafoam_instance = self.dafoam_instance
-        states                                  = dafoam_instance.getStates()
-        cell_coords                             = dafoam_instance.getCellCentroids()
-        state_weights                           = np.abs(dafoam_instance.getStateWeights())
-        state_reference_values                  = dafoam_instance.getPatchStateAverages(self.reference_patch) if self.reference_patch is not None else None
-
+        states          = dafoam_instance.getStates()
+        cell_coords     = dafoam_instance.getCellCentroids()
+        state_weights   = np.abs(dafoam_instance.getStateWeights())
+        state_reference_values = (dafoam_instance.getPatchStateAverages(self.reference_patch)
+                                  if self.reference_patch is not None else None)
         if self.store_residuals:
-            residuals                           = dafoam_instance.getResiduals()
+            residuals = dafoam_instance.getResiduals()
 
+        if self.parallel_write:
+            self._write_sample_parallel(h5filepath, sample_idx, states, cell_coords,
+                                        state_weights, state_reference_values,
+                                        residuals if self.store_residuals else None)
+        else:
+            self._write_sample_root(h5filepath, sample_idx, states, cell_coords,
+                                    state_weights, state_reference_values,
+                                    residuals if self.store_residuals else None)
+
+
+    # region _write_sample_parallel
+    def _write_sample_parallel(self, h5filepath, sample_idx, states, cell_coords,
+                                state_weights, state_reference_values, residuals):
         with h5py.File(h5filepath, "a", driver="mpio", comm=self.comm) as f:
-            sample_group    = f["samples"]
-            state_group     = sample_group["states"]
-            ref_group       = sample_group["reference_states"]
-            mesh_group      = sample_group["mesh"]
-
+            sample_group = f["samples"]
+            state_group  = sample_group["states"]
+            ref_group    = sample_group["reference_states"]
+            mesh_group   = sample_group["mesh"]
             if self.store_residuals:
-                res_group   = sample_group["residuals"]
+                res_group = sample_group["residuals"]
 
             added_cell_volumes = False
             added_face_areas   = False
 
-            # Loop through states to update sample data
             for state_name, info in self.state_info.items():
-                dset        = state_group[state_name]
-                indices     = info['indices']
-                state_type  = info['type']
+                dset       = state_group[state_name]
+                indices    = info['indices']
+                state_type = info['type']
 
                 if self.store_residuals:
-                    rset    = res_group[state_name]
-                    self._write_field_data_to_dataset(rset, residuals[indices], state_type, sample_idx)
+                    self._write_field_data_to_dataset(res_group[state_name], residuals[indices], state_type, sample_idx)
 
                 if self.reference_patch is not None:
                     ref_group[state_name][sample_idx] = state_reference_values[state_name]
 
                 self._write_field_data_to_dataset(dset, states[indices], state_type, sample_idx)
 
-                # Update the cell volumes and face areas only for first time of respective addressing_type
                 if state_type == "volScalarStates" and not added_cell_volumes:
                     self._write_field_data_to_dataset(mesh_group["cell_volumes"], state_weights[indices], state_type, sample_idx)
                     added_cell_volumes = True
-                    
+
                 if state_type == "surfaceScalarStates" and not added_face_areas:
                     self._write_field_data_to_dataset(mesh_group["face_areas"], state_weights[indices], state_type, sample_idx)
                     added_face_areas = True
 
             self._write_field_data_to_dataset(mesh_group["centroid_coordinates"], cell_coords, "volVectorStates", sample_idx)
-            
-            # Update scalar values
-            sample_group["converged"][sample_idx]             = not self.dafoam_instance.primalFail
-            sample_group.attrs["last_written_sample_index"]   = sample_idx
+
+            sample_group["converged"][sample_idx]           = not self.dafoam_instance.primalFail
+            sample_group.attrs["last_written_sample_index"] = sample_idx
+
+
+    # region _write_sample_root
+    def _write_sample_root(self, h5filepath, sample_idx, states, cell_coords,
+                           state_weights, state_reference_values, residuals):
+        # Gather all distributed field data to rank 0, then rank 0 writes the file
+        # serially with contiguous slice writes — avoids MPI-IO point-selection overhead.
+        gathered = self._gather_field_data(states, cell_coords, state_weights,
+                                           residuals=residuals)
+
+        if self.rank == 0:
+            with h5py.File(h5filepath, "a") as f:
+                sample_group = f["samples"]
+                state_group  = sample_group["states"]
+                ref_group    = sample_group["reference_states"]
+                mesh_group   = sample_group["mesh"]
+                if self.store_residuals:
+                    res_group = sample_group["residuals"]
+
+                for state_name in self.state_info:
+                    state_group[state_name][:, sample_idx] = gathered["states"][state_name]
+                    if self.store_residuals:
+                        res_group[state_name][:, sample_idx] = gathered["residuals"][state_name]
+                    if self.reference_patch is not None:
+                        ref_group[state_name][sample_idx] = state_reference_values[state_name]
+
+                mesh_group["cell_volumes"][:, sample_idx]         = gathered["cell_volumes"]
+                mesh_group["face_areas"][:, sample_idx]           = gathered["face_areas"]
+                mesh_group["centroid_coordinates"][:, sample_idx] = gathered["centroid_coordinates"]
+
+                sample_group["converged"][sample_idx]           = not self.dafoam_instance.primalFail
+                sample_group.attrs["last_written_sample_index"] = sample_idx
+
+        self.comm.Barrier()
+
+
+    # region _gather_field_data
+    def _gather_field_data(self, states, cell_coords, state_weights, residuals=None):
+        """
+        Gather all distributed field arrays to rank 0 and assemble the global arrays.
+        Returns a dict of global arrays on rank 0; on other ranks returns None values.
+        """
+        cell_global_indices             = self.cell_global_indices
+        cell_vector_global_indices      = self.cell_vector_global_indices
+        face_proc_boundary_mask         = self.face_proc_boundary_mask
+        face_masked_sorted_global_indices = self.face_masked_sorted_global_indices
+        face_masked_sorting_indices     = self.face_masked_sorting_indices
+
+        def gather_and_assemble(local_data, global_indices, global_size):
+            all_data    = self.comm.gather(local_data,    root=0)
+            all_indices = self.comm.gather(global_indices, root=0)
+            if self.rank == 0:
+                out = np.empty(global_size, dtype=np.float64)
+                for data_i, idx_i in zip(all_data, all_indices):
+                    out[idx_i] = data_i
+                return out
+            return None
+
+        gathered = {"states": {}, "residuals": {}}
+
+        added_cell_volumes = False
+        added_face_areas   = False
+
+        for state_name, info in self.state_info.items():
+            indices    = info['indices']
+            state_type = info['type']
+
+            if state_type in ("volScalarStates", "modelStates"):
+                global_size = self.num_cells_global
+                g_indices   = cell_global_indices
+            elif state_type == "volVectorStates":
+                global_size = 3 * self.num_cells_global
+                g_indices   = cell_vector_global_indices
+            elif state_type == "surfaceScalarStates":
+                global_size = self.num_faces_no_proc_boundaries_global
+                local_reordered = states[indices][face_proc_boundary_mask][face_masked_sorting_indices]
+                g_indices       = face_masked_sorted_global_indices
+                gathered["states"][state_name] = gather_and_assemble(local_reordered, g_indices, global_size)
+                if not added_face_areas:
+                    local_wa = state_weights[indices][face_proc_boundary_mask][face_masked_sorting_indices]
+                    gathered["face_areas"] = gather_and_assemble(local_wa, g_indices, global_size)
+                    added_face_areas = True
+                if residuals is not None:
+                    local_res = residuals[indices][face_proc_boundary_mask][face_masked_sorting_indices]
+                    gathered["residuals"][state_name] = gather_and_assemble(local_res, g_indices, global_size)
+                continue
+
+            gathered["states"][state_name] = gather_and_assemble(states[indices], g_indices, global_size)
+
+            if state_type == "volScalarStates" and not added_cell_volumes:
+                gathered["cell_volumes"] = gather_and_assemble(state_weights[indices], g_indices, global_size)
+                added_cell_volumes = True
+
+            if residuals is not None:
+                gathered["residuals"][state_name] = gather_and_assemble(residuals[indices], g_indices, global_size)
+
+        # Cell centroid coordinates (volVectorStates)
+        gathered["centroid_coordinates"] = gather_and_assemble(
+            cell_coords, cell_vector_global_indices, 3 * self.num_cells_global
+        )
+
+        return gathered
 
     
     # region load_h5
@@ -417,15 +737,6 @@ class TrainingDataInterface():
 
                     else:
                         result[key] = item[()]
-
-                    # # Add attributes if present
-                    # if len(item.attrs) > 0:
-                    #     result[key] = {
-                    #         "data": data,
-                    #         "_attrs": dict(item.attrs),
-                    #     }
-                    # else:
-                    #     result[key] = data
 
             return result
         
@@ -467,11 +778,45 @@ class TrainingDataInterface():
         self.face_masked_sorted_global_indices   = self.face_masked_global_indices[self.face_masked_sorting_indices]
         self.num_faces_no_proc_boundaries        = sum(self.face_proc_boundary_mask)
 
+        # Check whether each rank's cell/face global indices are contiguous ranges.
+        # If so, HDF5 slice writes can be used instead of fancy (point-selection) indexing,
+        # which is significantly faster in both serial and parallel HDF5.
+        cell_diffs = np.diff(cell_global_indices)
+        self.cells_are_contiguous = bool(np.all(cell_diffs == 1))
+        self.cell_slice_start     = int(cell_global_indices[0]) if self.cells_are_contiguous else None
+
+        face_sorted = self.face_masked_sorted_global_indices
+        face_diffs  = np.diff(face_sorted) if len(face_sorted) > 1 else np.array([1])
+        self.faces_are_contiguous = bool(np.all(face_diffs == 1))
+        self.face_slice_start     = int(face_sorted[0]) if self.faces_are_contiguous else None
+
+        # cell_vector indices are always contiguous when cell indices are (stride-1 by construction)
+        self.cell_vector_slice_start = 3 * self.cell_slice_start if self.cells_are_contiguous else None
+
+        if self.cells_are_contiguous:
+            self.print0("  Cell indices are contiguous — using slice writes for cell data.")
+        else:
+            self.print0("  Cell indices are non-contiguous — using fancy-index writes for cell data.")
+        if self.faces_are_contiguous:
+            self.print0("  Face indices are contiguous — using slice writes for face data.")
+        else:
+            self.print0("  Face indices are non-contiguous — using fancy-index writes for face data.")
+
         # Global sizes across ranks
         self.num_cells_global                    = self.comm.allreduce(self.num_cells,                      op=MPI.SUM)
         self.num_faces_global                    = self.comm.allreduce(self.num_faces,                      op=MPI.SUM)
         self.num_faces_no_proc_boundaries_global = self.comm.allreduce(self.num_faces_no_proc_boundaries,   op=MPI.SUM)
         self.num_state_elements_global           = self.comm.allreduce(self.num_state_elements,             op=MPI.SUM)
+
+        # Gather each rank's global index arrays to rank 0.  Used by _read_field_data_from_dataset
+        # when parallel_read=False to read contiguously then scatter each rank's portion.
+        # These are small (O(local_cells) ints) so the one-time gather cost is negligible.
+        positive_face_global_indices_zero_indexed = np.abs(face_global_indices) - 1
+        face_sorted_read_indices                  = positive_face_global_indices_zero_indexed[
+                                                        np.argsort(positive_face_global_indices_zero_indexed)]
+        self.all_cell_global_indices         = self.comm.gather(cell_global_indices,         root=0)
+        self.all_cell_vector_global_indices  = self.comm.gather(cell_vector_global_indices,  root=0)
+        self.all_face_sorted_read_indices    = self.comm.gather(face_sorted_read_indices,    root=0)
 
         self.print0('All set!')
 
@@ -510,8 +855,8 @@ class TrainingDataInterface():
         has_ref       = True
 
         # Check if all entries contain "ref_value"
-        for dict in var_limits.values():
-            if "ref_value" not in dict:
+        for var_spec in var_limits.values():
+            if "ref_value" not in var_spec:
                 self.print0("None/not all variables in variable limits have 'ref_value' key. Assuming no reference.")
                 has_ref = False
         
@@ -614,141 +959,22 @@ class TrainingDataInterface():
                         dtype=np.int64,
                         count=n
                     )
-        
         return data
     
 
     # region _compute_pod_modes
     def _compute_pod_modes(self, h5filepath, inner_product=None, centering='mean', scaling="reference", write_h5=True, new_h5_file=True, overwrite_datasets=False, new_file_suffix="modes", write_modes_using_write_adjoint_fields=True):
         
-        # Option to pass a dict containing similar data structure as what would be read from the load_h5
-        # This is currently an internal option and kind of sketchy - should update to a proper interface
-        # and options to expose to user.
-        # TODO: replace with valid option/method to pass in data instead of using h5file
+        # Accepts either an h5 file path or a pre-loaded dict with keys "data" and "metadata"
+        # (internal shortcut used by _leave_one_out_test; see * at end of file for expected structure)
         if isinstance(h5filepath, dict):
             data_dict   = h5filepath["data"]
             metadata    = h5filepath["metadata"]
-
-            # Expecting data_dict to look like:
-            # h5filepath = {
-            #               "data": {
-            #                        "states":  {
-            #                                    "U": float_array
-            #                                    "P": float_array
-            #                                    ...
-            #                                   }
-            #                        "mesh":    {
-            #                                    "cell_volumes": float_array
-            #                                    "face_areas": float_array
-            #                                   }
-            #                        "reference_states": {
-            #                                              "U": float_array
-            #                                              "P": float_array
-            #                                              ...
-            #                                             }
-            #               "metadata: { 
-            #                            "secondary_variables": {"_attrs" : {"first_sample_is_ref": bool}}
-            #                            "_attrs": {num_secondary_samples" : int}
-            #                           }
-            #               }
-        
         else:
-            # data, metadata  = self.read_h5_file(h5filepath=h5filepath, return_metadata=True, visualize_data=False)
             data_dict       = self.load_h5(h5file_path=h5filepath, group_to_read="samples", only_distributed_data=False)
             metadata        = self.load_h5(h5file_path=h5filepath, group_to_read="parameters", only_distributed_data=False)
 
-        reference_state     = {}
-        weights             = {}
-        scaling_values      = {}
-
-        for state_var, info in self.state_info.items():
-            state_data = data_dict["states"][state_var]
-            state_type = info["type"]
-
-            # Centering methods (centering)
-            # 1. (None) No centering - will keep states as they are
-            # 2. ('mean') Mean centered. Will take the mean of the snapshots and subtract that from each snapshot
-            # 3. ('reference') Will use the reference sample in the file if it exists
-            # 4. (dict) User supplied reference
-            if centering is None:
-                reference_state[state_var] = np.zeros_like(state_data[:, 0])
-
-            elif isinstance(centering, str):
-                if centering == 'mean':
-                    reference_state[state_var] = np.mean(state_data, axis=1)
-
-                elif centering == 'reference':
-                    if not metadata["secondary_variables"]["_attrs"]["first_sample_is_reference"]:
-                        self.print0("WARNING: Using first sample as reference state, even though it seems the dataset was not sampled this way.")
-                    reference_state[state_var]      = state_data[:, 0]
-                    data_dict["states"][state_var]  = state_data[:, 1:]
-
-            elif isinstance(centering, dict):
-                # TODO: Add check to see if keys and dimensions match up
-                reference_state[state_var] = centering[state_var]
-
-            else:
-                raise TypeError(f'"{centering}" is not a valid centering method. ')
-        
-            # Weighting methods (inner_product)
-            # 1. (None) No weighting applied. Will use ones
-            # 2. ("reference") Generate the weights from the cell volumes and face areas of the first sample
-            # 4. (dict) User supplied weights
-            if inner_product is None:
-                weights = None
-        
-            elif isinstance(inner_product, str):        
-                if inner_product == "reference":
-                    # We only consider the weights for the reference state (first sample) for now
-                    if state_type == "volVectorStates":
-                        weights[state_var] = np.repeat(data_dict["mesh"]['cell_volumes'][:, 0], repeats=3, axis=0)
-                    elif state_type == 'volScalarStates' or state_type == "modelStates":
-                        weights[state_var] = data_dict["mesh"]['cell_volumes'][:, 0]
-                    elif state_type == "surfaceScalarStates":
-                        weights[state_var] = np.abs(data_dict["mesh"]['face_areas'][:, 0]) # Need to take abs because face areas have direction associated.
-                    else:
-                        raise TypeError(f"State type of {state_type} not recognized. May need to be implemented?")
-                        
-                else:
-                    raise NotImplementedError(f"Inner product weight of type {inner_product} has not yet been implemented")
-            
-            elif isinstance(inner_product, dict):
-                # TODO: Add check to see if keys and dimensions match up
-                weights[state_var] = inner_product[state_var]
-                
-            else:
-                assert np.asarray(inner_product).shape == np.asarray(reference_state[state_var]).shape, "Supplied inner_product weight vector seems to be incompatible?"
-            
-            # Scaling methods (scaling)
-            # 1. (None) No scaling applied to the data. Terms like pressure will most likely dominate
-            # 2. ('reference') Will use the reference value found in the file (if it exists)
-            # 3. (dict) Will use the supplied scaling value. Must be a dictionary whose keys are state names (as seen by OpenFOAM - 'p', 'T', etc), and entries are scalar values
-            if scaling is None:
-                scaling_values[state_var] = np.ones_like(centering[state_var])
-
-            elif scaling == 'reference':
-                if "reference_states" in data_dict.keys():
-                    reference_states = data_dict["reference_states"]
-                    if f'{state_var}' in reference_states:
-                        if state_var == "nuTilda":
-                            scaling_values[state_var] = 1000 * reference_states[state_var][0] # We'll "overscale" nuTilda to reduce its contribution to the POD mode energy
-                        elif state_var == "phi":
-                            scaling_values[state_var] = reference_states["p"][0] / reference_states["T"][0] / 287. * reference_states["U"][0] #data["face_areas"][:, 0] # Use face areas for phi weighting
-                        else:
-                            scaling_values[state_var] = reference_states[state_var][0]
-                    else:
-                        raise TypeError(f'Reference value not found for {state_var} in dataset during POD compute setup.')
-                else:
-                    raise TypeError(f'Reference values not found in dataset during POD compute setup.')
-                    
-            elif isinstance(scaling, dict):
-                # TODO: Add check to see if keys and dimensions match up  
-                scaling_values[state_var] = scaling[state_var]
-                    
-            else:
-                raise TypeError("Not a valid scaling method. Please supply None, 'reference', or a dict with the proper entries.")
-
-            data_dict["states"][state_var] = 1/scaling_values[state_var] * (data_dict["states"][state_var] - reference_state[state_var][:, None])
+        reference_state, weights, scaling_values = self._build_pod_inputs(data_dict, metadata, centering, inner_product, scaling)
 
         # Only need state data and number of samples for POD computation
         data_array    = np.concatenate([data_dict["states"][state_var] for state_var in self.state_info.keys()], axis=0)
@@ -835,7 +1061,97 @@ class TrainingDataInterface():
                 self.dafoam_instance.solver.writeMeshPoints(mesh, solution_write_number)
 
         return local_modes, reference_state, weights, scaling_values
-        
+
+
+    # region _build_pod_inputs
+    def _build_pod_inputs(self, data_dict, metadata, centering, inner_product, scaling):
+        """
+        Apply centering, weighting, and scaling to data_dict["states"] in place.
+
+        centering:     None | 'mean' | 'reference' | dict of arrays
+        inner_product: None | 'reference' | dict of arrays
+        scaling:       None | 'reference' | dict of scalars
+
+        Returns reference_state, weights, scaling_values dicts (keyed by state name).
+        weights is None when inner_product is None.
+        """
+        reference_state = {}
+        weights         = None if inner_product is None else {}
+        scaling_values  = {}
+
+        for state_var, info in self.state_info.items():
+            state_data = data_dict["states"][state_var]
+            state_type = info["type"]
+
+            # --- Centering ---
+            # Options: None (zero), 'mean', 'reference' (first snapshot), or a dict of arrays
+            if centering is None:
+                reference_state[state_var] = np.zeros_like(state_data[:, 0])
+            elif isinstance(centering, str):
+                if centering == 'mean':
+                    reference_state[state_var] = np.mean(state_data, axis=1)
+                elif centering == 'reference':
+                    if not metadata["secondary_variables"]["_attrs"]["first_sample_is_reference"]:
+                        self.print0("WARNING: Using first sample as reference state, even though it seems the dataset was not sampled this way.")
+                    reference_state[state_var]      = state_data[:, 0]
+                    data_dict["states"][state_var]  = state_data[:, 1:]
+                else:
+                    raise TypeError(f'"{centering}" is not a valid centering method.')
+            elif isinstance(centering, dict):
+                reference_state[state_var] = centering[state_var]
+            else:
+                raise TypeError(f'"{centering}" is not a valid centering method.')
+
+            # --- Weighting (inner product) ---
+            # Options: None (skip), 'reference' (cell volumes / face areas of first sample), or a dict
+            if inner_product is not None:
+                if isinstance(inner_product, str):
+                    if inner_product == "reference":
+                        if state_type == "volVectorStates":
+                            weights[state_var] = np.repeat(data_dict["mesh"]['cell_volumes'][:, 0], repeats=3, axis=0)
+                        elif state_type == 'volScalarStates' or state_type == "modelStates":
+                            weights[state_var] = data_dict["mesh"]['cell_volumes'][:, 0]
+                        elif state_type == "surfaceScalarStates":
+                            weights[state_var] = np.abs(data_dict["mesh"]['face_areas'][:, 0])
+                        else:
+                            raise TypeError(f"State type {state_type} not recognized.")
+                    else:
+                        raise NotImplementedError(f"Inner product weight '{inner_product}' has not been implemented.")
+                elif isinstance(inner_product, dict):
+                    weights[state_var] = inner_product[state_var]
+                else:
+                    assert np.asarray(inner_product).shape == np.asarray(reference_state[state_var]).shape, \
+                        "Supplied inner_product weight vector shape is incompatible."
+
+            # --- Scaling ---
+            # Options: None (ones), 'reference' (freestream patch averages), or a dict of scalars
+            # nuTilda is over-scaled by 1000x to reduce its contribution to POD mode energy.
+            # phi uses a derived velocity-pressure scale rather than its own patch average.
+            if scaling is None:
+                scaling_values[state_var] = np.ones_like(reference_state[state_var])
+            elif scaling == 'reference':
+                if "reference_states" not in data_dict:
+                    raise TypeError('Reference values not found in dataset during POD compute setup.')
+                reference_states = data_dict["reference_states"]
+                if state_var not in reference_states:
+                    raise TypeError(f'Reference value not found for {state_var} in dataset during POD compute setup.')
+                if state_var == "nuTilda":
+                    scaling_values[state_var] = 1000 * reference_states[state_var][0]
+                elif state_var == "phi":
+                    scaling_values[state_var] = (reference_states["p"][0] / reference_states["T"][0] / 287.
+                                                 * reference_states["U"][0])
+                else:
+                    scaling_values[state_var] = reference_states[state_var][0]
+            elif isinstance(scaling, dict):
+                scaling_values[state_var] = scaling[state_var]
+            else:
+                raise TypeError("Not a valid scaling method. Please supply None, 'reference', or a dict.")
+
+            data_dict["states"][state_var] = (1 / scaling_values[state_var]
+                                              * (data_dict["states"][state_var] - reference_state[state_var][:, None]))
+
+        return reference_state, weights, scaling_values
+
 
     # region _leave_one_out_test
     def _leave_one_out_test(self, h5filepath, num_modes=None, pod_options={}):
@@ -945,10 +1261,6 @@ class TrainingDataInterface():
                 self.print0(f"     {param}: {configs[i, :]}")
             self.print0(f"     Projection error: {e[i]}")
 
-        from scipy.spatial import distance
-        from sklearn.neighbors import NearestNeighbors
-        import matplotlib as mpl
-
         if self.rank == 0:
             plt.figure()
             plt.semilogy(e[error_sort_indices])
@@ -1011,33 +1323,50 @@ class TrainingDataInterface():
         face_masked_sorted_global_indices       = self.face_masked_sorted_global_indices
         face_masked_sorting_indices             = self.face_masked_sorting_indices
         face_proc_boundary_mask                 = self.face_proc_boundary_mask
-        
-        if field_type == "volScalarStates" or field_type == "modelStates":
-            if column_idx is None:
-                dset[cell_global_indices]                           = data
-            else:
-                dset[cell_global_indices, column_idx]               = data
 
-        elif field_type == "volVectorStates":
-            if column_idx is None:
-                dset[cell_vector_global_indices]                    = data
-            else:
-                dset[cell_vector_global_indices, column_idx]        = data
+        with dset.collective:
+            if field_type == "volScalarStates" or field_type == "modelStates":
+                if self.cells_are_contiguous:
+                    s = self.cell_slice_start
+                    sl = slice(s, s + len(data))
+                    if column_idx is None:  dset[sl]           = data
+                    else:                   dset[sl, column_idx] = data
+                else:
+                    if column_idx is None:  dset[cell_global_indices]           = data
+                    else:                   dset[cell_global_indices, column_idx] = data
 
-        elif field_type == "surfaceScalarStates":
-            if column_idx is None:
-                dset[face_masked_sorted_global_indices]             = data[face_proc_boundary_mask][face_masked_sorting_indices]
-            else:
-                dset[face_masked_sorted_global_indices, column_idx] = data[face_proc_boundary_mask][face_masked_sorting_indices]
+            elif field_type == "volVectorStates":
+                if self.cells_are_contiguous:
+                    s = self.cell_vector_slice_start
+                    sl = slice(s, s + len(data))
+                    if column_idx is None:  dset[sl]           = data
+                    else:                   dset[sl, column_idx] = data
+                else:
+                    if column_idx is None:  dset[cell_vector_global_indices]           = data
+                    else:                   dset[cell_vector_global_indices, column_idx] = data
 
-        else:
-            raise NotImplementedError(f"Unknown state type, {field_type}. Might need to be added to solver_variable_storage_type?")
+            elif field_type == "surfaceScalarStates":
+                reordered = data[face_proc_boundary_mask][face_masked_sorting_indices]
+                if self.faces_are_contiguous:
+                    s = self.face_slice_start
+                    sl = slice(s, s + len(reordered))
+                    if column_idx is None:  dset[sl]           = reordered
+                    else:                   dset[sl, column_idx] = reordered
+                else:
+                    if column_idx is None:  dset[face_masked_sorted_global_indices]             = reordered
+                    else:                   dset[face_masked_sorted_global_indices, column_idx] = reordered
+
+            else:
+                raise NotImplementedError(f"Unknown state type, {field_type}. Might need to be added to solver_variable_storage_type?")
         
 
     # region _read_field_data_from_dataset
     def _read_field_data_from_dataset(self, dset, field_type, column_idx=None, apply_sign_convention=True):
         # apply_sign_convention = true will negate the stored data for the oppositely oriented faces
         # (This matches DAFoam face area convention for processor boundary faces - set to false for magnitudes instead)
+
+        if not self.parallel_read:
+            return self._read_field_data_from_dataset_root(dset, field_type, column_idx, apply_sign_convention)
 
         cell_global_indices                     = self.cell_global_indices
         cell_vector_global_indices              = self.cell_vector_global_indices
@@ -1067,12 +1396,12 @@ class TrainingDataInterface():
             else:
                 local_data     = np.zeros((self.num_faces,))
                 dset           = dset[:, column_idx]
-                
+
             if dset.ndim > 1:
                 dset_sorted                                             = dset[positive_face_global_indices_zero_indexed[positive_face_zero_indexed_ordered_indices], :]
             else:
                 dset_sorted                                             = dset[positive_face_global_indices_zero_indexed[positive_face_zero_indexed_ordered_indices]]
-            
+
             negative_mask_sorted                                        = negative_mask[positive_face_zero_indexed_ordered_indices] # Recall: Negative mask won't do anything if apply_sign_convention=False
 
             if dset.ndim > 1:
@@ -1088,6 +1417,75 @@ class TrainingDataInterface():
             raise NotImplementedError(f"Unknown state type, {field_type}. Might need to be added to solver_variable_storage_type?")
 
         return data
+
+
+    # region _read_field_data_from_dataset_root
+    def _read_field_data_from_dataset_root(self, dset, field_type, column_idx=None, apply_sign_convention=True):
+        """
+        Root-read variant: rank 0 reads the full dataset contiguously, then each rank
+        receives its local portion via MPI scatter.  Avoids HDF5 point-selection overhead
+        on non-contiguous global index patterns.
+        """
+        face_global_indices  = self.face_global_indices
+        negative_indices     = face_global_indices < 0
+        negative_mask        = np.ones_like(face_global_indices, dtype=np.float64)
+        negative_mask[negative_indices] = -1.0 if apply_sign_convention else 1.0
+        positive_face_zero_indexed_ordered_indices = np.argsort(np.abs(face_global_indices) - 1)
+
+        if field_type in ("volScalarStates", "modelStates"):
+            if self.rank == 0:
+                full = dset[:] if column_idx is None else dset[:, column_idx]
+                pieces = [full[idx] for idx in self.all_cell_global_indices]
+            else:
+                pieces = None
+            data = self._scatter_pieces(pieces)
+
+        elif field_type == "volVectorStates":
+            if self.rank == 0:
+                full = dset[:] if column_idx is None else dset[:, column_idx]
+                pieces = [full[idx] for idx in self.all_cell_vector_global_indices]
+            else:
+                pieces = None
+            data = self._scatter_pieces(pieces)
+
+        elif field_type == "surfaceScalarStates":
+            if self.rank == 0:
+                full = dset[:] if column_idx is None else dset[:, column_idx]
+                pieces = [full[idx] for idx in self.all_face_sorted_read_indices]
+            else:
+                pieces = None
+            dset_sorted = self._scatter_pieces(pieces)
+
+            negative_mask_sorted = negative_mask[positive_face_zero_indexed_ordered_indices]
+            if dset_sorted.ndim > 1:
+                local_data = np.zeros((self.num_faces, dset_sorted.shape[1]))
+                local_data[positive_face_zero_indexed_ordered_indices, :] = negative_mask_sorted[:, None] * dset_sorted
+            else:
+                local_data = np.zeros(self.num_faces)
+                local_data[positive_face_zero_indexed_ordered_indices] = negative_mask_sorted * dset_sorted
+            data = local_data
+
+        else:
+            raise NotImplementedError(f"Unknown state type, {field_type}. Might need to be added to solver_variable_storage_type?")
+
+        return data
+
+
+    # region _scatter_pieces
+    def _scatter_pieces(self, pieces):
+        """
+        Scatter a list of numpy arrays from rank 0 to all ranks using individual
+        send/recv pairs rather than comm.scatter.  comm.scatter (pickle-based) packs
+        all pieces into a single buffer before sending, which overflows a 32-bit int
+        when the total data size exceeds ~2 GB.  Individual sends avoid that limit
+        because each message is only one rank's slice.
+        """
+        if self.rank == 0:
+            for i in range(1, self.comm_size):
+                self.comm.send(pieces[i], dest=i, tag=i)
+            return pieces[0]
+        else:
+            return self.comm.recv(source=0, tag=self.rank)
     
 
     # region _visualize_imported_data
@@ -1238,5 +1636,33 @@ class TrainingDataInterface():
                 pos=[(0.05, 0.1), (0.05, 0.9)])
             
             plt.show(pts)
-        
+
         quiet_barrier(self.comm)
+
+
+# * Expected structure for the dict form of h5filepath in _compute_pod_modes:
+#
+# h5filepath = {
+#     "data": {
+#         "states": {
+#             "U": float_array,
+#             "p": float_array,
+#             ...
+#         },
+#         "mesh": {
+#             "cell_volumes": float_array,
+#             "face_areas":   float_array,
+#         },
+#         "reference_states": {
+#             "U": float_array,
+#             "p": float_array,
+#             ...
+#         },
+#     },
+#     "metadata": {
+#         "secondary_variables": {
+#             "_attrs": {"first_sample_is_reference": bool}
+#         },
+#         "_attrs": {"num_secondary_samples": int},
+#     },
+# }
