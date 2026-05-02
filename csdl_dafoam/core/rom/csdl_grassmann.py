@@ -43,8 +43,20 @@ class Grassmann:
         U_tilde, S, VT  = self._svd(Ydot_tilde)
         U               = self._apply_inverse_sqrt_weights(U_tilde)
         V               = self._T(VT)
-        return Y0 @ self._A_times_diagB(V, self._cos(S)) + self._A_times_diagB(U, self._sin(S))
 
+        # Name variables
+        self._apply_name(Ydot_tilde,    "Ydot_tilde")
+        self._apply_name(U_tilde,       "U_tilde")
+        self._apply_name(S,             "S")
+        self._apply_name(VT,            "VT")
+        self._apply_name(U,             "U")
+        self._apply_name(V,             "V")
+
+        return Y0 @ self._A_times_diagB(V, self._cos(S)) + self._A_times_diagB(U, self._sin(S))
+    
+    def _apply_name(self, var:csdl.Variable|np.ndarray, var_name:str):
+        if is_csdl(var):
+            var.name = var_name
 
     # region log
     def log(self, Y0:csdl.Variable|np.ndarray, Y1:csdl.Variable|np.ndarray):
@@ -79,8 +91,7 @@ class Grassmann:
     def geodesic(self, Y0:csdl.Variable|np.ndarray, Y1:csdl.Variable|np.ndarray):
         angles = self.subspace_angles(Y0, Y1)
         return self._norm(angles, is_global=True)
-
-    
+  
 
    # region karcher_mean
     def karcher_mean(
@@ -110,6 +121,9 @@ class Grassmann:
             Damping factor for the update. Usually 1.0 is fine.
         return_history : bool
             If True, return (mean, update_norm_history).
+        allow_csdl_vars : bool
+            If True, then we won't throw an error when the user supplies CSDL variable(s).
+            ***This is highly discouraged, as each iteration will create a new variable.***
 
         Returns
         -------
@@ -159,7 +173,7 @@ class Grassmann:
         return (Y, history) if return_history else Y
         
 
-    # The below functions abstract the CSDL/Numpy variables and the MPI handling
+    # The below functions abstract the CSDL/Numpy variable and MPI handling
 
 
     # region _svd
