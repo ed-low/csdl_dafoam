@@ -6,12 +6,13 @@ from csdl_dafoam.core.rom.rom_solver import BaseSolver, SolverResult
 
 # region CSDLROMWrapper
 class CSDLROMWrapper(csdl.experimental.CustomImplicitOperation):
-    def __init__(self, model:BaseModel, solver:BaseSolver):
+    def __init__(self, model:BaseModel, solver:BaseSolver, write_unconverged_solutions_to_file:bool=False):
         super().__init__()
         solver.model    = model
         self.model      = model
         self.solver     = solver
         self.print_fn   = model.print_fn
+        self.write_unconverged_solutions_to_file = write_unconverged_solutions_to_file
 
         self._cached_result    = None # Will be set and updated during solve_residual_equations
         # self._input_info       = {}   # Set up during evaluate
@@ -80,7 +81,11 @@ class CSDLROMWrapper(csdl.experimental.CustomImplicitOperation):
         lam = solver.adjoint_solve(result=self._cached_result, rhs=vec, mode=mode)
 
         # Write solution to file if the model has the capability
-        model.write_solution(rom_state=rom_state)
+        # We'll write the cached solution if we have NaNs
+        if any(np.isnan(rom_state)) and self.write_unconverged_solutions_to_file:
+                model.write_solution(rom_state=self._cached_result.rom_state)
+        else:
+            model.write_solution(rom_state=rom_state)
 
         d_residuals[output_name] += lam
 
