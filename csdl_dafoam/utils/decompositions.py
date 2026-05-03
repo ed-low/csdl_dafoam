@@ -398,7 +398,7 @@ def orthogonality_check_distributed(matrix_local:np.ndarray, comm:MPI.Comm, weig
     orth_err = np.linalg.norm(ATMA - np.eye(ATMA.shape[0]), ord='fro')
     tol      = 1e-10 * ATMA.shape[0]
 
-    if rank == 0:
+    if comm.Get_rank() == 0:
         if orth_err > tol:
             print(f"Orthogonality check: WARNING ({orth_err:.2e} > {tol})")
         else:
