@@ -1,3 +1,4 @@
+from __future__ import annotations
 import numpy as np
 import shutil
 import gzip
@@ -9,33 +10,38 @@ from pathlib import Path
 from mpi4py import MPI
 from vedo import Arrows, Points, Plotter, Text2D
 from csdl_dafoam.utils.runscript_helper_functions import quiet_barrier
-from csdl_dafoam.utils.standard_atmosphere_model import compute_ambient_conditions_group
 from csdl_dafoam.utils.decompositions import method_of_snapshots_distributed
 import matplotlib.pyplot as plt
 import matplotlib as mpl
 from scipy.spatial import distance
 from sklearn.neighbors import NearestNeighbors
+from warnings import warn
+
+from typing import TYPE_CHECKING, Dict, List, Tuple, Any
+if TYPE_CHECKING:
+    from dafoam import PYDAFOAM
+    from csdl_alpha import Variable, experimental
 
 
 # region TRAININGDATAINTERFACE
 class TrainingDataInterface():  
     def __init__(self,
-                 dafoam_instance,
-                 storage_location,
-                 dataset_keyword,
-                 primary_variables=None,
-                 secondary_variables=None,
-                 non_sampled_variables=None,
-                 csdl_simulator=None,
-                 reference_patch=None,
-                 num_primary_samples=2,
-                 num_secondary_samples=20,
-                 random_state_seed=0,
-                 store_residuals=False,
-                 h5_file_base_name="point",
-                 gather_raw_files=True,
-                 parallel_write=True,
-                 parallel_read=True,
+                 dafoam_instance:PYDAFOAM,
+                 storage_location:str,
+                 dataset_keyword:str,
+                 primary_variables:Dict[Variable, Dict[str, Any]]=None,
+                 secondary_variables:Dict[Variable, Dict[str, Any]]=None,
+                 non_sampled_variables:List[Variable]=None,
+                 csdl_simulator:experimental.PySimulator=None,
+                 reference_patch:str=None,
+                 num_primary_samples:int=2,
+                 num_secondary_samples:int=20,
+                 random_state_seed:float=0,
+                 store_residuals:bool=False,
+                 h5_file_base_name:str="point",
+                 gather_raw_files:bool=True,
+                 parallel_write:bool=True,
+                 parallel_read:bool=True,
                  ):
         
         # TODO: See if there is DAFoam API to get whether a variable is volVectorStates, volScalarStates, modelStates, or surfaceScalarStates.
@@ -82,14 +88,19 @@ class TrainingDataInterface():
 
         self.ran_sampling               = False
 
+        self._validate_variable_names()
+
         # Create directory
         self.print0('Creating storage directory...')
         if self.rank == 0:
             os.makedirs(storage_location/dataset_keyword, exist_ok = True)
 
+        # Get objective variables if there are any
+        self.objectives = list(csdl_simulator.recorder.objectives.keys()) if csdl_simulator is not None else None
+
 
     # region sample_variables
-    def sample_variables(self, print_sampled_values=True, random_state_seed=None):
+    def sample_variables(self, print_sampled_values:bool=True, random_state_seed:float=None):
         if random_state_seed is None:
             random_state_seed = self.random_state_seed
 
@@ -114,7 +125,7 @@ class TrainingDataInterface():
 
 
     # region run_sweep
-    def run_sweep(self, compute_pod=True, separate_pod_file=False, pod_options=None):
+    def run_sweep(self, compute_pod:bool=True, compute_objective_grad:bool=False, separate_pod_file:bool=False, pod_options:Dict=None):
         sim                         = self.csdl_simulator
         rank                        = self.rank
         comm_size                   = self.comm_size
@@ -172,7 +183,7 @@ class TrainingDataInterface():
             # When the previous primary completed fully and we're starting a fresh file for the
             # next primary, skip_h5_init is False and the file must be initialised normally.
             if not (is_first_resumed and skip_h5_init):
-                self.initialize_h5_file(h5file_path, primary_idx)
+                self.initialize_h5_file(h5file_path, primary_idx, compute_objective_grad=compute_objective_grad)
 
             if self.rank == 0 and self.gather_raw_files:
                 if is_first_resumed and skip_h5_init:
@@ -233,8 +244,8 @@ class TrainingDataInterface():
                 # Primal solve
                 sim.run()
 
-                # We'll do a check to see if the first primal solve of the primary point failed
-                # If so, we'll retry by running with a new initial condition taken from
+                # Do a check to see if the first primal solve of the primary point failed
+                # If so, retry by running with a new initial condition taken from
                 # the freestream value (reference patch).
                 if secondary_idx == 0 and dafoam_instance.primalFail and self.reference_patch is not None:
 
@@ -254,8 +265,6 @@ class TrainingDataInterface():
 
                     # Try running again
                     sim.run()
-
-                # TODO: Add a derivative computation here
 
                 self.write_sample(h5file_path, secondary_idx)
 
@@ -288,12 +297,34 @@ class TrainingDataInterface():
                     dafoam_instance.renameSolution(primary_idx * (self.num_secondary_samples + 1) + secondary_idx + 1)
                     os.chdir(current_directory)
 
+                if compute_objective_grad:
+                    # Do an objective check and issue warning only on the first iteration
+                    if primary_idx == 0 and secondary_idx == 0:
+                        if not self.objectives:
+                            warn(f"Rank {rank}: Objectives don't seem to be specified. Skipping gradient computation.") 
+                            compute_objective_grad = False
+                    
+                    gradients = sim.compute_totals(self.objectives, list(self.secondary_variables.keys()) + list(self.primary_variables.keys()))
+
+                    with h5py.File(h5file_path, "a", driver="mpio", comm=self.comm) as f:
+                        for objective_idx, objective_var in enumerate(self.objectives):
+                            objective_name = objective_var.name if objective_var.name is not None else f"objective_{objective_idx}"
+                            for primary_var in self.primary_variables:
+                                dset = f["samples"]["gradients"][objective_name][primary_var.name]
+                                if rank  == 0:
+                                    dset[:, secondary_idx] = gradients[objective_var, primary_var].flatten()
+
+                            for secondary_var in self.secondary_variables:
+                                dset = f["samples"]["gradients"][objective_name][secondary_var.name]
+                                if rank == 0:
+                                    dset[:, secondary_idx] = gradients[objective_var, secondary_var].flatten()
+
             if compute_pod:
                 self._compute_pod_modes(h5filepath=h5file_path, **pod_options)
 
     
     # region _check_for_interrupted_sweep
-    def _check_for_interrupted_sweep(self, adj_num_secondary_samples):
+    def _check_for_interrupted_sweep(self, adj_num_secondary_samples:int):
         """
         Scan the storage directory for the largest-indexed h5 data file and determine
         where the sweep should resume.  Two cases are handled:
@@ -352,7 +383,7 @@ class TrainingDataInterface():
                     with h5py.File(largest_file, "r") as f:
                         sec_var_group = f["parameters"]["secondary_variables"]
                         for var, info in self.secondary_variables.items():
-                            var_name = info["name"]
+                            var_name = var.name
                             if var_name not in sec_var_group:
                                 print(f"Resume check: secondary variable '{var_name}' not found in {largest_file.name}. Cannot resume.")
                                 secondary_match = False
@@ -367,7 +398,7 @@ class TrainingDataInterface():
                             prim_var_group = f["parameters"]["primary_variables"]
                             primary_match = True
                             for var, info in self.primary_variables.items():
-                                var_name = info["name"]
+                                var_name = var.name
                                 if var_name not in prim_var_group:
                                     print(f"Resume check: primary variable '{var_name}' not found in {largest_file.name}. Cannot resume.")
                                     primary_match = False
@@ -400,7 +431,7 @@ class TrainingDataInterface():
 
 
     # region _find_existing_raw_directory
-    def _find_existing_raw_directory(self, primary_idx):
+    def _find_existing_raw_directory(self, primary_idx:int) -> Path:
         """Return the path of an existing raw directory for the given primary index."""
         base = self.storage_location/self.dataset_keyword/f'{self.h5_file_base_name}_{primary_idx}_raw'
         if base.exists():
@@ -413,7 +444,7 @@ class TrainingDataInterface():
 
 
     # region _cleanup_openfoam_for_resume
-    def _cleanup_openfoam_for_resume(self, dafoam_directory):
+    def _cleanup_openfoam_for_resume(self, dafoam_directory:Path):
         """
         Remove stale OpenFOAM time directories left by an interrupted run.
 
@@ -456,7 +487,7 @@ class TrainingDataInterface():
 
 
     # region initialize_h5_file
-    def initialize_h5_file(self, h5filepath, primary_idx):
+    def initialize_h5_file(self, h5filepath:Path|str, primary_idx:int, compute_objective_grad:bool=False):
         comm = self.comm
 
         # Global sizes across ranks
@@ -475,6 +506,8 @@ class TrainingDataInterface():
             state_group     = sample_group.create_group("states")
             ref_group       = sample_group.create_group("reference_states")
             mesh_group      = sample_group.create_group("mesh")
+            gradient_group  = sample_group.create_group("gradients")
+
             if self.store_residuals:
                 res_group   = sample_group.create_group("residuals")
 
@@ -498,19 +531,35 @@ class TrainingDataInterface():
                 if self.reference_patch is not None:
                     ref_group.create_dataset(f"{state_name}",           (adj_num_secondary_samples,),           dtype="f8")
 
+            if compute_objective_grad:
+                for objective_idx, objective in enumerate(self.objectives):
+                    objective_name = objective.name if objective.name is not None else f"objective_{objective_idx}"
+                    if objective.name is None:
+                        objective_name = f"objective_{objective_idx}"
+                        warn(f"Rank {self.rank}: Found objective without name ({objective}). Saving as {objective_name}.")
+                    objective_group = gradient_group.create_group(objective_name)
+                    
+                    for primary_var in self.primary_variables:
+                        objective_group.create_dataset(primary_var.name, (np.prod(primary_var.shape), adj_num_secondary_samples), dtype="f8")
+
+                    for secondary_var in self.secondary_variables:
+                        objective_group.create_dataset(secondary_var.name, (np.prod(secondary_var.shape), adj_num_secondary_samples), dtype="f8")
+
             mesh_group.create_dataset("centroid_coordinates",     (3 * num_cells_global, adj_num_secondary_samples),                dtype="f8")
             mesh_group.create_dataset("cell_volumes",             (num_cells_global, adj_num_secondary_samples),                    dtype="f8")
             mesh_group.create_dataset("face_areas",               (num_faces_no_proc_boundaries_global, adj_num_secondary_samples), dtype="f8") 
-            # The following two datasets are for debugging
+            
+            # The following two inidces datasets are useful for debugging
             mesh_group.create_dataset("cell_indices",             (num_cells_global, ),                                             dtype="i8")
             mesh_group.create_dataset("face_indices",             (num_faces_no_proc_boundaries_global, ),                          dtype="i8")
-
             self._write_field_data_to_dataset(mesh_group["cell_indices"],  self.cell_global_indices, "volScalarStates")
             self._write_field_data_to_dataset(mesh_group["face_indices"], self.face_global_indices, "surfaceScalarStates")
 
             mesh_group["centroid_coordinates"].attrs.create("addressing_type",  "volVectorStates")
             mesh_group["cell_volumes"].attrs.create("addressing_type",          "volScalarStates")
             mesh_group["face_areas"].attrs.create("addressing_type",            "surfaceScalarStates")
+            mesh_group["cell_indices"].attrs.create("addressing_type",          "volScalarStates")
+            mesh_group["face_indices"].attrs.create("addressing_type",          "surfaceScalarStates")
 
             sample_group.attrs.create("last_written_sample_index",          data=-1,                                dtype="i8")
             sample_group.attrs.create("generated_on_n_processors",          data=self.comm_size,                    dtype="i8")
@@ -524,24 +573,24 @@ class TrainingDataInterface():
             parameter_group.attrs.create("random_state_seed",               data=self.random_state_seed,            dtype="f8")
 
             primary_var_group = parameter_group.create_group("primary_variables")
-            for info in self.primary_variables.values():
-                primary_var_group.create_dataset(info["name"],              data=info["samples"][primary_idx],      dtype="f8")
+            for var, info in self.primary_variables.items():
+                primary_var_group.create_dataset(var.name,                  data=info["samples"][primary_idx],      dtype="f8")
 
             secondary_var_group = parameter_group.create_group("secondary_variables")
-            for info in self.secondary_variables.values():
-                secondary_var_group.create_dataset(info["name"],            data=info["samples"],                   dtype="f8")
+            for var, info in self.secondary_variables.items():
+                secondary_var_group.create_dataset(var.name,                data=info["samples"],                   dtype="f8")
             secondary_var_group.attrs.create("first_sample_is_reference",   data=self.secondary_has_ref,            dtype="bool")
-            
+
             if self.non_sampled_variables is not None:
                 non_sampled_var_group = parameter_group.create_group("non_sampled_variables")
-                for var, info in self.non_sampled_variables.items():
-                    non_sampled_var_group.create_dataset(info["name"],      data=var.value,                         dtype="f8")
+                for var in self.non_sampled_variables:
+                    non_sampled_var_group.create_dataset(var.name,          data=var.value,                         dtype="f8")
 
         self.print0('All set!')
 
     
     # region write_sample
-    def write_sample(self, h5filepath, sample_idx):
+    def write_sample(self, h5filepath:Path, sample_idx:int):
         self.print0('Adding sample...')
         dafoam_instance = self.dafoam_instance
         states          = dafoam_instance.getStates()
@@ -563,8 +612,8 @@ class TrainingDataInterface():
 
 
     # region _write_sample_parallel
-    def _write_sample_parallel(self, h5filepath, sample_idx, states, cell_coords,
-                                state_weights, state_reference_values, residuals):
+    def _write_sample_parallel(self, h5filepath:Path, sample_idx:int, states:np.ndarray, cell_coords:np.ndarray,
+                                state_weights:np.ndarray, state_reference_values:np.ndarray, residuals:np.ndarray):
         with h5py.File(h5filepath, "a", driver="mpio", comm=self.comm) as f:
             sample_group = f["samples"]
             state_group  = sample_group["states"]
@@ -604,8 +653,8 @@ class TrainingDataInterface():
 
 
     # region _write_sample_root
-    def _write_sample_root(self, h5filepath, sample_idx, states, cell_coords,
-                           state_weights, state_reference_values, residuals):
+    def _write_sample_root(self, h5filepath:Path, sample_idx:int, states:np.ndarray, cell_coords:np.ndarray,
+                           state_weights:np.ndarray, state_reference_values:np.ndarray, residuals:np.ndarray):
         # Gather all distributed field data to rank 0, then rank 0 writes the file
         # serially with contiguous slice writes — avoids MPI-IO point-selection overhead.
         gathered = self._gather_field_data(states, cell_coords, state_weights,
@@ -638,7 +687,7 @@ class TrainingDataInterface():
 
 
     # region _gather_field_data
-    def _gather_field_data(self, states, cell_coords, state_weights, residuals=None):
+    def _gather_field_data(self, states:np.ndarray, cell_coords:np.ndarray, state_weights:np.ndarray, residuals:np.ndarray|None=None):
         """
         Gather all distributed field arrays to rank 0 and assemble the global arrays.
         Returns a dict of global arrays on rank 0; on other ranks returns None values.
@@ -706,7 +755,7 @@ class TrainingDataInterface():
 
     
     # region load_h5
-    def load_h5(self, h5file_path, group_to_read=None, only_distributed_data=False):
+    def load_h5(self, h5file_path, group_to_read:str=None, only_distributed_data:bool=False)->Dict:
         
         # Recursive function to walk through dataset (will handle the distributed datatypes)
         def recurse(h5obj):
@@ -749,7 +798,7 @@ class TrainingDataInterface():
 
     #region _setup_indices_and_state_maps_and_names
     def _setup_indices_state_info_and_global_counts(self):
-        self.print0('Setting up state map and processor addressing...', end=" ")
+        self.print0('Setting up state map and processor addressing...')
 
         state_names, state_map     = self.dafoam_instance.getStateVariableMap(includeComponentSuffix=False)
 
@@ -821,6 +870,32 @@ class TrainingDataInterface():
         self.print0('All set!')
 
 
+    # region _validate_variable_names
+    def _validate_variable_names(self):
+        """Check that every variable dict key has a non-None .name attribute."""
+        sampled = {"primary_variables": self.primary_variables,
+                   "secondary_variables": self.secondary_variables}
+        for label, var_dict in sampled.items():
+            if var_dict is None:
+                continue
+            for var in var_dict:
+                if var.name is None:
+                    raise ValueError(
+                        f"Variable in '{label}' has no name. "
+                        f"Assign one when creating the variable, e.g. "
+                        f"csdl.Variable(name='my_var', ...)."
+                    )
+
+        if self.non_sampled_variables is not None:
+            for var in self.non_sampled_variables:
+                if var.name is None:
+                    raise ValueError(
+                        f"Variable in 'non_sampled_variables' has no name. "
+                        f"Assign one when creating the variable, e.g. "
+                        f"csdl.Variable(name='my_var', ...)."
+                    )
+
+
     # region _generate_lhs_samples
     def _generate_lhs_samples(self,
                               var_limits: Dict[Any, Dict[str, Any]], 
@@ -835,9 +910,8 @@ class TrainingDataInterface():
         
         Args:
             var_limits: Dictionary mapping CSDL variables to their specifications (example below). A 'samples' entry will be appended to a variable's
-                        sub-dictionary (along with name, range) which contains a (num_samples, variable_shape) array of samples
+                        sub-dictionary (along with range) which contains a (num_samples, variable_shape) array of samples
                     csdl_var: {
-                        'name': str,           # Variable name for labeling
                         'range': [min, max],   # Sampling range
                         'ref_value': float,    # (Optional) Reference value
                     }
@@ -861,11 +935,10 @@ class TrainingDataInterface():
                 has_ref = False
         
         for var, spec in var_limits.items():
-            name        = spec['name']
             var_range   = spec['range']
-            
+
             if len(var_range) != 2:
-                raise ValueError(f"{name}: range must be [min, max], got {var_range}")
+                raise ValueError(f"{var.name}: range must be [min, max], got {var_range}")
             
             shape        = var.value.shape
             num_elements = int(np.prod(shape)) if shape else 1
@@ -876,7 +949,6 @@ class TrainingDataInterface():
             # Store metadata for reconstruction
             var_metadata.append({
                 'var': var,
-                'name': name,
                 'shape': shape,
                 'start_idx': current_idx,
                 'end_idx': current_idx + num_elements,
@@ -919,7 +991,7 @@ class TrainingDataInterface():
 
 
     # region _read_proc_addressing
-    def _read_proc_addressing(self, key="cell"):
+    def _read_proc_addressing(self, key:str="cell") -> np.ndarray:
         key = key.lower()
         if key not in ["boundary", "cell", "face", "point"]:
             raise ValueError( f'{key} does not have an associated ProcAddressing. Please specify "boundary", "cell", "face", or "point".')
@@ -963,7 +1035,9 @@ class TrainingDataInterface():
     
 
     # region _compute_pod_modes
-    def _compute_pod_modes(self, h5filepath, inner_product=None, centering='mean', scaling="reference", write_h5=True, new_h5_file=True, overwrite_datasets=False, new_file_suffix="modes", write_modes_using_write_adjoint_fields=True):
+    def _compute_pod_modes(self, h5filepath:Path, inner_product:str|None=None, centering:str|None='mean', scaling:str|None="reference", 
+                           write_h5:bool=True, new_h5_file:bool=True, overwrite_datasets:bool=False, new_file_suffix:str="modes", 
+                           write_modes_using_write_adjoint_fields:bool=True) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         
         # Accepts either an h5 file path or a pre-loaded dict with keys "data" and "metadata"
         # (internal shortcut used by _leave_one_out_test; see * at end of file for expected structure)
@@ -983,9 +1057,20 @@ class TrainingDataInterface():
         # Actual POD computation
         modes_array, singular_values = method_of_snapshots_distributed(matrix_local=data_array,
                                                                        comm=self.comm, method="tsqr",
-                                                                       weights_local=weights_array)
-        
-        local_modes = {state_name:modes_array[info["indices"], :] for state_name, info in self.state_info.items()}
+                                                                       weights_local=weights_array,
+                                                                       orthogonality_check=True)
+
+        # Extract per-variable modes using variable-order offsets in data_array, not info["indices"].
+        # info["indices"] index into DAFoam's state vector, which with adjStateOrdering="cell" is
+        # cell-interleaved and does not match data_array's variable-order layout.
+        offset = 0
+        data_array_slices = {}
+        for state_var in self.state_info:
+            n_rows = data_dict["states"][state_var].shape[0]
+            data_array_slices[state_var] = slice(offset, offset + n_rows)
+            offset += n_rows
+
+        local_modes = {state_name: modes_array[data_array_slices[state_name], :] for state_name in self.state_info}
 
         if write_h5:
             # Change file path name if new file requested
@@ -1034,8 +1119,16 @@ class TrainingDataInterface():
                     if scaling is not None:
                         if overwrite_datasets and state_var in scaling_group:
                             del scaling_group[state_var]
-                        dset = scaling_group.require_dataset(state_var, shape=(1,), dtype="f8")
-                        dset[...] = scaling_values[state_var]
+                        s = np.asarray(scaling_values[state_var])
+                        if s.ndim == 1 and s.size > 1:
+                            # Per-DOF scaling (e.g. per-face for phi): store as distributed field
+                            dset = scaling_group.require_dataset(state_var, (num_rows,), dtype="f8")
+                            self._write_field_data_to_dataset(dset, scaling_values[state_var], state_type)
+                            dset.attrs.create("addressing_type", state_type)
+                            dset.attrs.create("apply_sign_convention", False)
+                        else:
+                            dset = scaling_group.require_dataset(state_var, shape=(1,), dtype="f8")
+                            dset[...] = float(s)
                 
                 if overwrite_datasets and 'singular_values' in pod_group:
                     del pod_group['singular_values']
@@ -1064,7 +1157,8 @@ class TrainingDataInterface():
 
 
     # region _build_pod_inputs
-    def _build_pod_inputs(self, data_dict, metadata, centering, inner_product, scaling):
+    def _build_pod_inputs(self, data_dict:Dict, metadata:Dict, centering:str|None, 
+                          inner_product:str|None, scaling:str|None) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
         Apply centering, weighting, and scaling to data_dict["states"] in place.
 
@@ -1078,6 +1172,8 @@ class TrainingDataInterface():
         reference_state = {}
         weights         = None if inner_product is None else {}
         scaling_values  = {}
+        _phi_rho_ref    = None  # saved for per-snapshot phi normalization
+        _phi_U_ref      = None
 
         for state_var, info in self.state_info.items():
             state_data = data_dict["states"][state_var]
@@ -1112,7 +1208,17 @@ class TrainingDataInterface():
                         elif state_type == 'volScalarStates' or state_type == "modelStates":
                             weights[state_var] = data_dict["mesh"]['cell_volumes'][:, 0]
                         elif state_type == "surfaceScalarStates":
-                            weights[state_var] = np.abs(data_dict["mesh"]['face_areas'][:, 0])
+                            # Face-area weights have units m², cell-volume weights have units m³.
+                            # Without correction the face-area integral dominates because the totals
+                            # are numerically incomparable (sum A_f >> sum V_c for large 3-D meshes).
+                            # Multiplying by L_char = V_total / A_total converts to effective volumes
+                            # so that phi's weighted norm is O(V_total * d²), matching cell variables.
+                            face_areas   = np.abs(data_dict["mesh"]['face_areas'][:, 0])
+                            cell_volumes = data_dict["mesh"]['cell_volumes'][:, 0]
+                            V_total = self.comm.allreduce(np.sum(cell_volumes), op=MPI.SUM)
+                            A_total = self.comm.allreduce(np.sum(face_areas),   op=MPI.SUM)
+                            L_char  = V_total / A_total
+                            weights[state_var] = face_areas * L_char
                         else:
                             raise TypeError(f"State type {state_type} not recognized.")
                     else:
@@ -1126,7 +1232,9 @@ class TrainingDataInterface():
             # --- Scaling ---
             # Options: None (ones), 'reference' (freestream patch averages), or a dict of scalars
             # nuTilda is over-scaled by 1000x to reduce its contribution to POD mode energy.
-            # phi uses a derived velocity-pressure scale rather than its own patch average.
+            # phi uses per-face reference values so that large-area faces don't dominate the inner
+            # product via the A_face^3 effect (phi_f ~ rho*U*A_f, so a scalar rho*U normalization
+            # leaves phi_normalized ~ A_f, and the face-area weighted norm picks up A_f^3).
             if scaling is None:
                 scaling_values[state_var] = np.ones_like(reference_state[state_var])
             elif scaling == 'reference':
@@ -1138,8 +1246,24 @@ class TrainingDataInterface():
                 if state_var == "nuTilda":
                     scaling_values[state_var] = 1000 * reference_states[state_var][0]
                 elif state_var == "phi":
-                    scaling_values[state_var] = (reference_states["p"][0] / reference_states["T"][0] / 287.
-                                                 * reference_states["U"][0])
+                    # scaling_values["phi"] = rho_ref * U_ref * A_f_ref (per face, using reference
+                    # snapshot face areas).  This is what the ROM uses for state reconstruction.
+                    #
+                    # The SNAPSHOT DATA is normalised below by rho_ref * U_ref * A_f_j (per-snapshot
+                    # face area) rather than A_f_ref.  This removes the mesh-deformation-driven
+                    # component of phi from the POD variance: phi = rho * U_n * A_f, so changes in
+                    # A_f across geometrically-varied snapshots would otherwise dominate the POD even
+                    # when the flow barely changes.  After per-snapshot normalisation,
+                    # phi_norm ≈ U_n_j / U_ref, which is bounded in [-1, 1] for subsonic flow and
+                    # comparable in magnitude to the normalised cell variables.
+                    face_areas_ref = np.abs(data_dict["mesh"]['face_areas'][:, 0])
+                    rho_ref = reference_states["p"][0] / reference_states["T"][0] / 287.
+                    U_ref   = reference_states["U"][0]
+                    phi_face_scale = rho_ref * U_ref * face_areas_ref
+                    phi_face_scale = np.where(phi_face_scale < 1e-300, 1.0, phi_face_scale)
+                    scaling_values[state_var] = phi_face_scale
+                    _phi_rho_ref = rho_ref  # saved for per-snapshot normalization in the apply step
+                    _phi_U_ref   = U_ref
                 else:
                     scaling_values[state_var] = reference_states[state_var][0]
             elif isinstance(scaling, dict):
@@ -1147,14 +1271,50 @@ class TrainingDataInterface():
             else:
                 raise TypeError("Not a valid scaling method. Please supply None, 'reference', or a dict.")
 
-            data_dict["states"][state_var] = (1 / scaling_values[state_var]
-                                              * (data_dict["states"][state_var] - reference_state[state_var][:, None]))
+            if state_var == "phi" and _phi_rho_ref is not None:
+                # Per-snapshot face-area normalization: divide snapshot j's phi by A_f_j (not A_f_ref).
+                # face_areas columns follow the same snapshot ordering as state data; after
+                # 'reference' centering removes column 0, the remaining k columns correspond to
+                # face_areas[:, 1:k+1].  For 'mean'/None centering all n columns are kept.
+                n_cols  = data_dict["states"]["phi"].shape[1]
+                offset  = 1 if (isinstance(centering, str) and centering == "reference") else 0
+                fa_snap = np.abs(data_dict["mesh"]["face_areas"][:, offset:offset + n_cols])
+                phi_scale_per_snap = _phi_rho_ref * _phi_U_ref * fa_snap
+                phi_scale_per_snap = np.where(phi_scale_per_snap < 1e-300, 1.0, phi_scale_per_snap)
+                data_dict["states"]["phi"] = (
+                    data_dict["states"]["phi"] - reference_state["phi"][:, None]
+                ) / phi_scale_per_snap
+            else:
+                s = np.asarray(scaling_values[state_var])
+                s_col = s[:, None] if s.ndim == 1 and s.size > 1 else s
+                data_dict["states"][state_var] = (data_dict["states"][state_var] - reference_state[state_var][:, None]) / s_col
+
+        # Diagnostic: M-weighted snapshot energy per variable (printed once during POD setup)
+        self.print0("\n  === Snapshot energy diagnostic (after centering + scaling) ===")
+        total_energy = 0.0
+        energies = {}
+        for state_var in self.state_info:
+            data = data_dict["states"][state_var]
+            w    = weights[state_var] if weights is not None else np.ones(data.shape[0])
+            local_e  = float(np.sum(w[:, None] * data**2))
+            local_mx = float(np.max(np.abs(data))) if data.size > 0 else 0.0
+            global_e  = self.comm.allreduce(local_e,  op=MPI.SUM)
+            global_mx = self.comm.allreduce(local_mx, op=MPI.MAX)
+            energies[state_var] = global_e
+            total_energy += global_e
+            n_active = self.comm.allreduce(float(np.sum(w > 0)), op=MPI.SUM)
+            self.print0(f"  {state_var:>10}: M-weighted energy = {global_e:.4e}  max|data| = {global_mx:.4e}  active DOFs = {n_active:.0f}")
+        self.print0(f"  {'TOTAL':>10}: M-weighted energy = {total_energy:.4e}")
+        self.print0(f"  {'':>10}  Fraction per variable:")
+        for state_var, e in energies.items():
+            self.print0(f"  {state_var:>10}: {e/max(total_energy, 1e-300):.4f}")
+        self.print0("")
 
         return reference_state, weights, scaling_values
 
 
     # region _leave_one_out_test
-    def _leave_one_out_test(self, h5filepath, num_modes=None, pod_options={}):
+    def _leave_one_out_test(self, h5filepath:Path, num_modes:bool=None, pod_options:Dict={}):
         data_dict       = self.load_h5(h5file_path=h5filepath, group_to_read="samples", only_distributed_data=False)
         metadata        = self.load_h5(h5file_path=h5filepath, group_to_read="parameters", only_distributed_data=False)
 
@@ -1316,7 +1476,7 @@ class TrainingDataInterface():
 
 
     # region _write_field_data_to_dataset
-    def _write_field_data_to_dataset(self, dset, data, field_type, column_idx=None):
+    def _write_field_data_to_dataset(self, dset:h5py.Dataset, data:np.ndarray, field_type:str, column_idx:int=None):
 
         cell_global_indices                     = self.cell_global_indices
         cell_vector_global_indices              = self.cell_vector_global_indices
@@ -1361,7 +1521,8 @@ class TrainingDataInterface():
         
 
     # region _read_field_data_from_dataset
-    def _read_field_data_from_dataset(self, dset, field_type, column_idx=None, apply_sign_convention=True):
+    def _read_field_data_from_dataset(self, dset:h5py.Dataset, field_type:str, column_idx:int=None, 
+                                      apply_sign_convention:bool=True) -> np.ndarray:
         # apply_sign_convention = true will negate the stored data for the oppositely oriented faces
         # (This matches DAFoam face area convention for processor boundary faces - set to false for magnitudes instead)
 
@@ -1420,7 +1581,8 @@ class TrainingDataInterface():
 
 
     # region _read_field_data_from_dataset_root
-    def _read_field_data_from_dataset_root(self, dset, field_type, column_idx=None, apply_sign_convention=True):
+    def _read_field_data_from_dataset_root(self, dset:h5py.Dataset, field_type:str, column_idx:int=None, 
+                                           apply_sign_convention:bool=True) -> np.ndarray:
         """
         Root-read variant: rank 0 reads the full dataset contiguously, then each rank
         receives its local portion via MPI scatter.  Avoids HDF5 point-selection overhead
@@ -1472,7 +1634,7 @@ class TrainingDataInterface():
 
 
     # region _scatter_pieces
-    def _scatter_pieces(self, pieces):
+    def _scatter_pieces(self, pieces:List[np.ndarray]) -> np.ndarray:
         """
         Scatter a list of numpy arrays from rank 0 to all ranks using individual
         send/recv pairs rather than comm.scatter.  comm.scatter (pickle-based) packs
