@@ -596,7 +596,6 @@ class DAFoamForces(csdl.CustomExplicitOperation):
             if "forceCoupling" in output_info["components"]:
                 force_output_dict[output_name] = output_info
                 output_size = self.dafoam_instance.solver.getOutputSize(output_name, output_type)
-                print(output_size)
                 setattr(dafoam_forces_outputs, output_name, self.create_output(output_name, (output_size,)))
                 force_output_dict[output_name]["output_size"] = output_size
                 num_outputs += 1
@@ -605,7 +604,9 @@ class DAFoamForces(csdl.CustomExplicitOperation):
 
         # We'll return a VariableGroup if we have more than one output. Otherwise we'll just
         # return the Variable
-        if num_outputs > 1:
+        if num_outputs == 0:
+            raise ValueError("No outputs found. Please make sure the DAOptions have an output specified.")
+        elif num_outputs > 1:
             return dafoam_forces_outputs
         else:
             return getattr(dafoam_forces_outputs, output_name)
