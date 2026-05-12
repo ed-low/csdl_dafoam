@@ -31,7 +31,7 @@ from csdl_dafoam.core.csdl_idwarp import DAFoamMeshWarper
 from csdl_dafoam.core.csdl_dafoam import instantiateDAFoam, DAFoamFunctions, DAFoamSolver, compute_dafoam_input_variables
 from csdl_dafoam.core.rom.csdl_rom import CSDLROMWrapper
 from csdl_dafoam.core.rom.rom_models import DAFoamLSPGModel, DAFoamGalerkinModel
-from csdl_dafoam.core.rom.rom_solver import NewtonSolver
+from csdl_dafoam.core.rom.rom_solver import NewtonSolver, BroydenNewtonSolver
 from csdl_dafoam.utils.training_interface import TrainingDataInterface
 import csdl_dafoam.utils.standard_atmosphere_model as sam
 from csdl_dafoam.utils.runscript_helper_functions import *
@@ -348,7 +348,29 @@ flight_conditions_group.altitude_m      = csdl.Variable(value=data["parameters"]
 # Atmospheric condition variables
 ambient_conditions_group = sam.compute_ambient_conditions_group(flight_conditions_group.altitude_m)
 
+# Assemble POD modes and relevant vectors:
+n_modes     = 20
+state_info  = data_generator.state_info
+n_local_states = dafoam_instance.getNLocalAdjointStates()
+pod_modes       = np.zeros((n_local_states, n_modes))
+scaling         = np.zeros(n_local_states)
+weights         = np.zeros(n_local_states)
+reference_state = np.zeros(n_local_states)
+for state_var, info in state_info.items():
+    idx = info["indices"]
+    pod_modes[idx, :]    = data["pod"]["modes"][state_var][:, :n_modes]
+    scaling[idx]         = data["pod"]["scaling"][state_var]
+    weights[idx]         = data["pod"]["weights"][state_var]
+    reference_state[idx] = data["pod"]["reference_state"][state_var]
+s_vals      = data["pod"]["singular_values"]
+residual_scaling = np.ones_like(dafoam_instance.getStateWeights())
+residual_scaling[state_info["T"]["indices"]] *= 1005
+
+pod_modes_var = csdl.Variable(value=pod_modes, name="pod_modes")
+
 with csdl.experimental.mpi.enter_mpi_region(rank, comm) as mpi_region:
+
+    pod_mode_var = mpi_region.split_custom(pod_modes_var, split_func=lambda x:x)
 
     normals = dafoam_instance.getPatchFaceAreaNormals()
     centers = dafoam_instance.getPatchFaceCenters()
@@ -411,18 +433,8 @@ with csdl.experimental.mpi.enter_mpi_region(rank, comm) as mpi_region:
                                                                 flight_conditions_group,
                                                                 x_vol_dafoam)
 
-    # Assemble POD modes and relevant vectors:
-    state_info      = data_generator.state_info # Get our state variable names
-    pod_modes       = np.array(np.concatenate([data["pod"]["modes"][state_var]              for state_var in state_info.keys()], axis=0))[:, 0:20]
-    scaling         = np.array(np.concatenate([data["pod"]["scaling"][state_var] * np.ones((np.size(info["indices"]), )) for state_var, info in state_info.items()], axis=0))
-    weights         = np.array(np.concatenate([data["pod"]["weights"][state_var]            for state_var in state_info.keys()], axis=0))
-    reference_state = np.array(np.concatenate([data["pod"]["reference_state"][state_var]    for state_var in state_info.keys()], axis=0))
-
-    residual_scaling = np.ones_like(dafoam_instance.getStateWeights())
-    residual_scaling[state_info["T"]["indices"]] *= 1005
-
     dafoam_rom_model = DAFoamLSPGModel(dafoam_input_variables_group=dafoam_input_variables_group,
-                                 pod_modes=pod_modes,
+                                 pod_modes=pod_modes_var,
                                  reference_fom_state=reference_state,
                                  scaling=scaling,
                                  weights=1 / residual_scaling ** 2,
@@ -553,10 +565,31 @@ recorder.stop()
 sim = csdl.experimental.PySimulator(recorder)
 
 loss_var    = objective_fun
-wrt         = flight_conditions_group.angle_of_attack_deg
+wrt         = pod_modes_var #normalized_percent_camber_change_dof #flight_conditions_group.angle_of_attack_deg
 grad        = sim.compute_totals(loss_var, wrt)[loss_var, wrt]
 
 print(f"Rank {rank} grad : {grad}")
+print(f"Rank {rank} grad.reshape(-1, n_modes).shape : {grad.reshape(-1, n_modes).shape}")
+
+
+for state_var, info in state_info.items():
+    if info["type"] == "volScalarStates" or info["type"] == "modelStates":
+        idx = data_generator.cell_global_indices 
+    elif info["type"] == "volVectorStates":
+        idx = data_generator.cell_vector_global_indices
+    else:
+        idx = data_generator.face_global_indices
+
+    all_idx        = np.concatenate(comm.allgather(idx), axis=0)
+    all_grad_state = np.concatenate(comm.allgather(grad.reshape(-1, n_modes)[info["indices"], :]), axis=0)
+    
+    if rank == 0:
+        plt.figure()
+        for i in range(n_modes):
+            plt.scatter(all_idx, all_grad_state[:, i])
+            plt.title(state_var)
+plt.show()
+
 
 
 # # Quick write of the variable names to file

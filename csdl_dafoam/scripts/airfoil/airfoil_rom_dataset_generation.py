@@ -163,8 +163,8 @@ storage_location      = dafoam_directory
 # Sampling options
 # grassmann_variables indicates the variables which correspond to points on the Grassmann manifold
 # snapshot_variables indicates the variables which correspond to "snapshots" or realizations
-num_grassmann_samples     = 10
-num_snapshot_samples      = 300
+num_grassmann_samples     = 2
+num_snapshot_samples      = 2
 random_state_seed         = 0
 
 
@@ -382,16 +382,12 @@ snapshot_vars_and_limits = {
     }
 }
 
-# A dictionary of variables whose values are important to know if one wants to rerun the simulation
+# A list of variables whose values are important to know if one wants to rerun the simulation
 # For instance, while angle of attack might be a sampled variable, we'd need to know that we were also at a specific altitude and Mach number
-important_non_sampled_variables = {
-    flight_conditions_group.airspeed_m_s: {
-        "name": "airspeed_m_s"
-    }, 
-    # flight_conditions_group.altitude_m: {
-    #     "name": "altitude_m"
-    # }
-}
+important_non_sampled_variables = [
+    flight_conditions_group.airspeed_m_s,
+    # flight_conditions_group.altitude_m,
+]
 
 
 # print(dafoam_instance.getStateVariableMap()[0])
@@ -407,15 +403,18 @@ data_generator = TrainingDataInterface(dafoam_instance=dafoam_instance,
                                             num_primary_samples=num_grassmann_samples,
                                             num_secondary_samples=num_snapshot_samples,
                                             random_state_seed=random_state_seed,
-                                            h5_file_base_name="300_samples",
-                                            gather_raw_files=True)
+                                            h5_file_base_name="test",
+                                            gather_raw_files=True,
+                                            parallel_read=False,
+                                            parallel_write=False)
 
 
 # data_generator.sample_variables()
 # data_generator.run_sweep(pod_options={"centering":"reference", "write_modes_using_write_adjoint_fields":False})
 
+
 import glob
-files = glob.glob(str(Path(storage_location)/dataset_keyword/f"300_samples_*.h5"))
+files = glob.glob(str(Path(storage_location)/dataset_keyword/f"test_*.h5"))
 
 ref_vals = dafoam_instance.getPatchStateAverages("inout")
 
@@ -433,6 +432,37 @@ for file in files:
                     new_file_suffix="modes", 
                     write_modes_using_write_adjoint_fields=False)
     
+
+######## Manually obtaining the file for now
+print("Loading data...") if rank == 0 else None
+data = data_generator.load_h5(Path(storage_location)/dataset_keyword/"test_0.h5", only_distributed_data=False)
+
+# Check proc addressing
+cell_index_h5 = data["samples"]["mesh"]["cell_indices"]
+face_index_h5 = data["samples"]["mesh"]["face_indices"]
+
+print(f"Rank {rank} max_cell_index_diff = {np.max(np.abs(cell_index_h5 - data_generator.cell_global_indices))}")
+print(f"Rank {rank} max_face_index_diff = {np.max(np.abs(face_index_h5 - data_generator.face_global_indices))}")
+
+# Assemble POD modes and relevant vectors:
+n_modes     = 1
+state_info  = data_generator.state_info # Get our state variable names
+pod_modes   = np.array(np.concatenate([data["pod"]["modes"][state_var] for state_var in state_info.keys()], axis=0))[:, :n_modes]
+scaling     = np.array(np.concatenate([data["pod"]["scaling"][state_var] * np.ones((np.size(state_info[state_var]["indices"]),)) for state_var in state_info.keys()]))
+weights     = np.array(np.concatenate([data["pod"]["weights"][state_var] for state_var in state_info.keys()]))
+reference_state = np.array(np.concatenate([data["pod"]["reference_state"][state_var] for state_var in state_info.keys()]))
+s_vals      = data["pod"]["singular_values"]
+residual_scaling = np.ones_like(dafoam_instance.getStateWeights())
+residual_scaling[state_info["T"]["indices"]] *= 1005
+
+print(f"Rank {rank}: max pod_modes       = {np.max(pod_modes)}")
+print(f"Rank {rank}: max scaling         = {np.max(scaling)}")
+print(f"Rank {rank}: max weights         = {np.max(weights)}")
+print(f"Rank {rank}: max reference_state = {np.max(reference_state)}")
+
+print(f"{comm.allreduce(pod_modes.T @ (weights[:, None] * pod_modes), op=MPI.SUM)}")
+#####
+
 
 
 # from csdl_dafoam.core.rom.csdl_grassmann import Grassmann

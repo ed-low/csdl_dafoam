@@ -557,10 +557,10 @@ i0, i1          = x_surf_dafoam_initial_indices[rank]
 
 # Flight condition variables
 flight_conditions_group                     = csdl.VariableGroup()
-flight_conditions_group.mach_number         = csdl.Variable(value=0.6, name="mach_number")
-flight_conditions_group.angle_of_attack_deg = csdl.Variable(value=aoa0, name="angle_of_attack")
-flight_conditions_group.altitude_m          = csdl.Variable(value=9144., name="altitude (m)")
-flight_conditions_group.airspeed_m_s        = csdl.Variable(value=U0, name="airspeed (m/s)")
+flight_conditions_group.mach_number         = csdl.Variable(value=0.6,   name="mach_number")
+flight_conditions_group.angle_of_attack_deg = csdl.Variable(value=aoa0,  name="angle_of_attack_deg")
+flight_conditions_group.altitude_m          = csdl.Variable(value=9144., name="altitude_m")
+flight_conditions_group.airspeed_m_s        = csdl.Variable(value=U0,    name="airspeed_m_s")
 
 # Atmospheric condition variables
 ambient_conditions_group = sam.compute_ambient_conditions_group(flight_conditions_group.altitude_m)
@@ -700,16 +700,12 @@ snapshot_vars_and_limits = {
     },
 }
 
-# A dictionary of variables whose values are important to know if one wants to rerun the simulation
+# A list of variables whose values are important to know if one wants to rerun the simulation
 # For instance, while angle of attack might be a sampled variable, we'd need to know that we were also at a specific altitude and Mach number
-important_non_sampled_variables = {
-    flight_conditions_group.airspeed_m_s: {
-        "name": "airspeed_m_s"
-    }, 
-    flight_conditions_group.altitude_m: {
-        "name": "altitude_m"
-    }
-}
+important_non_sampled_variables = [
+    flight_conditions_group.airspeed_m_s,
+    flight_conditions_group.altitude_m,
+]
 
 data_generator = TrainingDataInterface(dafoam_instance=dafoam_instance, 
                                             csdl_simulator=sim,
@@ -728,5 +724,20 @@ data_generator = TrainingDataInterface(dafoam_instance=dafoam_instance,
                                             parallel_write=False,
                                             parallel_read=False)
 
-data_generator.sample_variables()
-data_generator.run_sweep()
+# data_generator.sample_variables()
+# data_generator.run_sweep()
+
+import glob
+files = glob.glob(str(Path(storage_location)/dataset_keyword/f"point_*.h5"))
+
+for i, file in enumerate([files[0]]):
+    print(f"Computing POD modes for file {i} ({file})") if rank == 0 else None
+    data_generator._compute_pod_modes(file,
+                    inner_product="reference",
+                    centering='reference',
+                    scaling="reference",
+                    write_h5=True,
+                    new_h5_file=False,
+                    overwrite_datasets=True,
+                    new_file_suffix="modes",
+                    write_modes_using_write_adjoint_fields=False)

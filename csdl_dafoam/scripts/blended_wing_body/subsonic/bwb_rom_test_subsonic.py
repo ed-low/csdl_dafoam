@@ -15,15 +15,15 @@ import lsdo_geo
 
 # IDWarp and DAFoam
 from csdl_dafoam.core.csdl_idwarp import DAFoamMeshWarper
-from csdl_dafoam.core.csdl_dafoam import instantiateDAFoam, DAFoamFunctions, DAFoamSolver, compute_dafoam_input_variables
+from csdl_dafoam.core.csdl_dafoam import instantiateDAFoam, DAFoamFunctions, DAFoamSolver, compute_dafoam_input_variables, DAFoamForces
 import csdl_dafoam.utils.standard_atmosphere_model as sam
 from csdl_dafoam.utils.runscript_helper_functions import *
-
 from csdl_dafoam.utils.training_interface import TrainingDataInterface
+from csdl_dafoam.scripts.blended_wing_body.bwb_helper_functions import *
 
-
-# BWB specific
-from bwb_helper_functions import setup_geometry, read_geometry_pickle, write_geometry_pickle
+from csdl_dafoam.core.rom.csdl_rom import CSDLROMWrapper
+from csdl_dafoam.core.rom.rom_models import DAFoamLSPGModel, DAFoamGalerkinModel
+from csdl_dafoam.core.rom.rom_solver import NewtonSolver, BroydenNewtonSolver
 
 # Plotting
 from vedo import Points, Arrows, show
@@ -34,14 +34,16 @@ faulthandler.enable()
 os.environ["PETSC_OPTIONS"] = "-malloc_debug"
 #-------------------------
 
-# Write this runscript to file before anything
-print_runscript_info()
+# Write this runscript to file before anything (will initialize MPI comm here)
+comm = MPI.COMM_WORLD
+if comm.Get_rank() == 0:
+    print_runscript_info()
 
 # ===============================
 # region USER INPUT
 # ===============================
 # Keyword for optimization name (optimization results folder will be saved with this name)
-problem_name              = 'bwb_training_test'
+problem_name              = 'fix_indexing'
 
 # Geometry
 geometry_directory        =  os.path.join(os.getcwd(), 'bwb_geometry/')
@@ -51,8 +53,7 @@ geometry_pickle_file_name = 'bwb_stored_refit.pickle'
 # Mesh
 average_normals_at_edges  = False # if true, this will average the normals of the shared point between two surfaces (might be useful for some cases)
 
-# MPI and timing
-comm           = MPI.COMM_WORLD
+# Timing
 timing_enabled = True  # True if we want timing printed for the CSDL operations
 
 # Plotting
@@ -65,8 +66,8 @@ dafoam_directory    = os.path.join(os.getcwd(), f'results/{problem_name}')
 dafoamPrintInterval = 100 
 
 # Initial/reference values for DAFoam (best to use base conditions)
-# These correspond to M=0.75 @ 30k feet
-U0        = 227.3805         # used for normalizing CD and CL
+# These correspond to M=0.6 @ 30k feet
+U0        = 181.9044         # used for normalizing CD and CL
 p0        = 30089.6
 T0        = 228.714
 nuTilda0  = 4.5e-5
@@ -88,7 +89,8 @@ wall_list = ['wall_body_lower',
 da_options = {
     "designSurfaces": wall_list,
     "solverName": "DARhoSimpleCFoam",
-    "primalMinResTol": 1.0e-8,
+    "primalMinResTol": 4.0e-7,
+    "primalMinResTolDiff":1.0e0,
     "primalBC": {
         "U0": {"variable": "U", "patches": ["inout"], "value": [U0, 0.0, 0.0]},
         "p0": {"variable": "p", "patches": ["inout"], "value": [p0]},
@@ -157,6 +159,14 @@ da_options = {
             "components": ["solver", "function"],
         },
     },
+    "outputInfo": {
+        "f_aero": {
+            "type": "forceCouplingOutput",
+            "patches": wall_list,
+            "components": ["forceCoupling"],
+            "pRef": p0,
+        },
+    },
     "writeAdjointFields": False,
     "debug": False,
     "printDAOptions": True,
@@ -167,13 +177,13 @@ da_options = {
 mesh_options = {
     "gridFile": dafoam_directory,
     "fileType": "OpenFOAM",
-    "symmetryPlanes": [],
+    "symmetryPlanes": [[[0.0, 0.0, 0.0], [0.0, 1.0, 0.0]]],
 }
 
 
 # region Training options
 # Storage options
-dataset_keyword       = 'bwb_training_testing'
+dataset_keyword       = 'training_data_test'
 storage_location      = Path(dafoam_directory)
 
 
@@ -188,6 +198,7 @@ rank_str  = f"{rank:0{len(str(comm_size-1))}d}" # string with zero-padded rank i
 
 # region DAFoam instance
 dafoam_instance               = instantiateDAFoam(da_options, comm, str(dafoam_directory), mesh_options)
+dafoam_instance_rom           = instantiateDAFoam(da_options, comm, str(dafoam_directory), mesh_options)
 dafoam_instance.printInterval = dafoamPrintInterval
 x_surf_dafoam_initial_local   = dafoam_instance.getSurfaceCoordinates()
 x_vol_dafoam_initial_local    = dafoam_instance.xv0
@@ -215,14 +226,116 @@ stp_file_path                     = Path(geometry_directory)/stp_file_name
 surface_mesh_projection_file_path = Path(dafoam_directory)/f'projected_surface_mesh_{x_surf_hash}.pickle'
 
 
-# ########################################
+# # ########################################
 # # Use this to visualize data 
-# data_generator = TrainingDataInterface(dafoam_instance=dafoam_instance, 
-#                                             storage_location=storage_location, 
+# data_generator = TrainingDataInterface(dafoam_instance=dafoam_instance,
+#                                             storage_location=storage_location,
 #                                             dataset_keyword=dataset_keyword,
-#                                             h5_file_base_name="point")
+#                                             h5_file_base_name="point",
+#                                             parallel_write=True,
+#                                             parallel_read=False)
 
-# data = data_generator.read_h5_file(Path(storage_location)/dataset_keyword/"point_0.h5", visualize_data=True)
+# # ---- WRITE/READ ROUNDTRIP TEST ----
+# if rank == 0:
+#     print("\n========== Write/Read Roundtrip Test ==========")
+
+# h5_test_path = storage_location / dataset_keyword / "point_0.h5"
+# test_idx     = 1
+
+# # Capture local state vector before write
+# states_init = dafoam_instance.getStates()
+
+# # Write current DAFoam states to H5 at test_idx
+# data_generator.write_sample(h5_test_path, test_idx)
+
+# # Read back all state columns from H5 (serial read, scattered to each rank)
+# loaded_states = data_generator.load_h5(h5_test_path, "samples/states", only_distributed_data=True)
+
+# # Compare each state variable
+# if rank == 0:
+#     print(f"{'Variable':<12}  {'max_abs_diff':>14}  {'max_rel_diff':>14}  {'Result':>6}")
+#     print("-" * 58)
+
+# all_passed = True
+# for state_name, info in data_generator.state_info.items():
+#     local_written  = states_init[info["indices"]]
+#     local_readback = loaded_states[state_name][:, test_idx]
+
+#     # Proc-boundary faces are not stored in the H5 — exclude them from the comparison
+#     if info["type"] == "surfaceScalarStates":
+#         mask           = data_generator.face_proc_boundary_mask
+#         local_written  = local_written[mask]
+#         local_readback = local_readback[mask]
+
+#     max_abs_diff = comm.allreduce(float(np.max(np.abs(local_written - local_readback))), op=MPI.MAX)
+#     max_val      = comm.allreduce(float(np.max(np.abs(local_written))),                  op=MPI.MAX)
+#     max_rel_diff = max_abs_diff / max_val if max_val > 0 else float("inf")
+
+#     passed      = max_rel_diff < 1e-10
+#     all_passed &= passed
+
+#     if rank == 0:
+#         print(f"{state_name:<12}  {max_abs_diff:>14.3e}  {max_rel_diff:>14.3e}  {'PASS' if passed else 'FAIL'}")
+
+# if rank == 0:
+#     print("-" * 58)
+#     print(f"Overall: {'PASS' if all_passed else 'FAIL'}")
+#     print("================================================\n")
+# # ---- END ROUNDTRIP TEST ----
+
+
+
+
+# # print("Reading H5 data") if rank == 0 else None
+# # states = data_generator.load_h5("/media/edward/DATA/Edward/AFRL_project/csdl_dafoam_workspace/blended_wing_body_case_subsonic/results/training_data/training_data_test/point_1.h5", "samples/states", only_distributed_data=True)
+
+
+
+
+
+
+# #Path(storage_location)/dataset_keyword/"point_0.h5", only_distributed_data=True)
+# # data_generator._visualize_imported_data(data["samples"]["states"], data["samples"]["mesh"]["centroid_coordinates"])
+
+# # current_dir = os.getcwd()
+# # os.chdir(dafoam_directory)
+# # quiet_barrier(comm)
+# # pyof = pyofm.PYOFM(comm=comm)
+# # quiet_barrier(comm)
+# # os.chdir(current_dir)
+
+# # for i in range(101):
+# #     # print("Reading OpenFOAM data") if rank == 0 else None
+# #     T_of = np.zeros((dafoam_instance.solver.getNLocalCells(), ))
+# #     pyof.readField("phi", "surfaceScalarField", f"{i:04}", T_of)
+    
+
+# #     T_h5 = states["phi"][:, i]
+
+# #     T_h5_sum   = comm.allreduce(np.sum(T_h5), op=MPI.SUM)
+# #     T_of_sum   = comm.allreduce(np.sum(T_of), op=MPI.SUM)
+# #     T_max_diff = comm.allreduce(np.max(np.abs(T_of - T_h5)), op=MPI.MAX)
+# #     T_max_rel_diff = comm.allreduce(np.max(np.abs(T_of - T_h5) / T_of), op=MPI.MAX)
+# #     T_diff_norm = np.sqrt(comm.allreduce(np.sum((T_of - T_h5) ** 2), op=MPI.SUM))
+
+
+# #     if rank == 0:
+# #         print(f"-----------Snapshot {i} ------------------------------")
+# #         print(f"T_h5 sum       : {T_h5_sum}")
+# #         print(f"T_of sum       : {T_of_sum}")
+# #         print(f"T sum diff     : {np.abs(T_of_sum - T_h5_sum)}")
+# #         print(f"T sum rel diff : {np.abs(T_of_sum - T_h5_sum)/ T_of_sum}")
+# #         print(f"T max diff     : {T_max_diff}")
+# #         print(f"T max rel diff : {T_max_rel_diff}")
+# #         print(f"T diff norm    : {T_diff_norm}")
+        
+
+# # import matplotlib.pyplot as plt
+# # plt.plot((T_of - T_h5) / T_of)
+# # plt.show()
+
+# quiet_barrier(comm)
+
 # ########################################
 
 
@@ -443,27 +556,87 @@ with Timer(f'evaluating geometry component', rank, timing_enabled):
 # region Surface mesh distribution
 i0, i1          = x_surf_dafoam_initial_indices[rank]
 
+
+# region BASIS Setup
+# Import data
+# POD Data import
+print("Setting up interface...") if rank == 0 else None
+data_generator = TrainingDataInterface(dafoam_instance=dafoam_instance, 
+                                        storage_location=storage_location, 
+                                        dataset_keyword=dataset_keyword,
+                                        h5_file_base_name="point",
+                                        parallel_read=False,
+                                        parallel_write=False)
+
+# import h5py
+# with h5py.File(Path(storage_location)/dataset_keyword/"point_0.h5", "a", driver="mpio", comm=comm) as f:
+#     f["samples"]["mesh"]["cell_indices"].attrs.create("addressing_type",          "volScalarStates")
+#     f["samples"]["mesh"]["face_indices"].attrs.create("addressing_type",          "surfaceScalarStates")
+
+# Manually obtaining the file for now
+print("Loading data...") if rank == 0 else None
+pod_data   = data_generator.load_h5(Path(storage_location)/dataset_keyword/"point_0.h5", group_to_read="pod",        only_distributed_data=False)
+param_data = data_generator.load_h5(Path(storage_location)/dataset_keyword/"point_0.h5", group_to_read="parameters", only_distributed_data=False)
+# # Check proc addressing
+# cell_index_h5 = data["samples"]["mesh"]["cell_indices"]
+# face_index_h5 = data["samples"]["mesh"]["face_indices"]
+
+# print(f"Rank {rank} max_cell_index_diff = {np.max(np.abs(cell_index_h5 - data_generator.cell_global_indices))}")
+# print(f"Rank {rank} max_face_index_diff = {np.max(np.abs(face_index_h5 - data_generator.face_global_indices))}")
+
 # Flight condition variables
+dataset_aoa = param_data["primary_variables"]["angle_of_attack_deg"]
+dataset_U0  = param_data["non_sampled_variables"]["airspeed_m_s"]
 flight_conditions_group                     = csdl.VariableGroup()
-flight_conditions_group.mach_number         = csdl.Variable(value=0.75, name="mach_number")
-flight_conditions_group.angle_of_attack_deg = csdl.Variable(value=aoa0, name="angle_of_attack")
-flight_conditions_group.altitude_m          = csdl.Variable(value=9144., name="altitude (m)")
-flight_conditions_group.airspeed_m_s        = csdl.Variable(value=U0, name="airspeed (m/s)")
+flight_conditions_group.mach_number         = csdl.Variable(value=0.6,          name="mach_number")
+flight_conditions_group.angle_of_attack_deg = csdl.Variable(value=dataset_aoa,  name="angle_of_attack")
+flight_conditions_group.altitude_m          = csdl.Variable(value=9144.,        name="altitude (m)")
+flight_conditions_group.airspeed_m_s        = csdl.Variable(value=dataset_U0,   name="airspeed (m/s)")
 
 # Atmospheric condition variables
 ambient_conditions_group = sam.compute_ambient_conditions_group(flight_conditions_group.altitude_m)
 
-# reynolds_number    = ambient_conditions_group.rho_kg_m3*flight_conditions_group.airspeed_m_s*10/ambient_conditions_group.mu_kg_m_s
-# if rank == 0:
-#     print(f'Reynolds number: {reynolds_number.value}')
-#     print(f'Density (kg/m^3): {ambient_conditions_group.rho_kg_m3.value}')
-#     print(f'Speed (m/s): {flight_conditions_group.airspeed_m_s.value}')
-#     print(f'Dynamic viscosity (kg/m/s): {ambient_conditions_group.mu_kg_m_s.value}')
-#     input('Press ENTER to continue...')    
-# else:
-#     None
+# Assemble POD modes and relevant vectors in DAFoam's state-vector ordering.
+# POD data is stored per-variable in the H5 file; info["indices"] gives each
+# variable's positions in DAFoam's local state vector (cell-interleaved for
+# adjStateOrdering="cell").  Scattering into those positions ensures that
+# setStates(), getResiduals(), and the ROM diagnostics all see consistently
+# ordered arrays.
+n_modes     = 20
+state_info  = data_generator.state_info
+n_local_states = dafoam_instance.getNLocalAdjointStates()
+pod_modes       = np.zeros((n_local_states, n_modes))
+scaling         = np.zeros(n_local_states)
+weights         = np.zeros(n_local_states)
+reference_state = np.zeros(n_local_states)
+for state_var, info in state_info.items():
+    idx = info["indices"]
+    pod_modes[idx, :]    = pod_data["modes"][state_var][:, :n_modes]
+    scaling[idx]         = pod_data["scaling"][state_var]
+    weights[idx]         = pod_data["weights"][state_var]
+    reference_state[idx] = pod_data["reference_state"][state_var]
+s_vals      = pod_data["singular_values"]
+residual_scaling = np.ones_like(dafoam_instance.getStateWeights())
+residual_scaling[state_info["T"]["indices"]] *= 1005
 
-# comm.Barrier()
+# print(f"Rank {rank}: max pod_modes       = {np.max(pod_modes)}")
+# print(f"Rank {rank}: max scaling         = {np.max(scaling)}")
+# print(f"Rank {rank}: max weights         = {np.max(weights)}")
+# print(f"Rank {rank}: max reference_state = {np.max(reference_state)}")
+
+print(f"{np.linalg.norm(comm.allreduce(pod_modes.T @ (weights[:, None] * pod_modes), op=MPI.SUM) - np.eye(n_modes), ord='fro')}")
+
+# import matplotlib.pyplot as plt
+# p_weights  = data["pod"]["weights"]["p"]
+# T_weights  = data["pod"]["weights"]["T"]
+# nu_weights = data["pod"]["weights"]["nuTilda"]
+# plt.plot((p_weights - T_weights)/ T_weights, label="p - T / T", linestyle=":")
+# plt.plot((p_weights - nu_weights)/ nu_weights, label="p - nuTilda / nuTilda", linestyle="--")
+# plt.plot((nu_weights - T_weights)/ T_weights, label="nuTilda - T / T", linestyle="-.")
+# plt.legend()
+# plt.show()
+
+
 
 with csdl.experimental.mpi.enter_mpi_region(rank, comm) as mpi_region:
 
@@ -485,9 +658,59 @@ with csdl.experimental.mpi.enter_mpi_region(rank, comm) as mpi_region:
                                                                 flight_conditions_group,
                                                                 x_vol_dafoam)
 
+    dafoam_rom_model = DAFoamGalerkinModel(dafoam_input_variables_group=dafoam_input_variables_group,
+                                 pod_modes=pod_modes,
+                                 reference_fom_state=reference_state,
+                                 scaling=scaling,
+                                 weights=weights, # / residual_scaling ** 2,
+                                 dafoam_instance=dafoam_instance_rom,
+                                 normalize_residuals=False,
+                                 fd_step=1e-6)
+    
+    dafoam_rom = CSDLROMWrapper(model=dafoam_rom_model, solver=BroydenNewtonSolver(options={"tol_rel":1e-9, "tol_step_abs":1e-13}))   
+    dafoam_rom_states = dafoam_rom.evaluate()
+
+    # Reconstruct state
+    dafoam_state_estimate = reference_state + scaling * (pod_modes @ dafoam_rom_states)
+
     # DAFoamSolver Implicit component setup and evaluation
     dafoam_solver           = DAFoamSolver(dafoam_instance)
     dafoam_solver_states    = dafoam_solver.evaluate(dafoam_input_variables_group)
+
+    # DAFoamForces explicit component
+    dafoam_forces           = DAFoamForces(dafoam_instance=dafoam_instance)
+    wing_forces             = dafoam_forces.evaluate(dafoam_solver_states, dafoam_input_variables_group)
+
+    import matplotlib.pyplot as plt
+    all_forces = np.concatenate(comm.allgather(wing_forces.value.reshape(-1,3)), axis=0)
+    all_points = np.concatenate(comm.allgather(x_surf_dafoam.value.reshape(-1,3)), axis=0)
+
+    if rank == 0:
+        print(f"Forces shape: {all_forces.shape}")
+        print(f"Points shape: {all_points.shape}")
+
+        max_force = np.max(np.linalg.norm(all_forces, axis=1))
+        from vedo import Arrows, show
+        import numpy as np
+
+        geo_plot  = geometry.plot(show=False)
+
+        # Assume these are already defined:
+        # all_points: (N,3)
+        # all_forces: (N,3)
+
+        # Normalize forces
+        norm_forces = 10 * all_forces / max_force
+
+        # Compute end points of arrows
+        end_points = all_points + norm_forces
+
+        # Create arrow objects
+        arrows = Arrows(all_points, end_points, c='red', s=1)
+
+        # Show
+        show(geo_plot, arrows, axes=1)
+    quiet_barrier(comm)
 
     # DAFoamFunctions Explicit component setup and evaluation
     dafoam_functions = DAFoamFunctions(dafoam_instance)
@@ -505,107 +728,3 @@ recorder.stop()
 # region SIM SETUP
 # ===============================
 sim = csdl.experimental.PySimulator(recorder)
-
-
-
-# ===============================
-# region TRAINING
-# ===============================
-
-
-
-# Sampling options
-# grassmann_variables indicates the variables which correspond to points on the Grassmann manifold
-# snapshot_variables indicates the variables which correspond to "snapshots" or realizations
-num_grassmann_samples     = 2
-num_snapshot_samples      = 20
-random_state_seed         = 0
-
-# Specify variables and their limits for sampling
-# Expect the following structure:
-# grassmann_vars_and_limits = {
-#   csdl_variable_1: {
-#       'name': name_string,
-#       'range': [min_val, max_val],
-#   }
-#   csdl_variable_2: {...}
-#
-#}
-# snapshot_vars_and_limits = {
-#   csdl_variable_1: {
-#       'name': name_string,
-#       'range': [min_val, max_val],
-#       'ref_val': reference_value,
-#   }
-#   csdl_variable_2: {...}
-#
-#}
-# Make sure that the csdl_variables are the actual csdl_variables
-# The name is for labeling during the file save
-# The range is the limits for sampling
-# The ref_value is the reference value for the particular Grassmann manifold point.
-
-grassmann_vars_and_limits = {
-    # flight_conditions_group.mach_number: {
-    #     'name': 'mach_number',   
-    #     'range': [0.65, 0.75],
-    # }, 
-    flight_conditions_group.angle_of_attack_deg: {
-        'name': 'angle_of_attack_deg',     
-        'range': [0., 10],
-    },
-    # flight_conditions_group.altitude_m: {
-    #     'name': 'altitude_m', 
-    #     'range': [7000., 13000],
-    #     }
-}
-
-snapshot_vars_and_limits = {
-    # percent_change_in_thickness_dof_wing: {
-    #     'name': '%_thickness_change_wing',
-    #     'range': [-10, 10],
-    #     'ref_value': 0, 
-    # },
-    normalized_percent_camber_change_dof_wing: {
-        'name': '%_camber_change_wing',
-        'range': [-10, 10],
-        'ref_value': 0, 
-    },
-    root_twist: {
-        'name': 'root_twist',
-        'range': [-10*np.pi/180, 10*np.pi/180],
-        'ref_value': 0, 
-    },
-    tip_twist: {
-        'name': 'tip_twist',
-        'range': [-10*np.pi/180, 10*np.pi/180],
-        'ref_value': 0, 
-    },
-    mid_twist: {
-        'name': 'mid_twist',
-        'range': [-10*np.pi/180, 10*np.pi/180],
-        'ref_value': 0, 
-    },
-}
-
-# A list of variables whose values are important to know if one wants to rerun the simulation
-# For instance, while angle of attack might be a sampled variable, we'd need to know that we were also at a specific altitude and Mach number
-important_non_sampled_variables = [
-    flight_conditions_group.airspeed_m_s,
-    flight_conditions_group.altitude_m,
-]
-
-data_generator = TrainingDataInterface(dafoam_instance=dafoam_instance, 
-                                            storage_location=storage_location, 
-                                            dataset_keyword=dataset_keyword,
-                                            primary_variables=grassmann_vars_and_limits, 
-                                            secondary_variables=snapshot_vars_and_limits,
-                                            non_sampled_variables=important_non_sampled_variables, 
-                                            csdl_simulator=sim,
-                                            num_primary_samples=num_grassmann_samples,
-                                            num_secondary_samples=num_snapshot_samples,
-                                            random_state_seed=random_state_seed,
-                                            h5_file_base_name="point")
-
-data_generator.sample_variables()
-data_generator.run_sweep()

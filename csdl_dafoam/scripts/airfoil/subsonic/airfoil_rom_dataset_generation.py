@@ -155,7 +155,7 @@ mesh_options = {
 # region Training options
 # ===============================
 # Storage options
-dataset_keyword       = 'training_set1'
+dataset_keyword       = 'training_set_with_grad'
 storage_location      = dafoam_directory
 
 # Sampling options
@@ -174,41 +174,32 @@ rank      = comm.Get_rank()
 comm_size = comm.Get_size()
 rank_str  = f"{rank:0{len(str(comm_size-1))}d}" # string with zero-padded rank index (for prints)
 
-
-print(str(dafoam_directory))
-print(dafoam_directory)
-
 # region DAFoam instance
-dafoam_instance         = instantiateDAFoam(da_options, comm, str(dafoam_directory), mesh_options)
-x_surf_dafoam_initial   = dafoam_instance.getSurfaceCoordinates()
+dafoam_instance             = instantiateDAFoam(da_options, comm, dafoam_directory, mesh_options)
+x_surf_dafoam_initial_mpi   = dafoam_instance.getSurfaceCoordinates()
+x_vol_dafoam_initial_mpi    = dafoam_instance.xv0
 
+local_n_surf  = x_surf_dafoam_initial_mpi.shape[0]
+local_n_vol   = x_vol_dafoam_initial_mpi.shape[0]
+
+# Gathering surface mesh to rank 0 (need to do this to avoid 'no-element' ranks in the projection
+# and geometry evaluation functions)
+(x_surf_dafoam_initial, 
+x_surf_dafoam_initial_size,
+x_surf_dafoam_initial_indices) = gather_array_to_rank0(x_surf_dafoam_initial_mpi, comm)
+
+# Get hash for surface mesh projection file read/write (broadcast to other ranks)
+if rank == 0:
+    x_surf_hash = hash_array_tol(x_surf_dafoam_initial, tol=1e-8)
+else:
+    x_surf_hash = None
+
+x_surf_hash = comm.bcast(x_surf_hash, root=0)
 
 # region File paths
 geometry_pickle_file_path         = Path(geometry_directory)/geometry_pickle_file_name
 stp_file_path                     = Path(geometry_directory)/stp_file_name
-
-
-
-# # ########################################
-# # # Use this to visualize data 
-# data_generator = TrainingDataInterface(dafoam_instance=dafoam_instance, 
-#                                             storage_location=storage_location, 
-#                                             dataset_keyword=dataset_keyword,
-#                                             h5_file_base_name="point")
-
-# data = data_generator.load_h5(Path(storage_location)/dataset_keyword/"point_0.h5", only_distributed_data=False)
-# data_generator._visualize_imported_data(data["pod"]["modes"], data["samples"]["mesh"]["centroid_coordinates"][:, 0], center_colormap=True)
-
-# import matplotlib.pyplot as plt
-# if rank == 0:
-#     singular_values = data["pod"]["singular_values"]
-#     plt.plot(np.cumsum(singular_values ** 2) / np.sum(singular_values ** 2))
-#     plt.axhline(y=0.9999, color='r', linestyle='-')
-#     plt.show()
-#     input("Press ENTER to continue...")
-# quiet_barrier(comm)
-# # ########################################
-
+surface_mesh_projection_file_path = Path(dafoam_directory)/f'projected_surface_mesh_{x_surf_hash}.pickle'
 
 
 # ===============================
@@ -223,14 +214,60 @@ geometry = lsdo_geo.import_geometry(stp_file_path,
                                     parallelize=False)
 
 
-projected_surf_mesh_dafoam = geometry.project(
-    x_surf_dafoam_initial, 
-    grid_search_density_parameter = 1,      
-    projection_tolerance          = 1.e-3,  
-    grid_search_density_cutoff    = 10,     
-    force_reprojection            = False,
-    plot                          = False  
-)
+# region Surface mesh projection
+# Now do we do the same check for the surface mesh projection
+if surface_mesh_projection_file_path.is_file():
+    if rank == 0:
+        print('Found surface mesh projection pickle!')
+    projected_surf_mesh_dafoam = read_simple_pickle(surface_mesh_projection_file_path)
+
+else:
+    if rank == 0:
+        print(f'No projected surface mesh file found at {surface_mesh_projection_file_path}')
+        try:
+            # ORIGINAL CODE
+            # with Timer('projecting on surface mesh'):
+            #     projected_surf_mesh_dafoam = geometry.project(
+            #         x_surf_dafoam_initial, 
+            #         grid_search_density_parameter = 1,      # 1     (ORIGINAL)
+            #         projection_tolerance          = 1e-4,   #1.e-3m (ORIGINAL)
+            #         grid_search_density_cutoff    = 50,     # 20    (ORIGINAL) 50
+            #         force_reprojection            = False,
+            #         plot                          = False    # UCSD_LAB
+            #     )
+
+            # Debugging/timing
+            import cProfile
+            import pstats
+            with cProfile.Profile() as pr:
+                projected_surf_mesh_dafoam = geometry.project(
+                    x_surf_dafoam_initial, 
+                    grid_search_density_parameter = 1,      # 1     (ORIGINAL)
+                    projection_tolerance          = 1e-10,   #1.e-3m (ORIGINAL)
+                    grid_search_density_cutoff    = 50,     # 20    (ORIGINAL) 50
+                    force_reprojection            = False,
+                    plot                          = False    # UCSD_LAB
+                )
+            # Summarize top time-consuming functions
+            stats = pstats.Stats(pr)
+            stats.strip_dirs().sort_stats(pstats.SortKey.TIME).print_stats(30)
+
+            print('Writing surface mesh projection pickle...')
+            write_simple_pickle(projected_surf_mesh_dafoam, surface_mesh_projection_file_path)
+            print('Done!')
+
+        # Added this exception because I was getting an ungraceful MPI termination
+        except Exception as e:
+            import traceback
+            print(f"[Rank 0 ERROR] Projection/pickle step failed:\n{traceback.format_exc()}", flush=True)
+            comm.Abort(1) # Abort MPI processes instead of letting them hang
+
+    comm.Barrier()
+    if rank != 0:
+        projected_surf_mesh_dafoam = read_simple_pickle(surface_mesh_projection_file_path)
+
+print(f'Rank {rank_str} done reading projected surface mesh!')
+comm.Barrier()
 
 # -------------------------------------------------------------------------------------------
 # COPY PASTED GEOMETRY STUFF HERE:
@@ -242,14 +279,14 @@ ffd_block = construct_ffd_block_around_entities(entities=geometry,
 
 # region CSDL Variable declaration
 percent_change_in_thickness          = csdl.Variable(shape=(num_ffd_coefficients_chordwise, num_ffd_sections), value=0.) # (5,2)
-percent_change_in_thickness_dof      = csdl.Variable(shape=(num_ffd_coefficients_chordwise-2,), value=np.array([0,0,0])) 
+percent_change_in_thickness_dof      = csdl.Variable(shape=(num_ffd_coefficients_chordwise-2,), value=5*np.array([0, 0, 0]), name="normalized_thickness_dof") 
 normalized_percent_camber_change     = csdl.Variable(shape=(num_ffd_coefficients_chordwise, num_ffd_sections),  value=0.)
-normalized_percent_camber_change_dof = csdl.Variable(shape=(num_ffd_coefficients_chordwise-2,), value=np.array([0,0,0]))
+normalized_percent_camber_change_dof = csdl.Variable(shape=(num_ffd_coefficients_chordwise-2,), value=5*np.array([0, 0, 0]), name="normalized_camber_dof")
 
 # ffd_block.plot()
 ffd_sectional_parameterization = VolumeSectionalParameterization(
     name="ffd_sectional_parameterization",
-    parameterized_points=ffd_block.coefficients,    # ffd_block.coefficients.shape = (5, 2, 2, 3)
+    parameterized_points=ffd_block.coefficients, #ffd_block.coefficients.shape = (5, 2, 2, 3)
     principal_parametric_dimension=1,
 )
 
@@ -283,12 +320,11 @@ geometry_coefficients = ffd_block.evaluate_ffd(coefficients=ffd_coefficients, pl
 geometry.set_coefficients(geometry_coefficients) 
 # -------------------------------------------------------------------------------------------
 
-x_surf_dafoam = geometry.evaluate(projected_surf_mesh_dafoam, plot=False)
-x_surf_dafoam   = x_surf_dafoam.flatten()
+with Timer(f'evaluating geometry component', rank, TIMING_ENABLED):
+    x_surf_dafoam_full = geometry.evaluate(projected_surf_mesh_dafoam, plot=False)
 
-# region IDWarp and DAFoam
-idwarp_model    = DAFoamMeshWarper(dafoam_instance)
-x_vol_dafoam    = idwarp_model.evaluate(x_surf_dafoam)
+# region Surface mesh distribution
+i0, i1          = x_surf_dafoam_initial_indices[rank]
 
 # Flight condition variables
 flight_conditions_group                     = csdl.VariableGroup()
@@ -299,22 +335,63 @@ flight_conditions_group.altitude_m          = csdl.Variable(value=0.,    name="a
 # Atmospheric condition variables
 ambient_conditions_group = sam.compute_ambient_conditions_group(flight_conditions_group.altitude_m)
 
-# DAFoam input variable generation
-# Generate our DAFoam CSDL input variable group 
-# (this will add airspeed_m_s to the flight conditions group if not already present)
-dafoam_input_variables_group = compute_dafoam_input_variables(dafoam_instance, 
-                                                              ambient_conditions_group, 
-                                                              flight_conditions_group,
-                                                              x_vol_dafoam)
+with csdl.experimental.mpi.enter_mpi_region(rank, comm) as mpi_region:
 
-# DAFoamSolver Implicit component setup and evaluation
-dafoam_solver           = DAFoamSolver(dafoam_instance)
-dafoam_solver_states    = dafoam_solver.evaluate(dafoam_input_variables_group)
+    x_surf_dafoam   = x_surf_dafoam_full[i0:i1, :]
+    x_surf_dafoam   = x_surf_dafoam.flatten()
 
-# DAFoamFunctions Explicit component setup and evaluation
-dafoam_functions = DAFoamFunctions(dafoam_instance)
-dafoam_function_outputs = dafoam_functions.evaluate(dafoam_solver_states, 
-                                                    dafoam_input_variables_group)
+    # region IDWarp and DAFoam
+    idwarp_model    = DAFoamMeshWarper(dafoam_instance)
+    x_vol_dafoam    = idwarp_model.evaluate(x_surf_dafoam)
+
+    # Need to split up angle-of-attack (and any other CSDL variables which DAFoam takes the derivative with respect to)
+    flight_conditions_group.angle_of_attack_deg = mpi_region.split_custom(flight_conditions_group.angle_of_attack_deg, split_func = lambda x:x)
+    
+    # DAFoam input variable generation
+    # Generate our DAFoam CSDL input variable group 
+    # (this will add airspeed_m_s to the flight conditions group if not already present)
+    dafoam_input_variables_group = compute_dafoam_input_variables(dafoam_instance, 
+                                                                ambient_conditions_group, 
+                                                                flight_conditions_group,
+                                                                x_vol_dafoam)
+    
+    # DAFoamSolver Implicit component setup and evaluation
+    dafoam_solver           = DAFoamSolver(dafoam_instance)
+    dafoam_solver_states    = dafoam_solver.evaluate(dafoam_input_variables_group)
+
+    # DAFoamFunctions Explicit component setup and evaluation
+    dafoam_functions = DAFoamFunctions(dafoam_instance, disable_jacvec_normalization=True)
+    dafoam_function_outputs = dafoam_functions.evaluate(dafoam_solver_states, 
+                                                        dafoam_input_variables_group)
+
+    outputDict = dafoam_instance.getOption("function")
+    for outputName in outputDict.keys():
+        mpi_region.set_as_global_output(getattr(dafoam_function_outputs, outputName))
+    # mpi_region.set_as_global_output(dafoam_function_outputs.drag)
+
+
+# region Optimization problem selection
+# optimization_case options
+# 1: Maximize CL/CD wrt angle-of-attack
+# 2: Minimize CD wrt angle-of-attack, wing shape (thickness/camber ffd), constrained by CL=0.5
+# 3: Maximize CL/CD wrt angle-of-attack, wing shape (thickness/camber ffd)
+# 4: Minimize D wrt angle-of-attack (test case)
+# 5: Maximize CL/CD wrt wing shape (thickness/camber ffd)
+optimization_case = 1
+
+
+if optimization_case == 1:
+    # Declaring and naming some variables
+    lift = dafoam_function_outputs.lift
+    drag = dafoam_function_outputs.drag
+
+    # Design variables
+    flight_conditions_group.angle_of_attack_deg.set_as_design_variable(lower=0, upper=10, scaler=1./10)
+
+    # Objectives
+    objective_fun = -lift/drag
+    objective_fun.set_as_objective()
+    objective_fun,name = "-L/D"
 
 
 recorder.stop()
@@ -380,16 +457,12 @@ snapshot_vars_and_limits = {
     }
 }
 
-# A dictionary of variables whose values are important to know if one wants to rerun the simulation
+# A list of variables whose values are important to know if one wants to rerun the simulation
 # For instance, while angle of attack might be a sampled variable, we'd need to know that we were also at a specific altitude and Mach number
-important_non_sampled_variables = {
-    flight_conditions_group.airspeed_m_s: {
-        "name": "airspeed_m_s"
-    },
-    flight_conditions_group.altitude_m: {
-        "name": "altitude_m"
-    }
-}
+important_non_sampled_variables = [
+    flight_conditions_group.airspeed_m_s,
+    flight_conditions_group.altitude_m,
+]
 
 
 # print(dafoam_instance.getStateVariableMap()[0])
@@ -405,12 +478,12 @@ data_generator = TrainingDataInterface(dafoam_instance=dafoam_instance,
                                             num_primary_samples=num_grassmann_samples,
                                             num_secondary_samples=num_snapshot_samples,
                                             random_state_seed=random_state_seed,
-                                            h5_file_base_name="300_samples",
+                                            h5_file_base_name="point",
                                             gather_raw_files=True)
 
 
 data_generator.sample_variables()
-data_generator.run_sweep(pod_options={"centering":"reference", "write_modes_using_write_adjoint_fields":False})
+data_generator.run_sweep(pod_options={"centering":"reference", "write_modes_using_write_adjoint_fields":False}, compute_objective_grad=True)
 
 # import glob
 # files = glob.glob(str(Path(storage_location)/dataset_keyword/f"300_samples_*.h5"))

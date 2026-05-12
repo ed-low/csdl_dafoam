@@ -33,9 +33,6 @@ from csdl_dafoam.utils.training_interface import TrainingDataInterface
 import csdl_dafoam.utils.standard_atmosphere_model as sam
 from csdl_dafoam.utils.runscript_helper_functions import *
 
-# Hashing (for file name generation)
-import hashlib
-
 #---- DEBUGGING TOOLS ----
 import faulthandler
 faulthandler.enable()
@@ -49,7 +46,7 @@ print_runscript_info()
 # region USER INPUT
 # ===============================
 # Keyword for optimization name (optimization results folder will be saved with this name in dafoam directory)
-problem_name              = 'rom_with_interpolation_comparison'
+problem_name              = 'training_data' #'rom_with_interpolation_comparison'
 
 # Geometry
 geometry_directory        =  os.path.join(os.getcwd(), 'airfoil_geometry/')
@@ -65,10 +62,10 @@ dafoam_directory = os.path.join(os.getcwd(), f'results/{problem_name}/')
 dafoamPrintInterval = 100
 
 # Initial/reference values for DAFoam (best to use base conditions)
-U0        = 206.53653128321116         # used for normalizing CD and CL
-p0        = 19509.303373738785
-T0        = 216.65227163736915
-nuTilda0  = 4.5e-5
+U0        = 100.08596673909351         # used for normalizing CD and CL
+p0        = 101325
+T0        = 288.150
+nuTilda0  = 0.0000181206
 aoa0      = 1.416e-1
 A0        = 0.1           #
 rho0      = p0 / T0 / 287 # used for normalizing CD and CL
@@ -159,7 +156,7 @@ mesh_options = {
 # region Training data options
 # ===============================
 # Storage options
-dataset_keyword       = 'training_data4'
+dataset_keyword       = 'training_set_with_grad' #'training_set1'
 storage_location      = Path(dafoam_directory)
 
 
@@ -337,9 +334,9 @@ i0, i1          = x_surf_dafoam_initial_indices[rank]
 
 # Flight condition variables
 flight_conditions_group                 = csdl.VariableGroup()
-flight_conditions_group.mach_number     = csdl.Variable(value=0.7, name="mach_number")
+flight_conditions_group.mach_number     = csdl.Variable(value=0.2938635415, name="mach_number")
 flight_conditions_group.angle_of_attack_deg = csdl.Variable(value=data["parameters"]["primary_variables"]["angle_of_attack_deg"], name="angle_of_attack_deg")
-flight_conditions_group.altitude_m      = csdl.Variable(value=data["parameters"]["primary_variables"]["altitude_m"], name="altitude (m)")
+flight_conditions_group.altitude_m      = csdl.Variable(value=data["parameters"]["non_sampled_variables"]["altitude_m"], name="altitude (m)")
 
 # Atmospheric condition variables
 ambient_conditions_group = sam.compute_ambient_conditions_group(flight_conditions_group.altitude_m)
@@ -390,39 +387,14 @@ with csdl.experimental.mpi.enter_mpi_region(rank, comm) as mpi_region:
 
 
     ### DIAGNOSTICS
-    cumulative_ratio = np.cumsum(s_vals ** 2) / np.sum(s_vals ** 2)
+    cumulative_ratio = np.cumsum(s_vals) / np.sum(s_vals)
     # print(cumulative_ratio)
 
     cutoff_index = np.where(cumulative_ratio >= 0.999)
     cutoff_index = cutoff_index[0][0]
     # print(np.where(np.cumsum(s_vals) / np.sum(s_vals) >= 0.999))
     print(cutoff_index, cumulative_ratio[cutoff_index])
-
-    # Stable rank (soft rank — robust to noise)
-    stable_rank = (np.sum(s_vals**2) / s_vals[0]**2)
-
-    # Effective rank (entropy-based)
-    p = s_vals**2 / np.sum(s_vals**2)       # normalized energy fractions
-    eff_rank = np.exp(-np.sum(p * np.log(p + 1e-300)))
-
-    print(f"Stable rank:    {stable_rank:.2f}")
-    print(f"Effective rank: {eff_rank:.2f}")
-
-    errors = []
-    for r in range(1, len(s_vals) + 1):
-        # energy not captured
-        err = np.sqrt(np.sum(s_vals[r:]**2)) / np.sqrt(np.sum(s_vals**2))
-        errors.append(err)
-
-    import matplotlib.pyplot as plt
-    if rank  == 0:
-        plt.figure()
-        plt.semilogy(range(1, len(s_vals)+1), errors)
-        plt.xlabel("Number of POD modes r")
-        plt.ylabel("Relative projection error (L2)")
-        plt.title("POD projection error vs. rank")
-        plt.grid(True)
-
+    
     # snapshots   = np.array(np.concatenate([data["samples"]["states"][state_var] for state_var in state_info.keys()], axis=0))
     # scld_cntrd  = 1 / scaling[:, None] * (snapshots - reference_state[:, None])
     # phi_tmp     = pod_modes[:,:10]
@@ -473,10 +445,10 @@ with csdl.experimental.mpi.enter_mpi_region(rank, comm) as mpi_region:
     from csdl_dafoam.utils.custom_explicit_reduced_svd import customExplicitReducedSVD
     import matplotlib.pyplot as plt
 
-    snapshots       = np.array(np.concatenate([data["samples"]["states"][state_var]         for state_var in state_info.keys()], axis=0))[:, 1:]
-    s_vals          = data["pod"]["singular_values"]#[:n_modes]
+    snapshots        = np.array(np.concatenate([data["samples"]["states"][state_var]         for state_var in state_info.keys()], axis=0))[:, 1:]
+    s_vals           = data["pod"]["singular_values"]#[:n_modes]
     snapshot_configs = np.array(np.concatenate([data["parameters"]["secondary_variables"]["%_camber_change"], data["parameters"]["secondary_variables"]["%_thickness_change"]], axis=1))[1:, :]
-    current_config  = csdl.concatenate((normalized_percent_camber_change_dof, percent_change_in_thickness_dof), axis=0)
+    current_config   = csdl.concatenate((normalized_percent_camber_change_dof, percent_change_in_thickness_dof), axis=0)
 
     
 
@@ -491,17 +463,18 @@ with csdl.experimental.mpi.enter_mpi_region(rank, comm) as mpi_region:
 
     pod_modes_weighted = pod_modes @ UD[:, :n_modes]
 
+
     num_samples=5
 
     snapshot_vars_and_limits = {
         percent_change_in_thickness_dof: {
             'name': '%_thickness_change',
-            'range': [-5, 5],
+            'range': [-10, 10],
             'ref_value': 0, 
         },
         normalized_percent_camber_change_dof: {
             'name': '%_camber_change',
-            'range': [-5, 5],
+            'range': [-10, 10],
             'ref_value': 0, 
         }
     }
@@ -611,27 +584,6 @@ with csdl.experimental.mpi.enter_mpi_region(rank, comm) as mpi_region:
 
         plt.suptitle("Parameter Pair Plot", y=1.02)
         # plt.show()
-
-    quiet_barrier(comm)
-
-    if rank == 0:
-        plt.figure()
-        plt.plot(np.cumsum(s_vals ** 2)/np.sum(s_vals ** 2), label="original", linestyle='--')
-        plt.plot(np.cumsum(SD.value ** 2)/np.sum(SD.value ** 2), label="weighted", linestyle='-.')
-        plt.title("Cumulative Energy Fraction")
-        plt.ylabel(r"$\sum_0^r{\sigma_i^2} / \sum{\sigma_i^2}$")
-        plt.xlabel("Number of modes, r")
-        plt.legend()
-
-        plt.figure()
-        plt.plot(s_vals, label="original", linestyle='--')
-        plt.plot(SD.value, label="weighted", linestyle='-.')
-        plt.title("Singular values")
-        plt.ylabel(r"$\sigma$")
-        plt.xlabel("Mode number")
-        plt.legend()
-
-        plt.show()
 
     quiet_barrier(comm)
     ###
