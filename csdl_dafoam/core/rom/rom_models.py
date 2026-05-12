@@ -15,8 +15,8 @@ from contextlib import contextmanager, nullcontext
 
 # region BASEMODEL
 class BaseModel(ABC):  
-    def __init__(self):
-        pass
+    def __init__(self, disable_presolve_diagnostics:bool=False):
+        self.disable_presolve_diagnostics = disable_presolve_diagnostics
     
     # region evaluate_input_output
     @abstractmethod
@@ -69,7 +69,8 @@ class BaseModel(ABC):
     def pre_solve_diagnostics(self, initial_rom_state: np.ndarray) -> None:
         # FOR SOLVER: called once before the Newton loop begins (after initial residual/basis setup).
         # Print any pre-solve diagnostics here (basis quality, scaling, etc.). No return value.
-        pass
+        if self.disable_presolve_diagnostics:
+            pass
 
     # region iter_diagnostic_headers
     def iter_diagnostic_headers(self) -> list:
@@ -113,7 +114,8 @@ class DAFoamProjectionROMModel(BaseModel):
                  fd_step:float=1e-6,
                  jac_fd_central:bool=True,
                  solution_leading_integer:int=1,
-                 solution_prefix:str|None=None
+                 solution_prefix:str|None=None,
+                 disable_presolve_diagnostics:bool=False
     ):
         self.model_name          = "DAFoamProjectionModel"
 
@@ -129,6 +131,7 @@ class DAFoamProjectionROMModel(BaseModel):
         self.n_local_states      = dafoam_instance.getNLocalAdjointStates()
         self.solution_leading_integer = solution_leading_integer
         self.solution_prefix     = solution_prefix
+        self.disable_presolve_diagnostics = disable_presolve_diagnostics
 
         # To be setup later
         self.n_modes             = None
@@ -192,7 +195,7 @@ class DAFoamProjectionROMModel(BaseModel):
         # Will return this
         input_sensitivities = {}
 
-        # vec = self.comm.allreduce(vec, op=MPI.SUM)
+        vec = self.comm.allreduce(vec, op=MPI.SUM)
         # print(f"Rank {self.comm.rank}: vec norm before={np.linalg.norm(vec):.6f}, after={np.linalg.norm(vec_full):.6f}")
 
         q = rom_state
@@ -242,7 +245,7 @@ class DAFoamProjectionROMModel(BaseModel):
                     product
                 )
 
-                print(f"[Rank {self.rank}] input={input_name}, type={input_type}, product={product}")
+                # print(f"[Rank {self.rank}] input={input_name}, type={input_type}, product={product}")
 
                 input_sensitivities[input_name] = product
 
@@ -488,6 +491,9 @@ class DAFoamProjectionROMModel(BaseModel):
 
     # region pre_solve_diagnostics
     def pre_solve_diagnostics(self, initial_rom_state: np.ndarray) -> None:
+        if self.disable_presolve_diagnostics:
+            pass
+
         W   = 72
         sep = "-" * W
         self.print_fn(f"\n{sep}")
@@ -771,245 +777,3 @@ class DAFoamLSPGModel(DAFoamProjectionROMModel):
         r = fom_residual
         JT_r = self._jacT_vec_product(fom_state=fom_state, vec=m * r)
         return s[:, None] * np.outer(JT_r, vec)
-
-
-            
-            
-
-
-
-import numpy as np
-from mpi4py import MPI
-from csdl_dafoam.core.rom.rom_models import BaseModel
-
-
-class SyntheticROMModel(BaseModel):
-
-    def __init__(self, N=40, r=6, use_analytic_jacobian=True):
-        super().__init__()
-
-        self.comm = MPI.COMM_WORLD
-        self.rank = self.comm.rank
-        self.size = self.comm.size
-
-        self.N = N
-        self.r = r
-        self.use_analytic_jacobian = use_analytic_jacobian
-
-        # MPI Partitioning
-        # # simple contiguous split
-        # n_per_rank = N // self.size
-        # start = self.rank * n_per_rank
-        # end = start + n_per_rank if self.rank != self.size-1 else N
-        # self.local_idx = np.arange(start, end)
-
-        # Strided partition
-        self.local_idx = np.arange(self.rank, self.N, self.size)
-
-        # trial basis
-        np.random.seed(0)
-        V           = np.random.randn(N, r)
-        self.V, _   = np.linalg.qr(V)
-        self.V_local   = self.V[self.local_idx, :]
-
-        # true FOM state
-        self.w_true         = np.linspace(1.0, 2.0, N)
-        self.w_true_local   = self.w_true[self.local_idx]
-
-        # exact ROM solution
-        self.q_true = self.V.T @ self.w_true
-
-
-    # ------------------------------
-    # CSDL placeholders
-    # ------------------------------
-
-    def evaluate_input_output(self):
-        return {}, {}
-
-    def update_from_input_vals(self, input_vals):
-        pass
-
-    def input_jacvec_transpose(self, rom_state, vec, input_vals, mode):
-        raise NotImplementedError
-
-
-    # ------------------------------
-    # residual evaluation
-    # ------------------------------
-
-    def evaluate_residuals(self, rom_state):
-
-        q = rom_state
-
-        # reconstruct FOM state
-        w = self.reconstruct_fom_state(q)
-        f = self.compute_fom_residual(w)
-
-        # ROM projection
-        R_local = self.V_local.T @ f
-
-        # Sum contributions across ranks
-        R = self.comm.allreduce(R_local, op=MPI.SUM)
-
-        return R
-
-
-    # ------------------------------
-    # analytic reduced Jacobian
-    # ------------------------------
-
-    def compute_reduced_jacobian(self, rom_state):
-
-        if not self.use_analytic_jacobian:
-            return None
-
-        q = rom_state
-        w = self.reconstruct_fom_state(q)
-
-        J_fom_local = 2 * w
-
-        J_local = self.V_local.T @ (np.diag(J_fom_local) @ self.V_local)
-
-        # Reduce J across ranks
-        J = np.zeros_like(J_local)
-        self.comm.Allreduce(J_local, J, op=MPI.SUM)
-
-        return J
-    
-    
-    def reconstruct_fom_state(self, rom_state):
-        return self.V_local @ rom_state
-    
-    def compute_fom_residual(self, fom_state):
-        return fom_state**2 - self.w_true_local**2
-
-
-    # ------------------------------
-    # printing
-    # ------------------------------
-
-    def print_fn(self, msg: str, **kwargs):
-        if self.rank == 0:
-            print(msg, **kwargs)
-
-
-
-import numpy as np
-from mpi4py import MPI
-from abc import ABC
-
-class Burgers1DFOM(BaseModel):
-    def __init__(self, N=50, nu=0.01, u0=1.0, u1=2.0, use_analytic_jacobian=True):
-        super().__init__()
-
-        self.comm = MPI.COMM_WORLD
-        self.rank = self.comm.rank
-        self.size = self.comm.size
-
-        self.N = N
-        self.nu = nu
-        self.u0 = u0
-        self.u1 = u1
-        self.use_analytic_jacobian = use_analytic_jacobian
-
-        # Grid
-        self.x = np.linspace(0, 1, N)
-        self.dx = self.x[1] - self.x[0]
-
-        # MPI partitioning (strided)
-        self.local_idx = np.arange(self.rank, N, self.size)
-        
-        # Initial guess
-        self.u_init = np.linspace(u0, u1, N)[self.local_idx]
-
-    # --------------------------
-    # Evaluate residuals
-    # --------------------------
-    def evaluate_residuals(self, rom_state=None):
-        # For FOM, rom_state is just the local state
-        u = rom_state if rom_state is not None else self.u_init.copy()
-
-        # Extend to full vector for boundary conditions
-        u_full = np.zeros(self.N)
-        # gather u_local to u_full
-        all_u   = np.concatenate(self.comm.allgather(u))
-        all_idx = np.concatenate(self.comm.allgather(self.local_idx))
-        u_full[all_idx] = all_u
-
-        R = np.zeros_like(u)
-        idx = self.local_idx
-
-        for i_local, i in enumerate(idx):
-            if i == 0:
-                R[i_local] = u_full[i] - self.u0  # left BC
-            elif i == self.N-1:
-                R[i_local] = u_full[i] - self.u1  # right BC
-            else:
-                # central differences for d^2u/dx^2
-                du_dx = (u_full[i+1] - u_full[i-1]) / (2*self.dx)
-                d2u_dx2 = (u_full[i+1] - 2*u_full[i] + u_full[i-1]) / (self.dx**2)
-                R[i_local] = u_full[i]*du_dx - self.nu*d2u_dx2
-
-        return R
-
-    # --------------------------
-    # Analytical Jacobian
-    # --------------------------
-    def compute_reduced_jacobian(self, rom_state=None):
-        if not self.use_analytic_jacobian:
-            return None
-
-        u = rom_state if rom_state is not None else self.u_init.copy()
-        N_local = len(u)
-        J_local = np.zeros((N_local, N_local))
-
-        # Extend to full vector for boundary conditions
-        u_full = np.zeros(self.N)
-        # gather u_local to u_full
-        all_u   = np.concatenate(self.comm.allgather(u))
-        all_idx = np.concatenate(self.comm.allgather(self.local_idx))
-        u_full[all_idx] = all_u
-
-        for i_local, i in enumerate(self.local_idx):
-            if i == 0 or i == self.N-1:
-                J_local[i_local, i_local] = 1.0
-            else:
-                # derivatives for interior points
-                idx_m = i-1
-                idx_c = i
-                idx_p = i+1
-
-                # check if these indices are local
-                local_map = {idx: j for j, idx in enumerate(self.local_idx)}
-                
-                # central diff terms
-                val_c = u_full[idx_c]*0.0  # placeholder
-                val_m = -self.nu / (self.dx**2) - u_full[idx_c]/(2*self.dx)
-                val_c = (u_full[idx_c+1] - u_full[idx_c-1])/(2*self.dx) + 2*self.nu/(self.dx**2)
-                val_p = -self.nu/(self.dx**2) + u_full[idx_c]/(2*self.dx)
-
-                for idx_, val in zip([idx_m, idx_c, idx_p], [val_m, val_c, val_p]):
-                    if idx_ in local_map:
-                        J_local[i_local, local_map[idx_]] = val
-
-        return J_local
-
-    # --------------------------
-    # CSDL placeholders
-    # --------------------------
-    def evaluate_input_output(self):
-        return {}, {}
-
-    def update_from_input_vals(self, input_vals):
-        pass
-
-    def input_jacvec_transpose(self, rom_state, vec, input_vals, mode):
-        raise NotImplementedError
-
-    # --------------------------
-    # Printing
-    # --------------------------
-    def print_fn(self, msg, **kwargs):
-        if self.rank == 0:
-            print(msg, **kwargs)
