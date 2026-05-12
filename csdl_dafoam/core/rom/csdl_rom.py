@@ -6,13 +6,14 @@ from csdl_dafoam.core.rom.rom_solver import BaseSolver, SolverResult
 
 # region CSDLROMWrapper
 class CSDLROMWrapper(csdl.experimental.CustomImplicitOperation):
-    def __init__(self, model:BaseModel, solver:BaseSolver, write_unconverged_solutions_to_file:bool=False):
+    def __init__(self, model:BaseModel, solver:BaseSolver, write_unconverged_solutions_to_file:bool=False, start_with_zero_state:bool=False):
         super().__init__()
         solver.model    = model
         self.model      = model
         self.solver     = solver
         self.print_fn   = model.print_fn
         self.write_unconverged_solutions_to_file = write_unconverged_solutions_to_file
+        self.start_with_zero_state = start_with_zero_state
 
         self._cached_result    = None # Will be set and updated during solve_residual_equations
         # self._input_info       = {}   # Set up during evaluate
@@ -53,7 +54,7 @@ class CSDLROMWrapper(csdl.experimental.CustomImplicitOperation):
         model.update_from_input_vals(input_vals=input_vals)
 
         # Use cached state, otherwise start at zero
-        rom_state0 = np.zeros(output_shape) if self._cached_result is None else self._cached_result.rom_state.copy()
+        rom_state0 = np.zeros(output_shape) if self._cached_result is None or self.start_with_zero_state else self._cached_result.rom_state.copy()
         result     = solver.solve(initial_state=rom_state0)
         rom_state  = result.rom_state #.copy() Might need the copy?
 
