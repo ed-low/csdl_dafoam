@@ -137,13 +137,15 @@ class RBFInterpolator(BaseInterpolatorClass):
                  sample_points:Union[np.ndarray, Variable],
                  kernel:str='gaussian', 
                  kernel_parameter:float|None=None,
-                 apply_scaling:bool=True
+                 apply_scaling:bool=True,
+                 positive_non_reproducing_weights:bool=False
     ):
         super().__init__(query_point=query_point,
                        sample_points=sample_points,
                        apply_scaling=apply_scaling)
         
-        self.kernel           = kernel
+        self.kernel                           = kernel
+        self.positive_non_reproducing_weights = positive_non_reproducing_weights
         self.kernel_parameter = kernel_parameter if kernel_parameter is not None else self._estimate_parameter()
 
         # We'll need the RBF interpolation matrix
@@ -157,10 +159,13 @@ class RBFInterpolator(BaseInterpolatorClass):
         A   = self.interpolation_matrix
 
         diffs    = csdl.expand(x, x_i.shape, 'j->ij') - x_i
-        r        = csdl.sum(diffs * diffs, axes=(1, ))
-        b        = self._phi_from_r2(r)
+        r2       = csdl.sum(diffs * diffs, axes=(1, ))
+        b        = self._phi_from_r2(r2)
 
-        return csdl.solve_linear(A, b)
+        if self.positive_non_reproducing_weights:
+            return b / csdl.sum(b)
+        else:
+            return csdl.solve_linear(A, b)
 
 
     # region _phi
@@ -203,8 +208,24 @@ class RBFInterpolator(BaseInterpolatorClass):
     def _estimate_parameter(self):
         kernel = self.kernel.lower()
 
+        if isinstance(self._sample_points, Variable):
+            raise NotImplementedError("Haven't implemented the auto-computation of kernel parameter for variable sample points.")
+
+        x_i = self._sample_points
+
+        # For normalized (positive non-reproducing) weights, locality matters more than
+        # interpolation matrix conditioning, so tune ε to the nearest-neighbor distance
+        # so the kernel decays to ~1/e at that spacing rather than being nearly flat.
+        if self.positive_non_reproducing_weights:
+            diff = x_i[:, None, :] - x_i[None, :, :]
+            d    = np.linalg.norm(diff, axis=2)
+            np.fill_diagonal(d, np.inf)
+            d_nn = np.mean(np.min(d, axis=1))  # mean nearest-neighbor distance
+
+            return 1.0 / d_nn
+
         c      = 3 # a constant for the scaled values
-        N, dim = self._sample_points.shape
+        N, dim = x_i.shape
 
         # If the data is scaled between 0 and 1, these values should be decent?
         if self.apply_scaling:
@@ -214,15 +235,10 @@ class RBFInterpolator(BaseInterpolatorClass):
                 return N ** (1 / dim) / c
             elif kernel == "inverse_multiquadratic":
                 return N ** (1 / dim) / c
-        
+
         # If we still have unscaled data, then we can try using some values based off
         # the mean distance (these would normalize the r values in the basis functions)
         else:
-            if isinstance(self._sample_points, Variable):
-                # TODO: Do we need to do this for the general case?
-                raise NotImplementedError("Haven't implemented the auto-computation of kernel parameter for variable sample points.")
-            
-            x_i = self._sample_points
             diff = x_i[:, None, :] - x_i[None, :, :]
             d    = np.linalg.norm(diff, axis=2)
             d_mn = 1 / x_i.shape[0] * (np.sum(d) - np.sum(np.diag(d)))
