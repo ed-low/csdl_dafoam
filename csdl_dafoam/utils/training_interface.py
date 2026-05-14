@@ -125,7 +125,9 @@ class TrainingDataInterface():
 
 
     # region run_sweep
-    def run_sweep(self, compute_pod:bool=True, compute_objective_grad:bool=False, separate_pod_file:bool=False, pod_options:Dict=None):
+    def run_sweep(self, compute_pod:bool=True, compute_objective_grad:bool=False, separate_pod_file:bool=False, pod_options:Dict=None,
+                  compute_perturbations:bool=False, perturbation_epsilon:float|Dict[Variable, float]=1e-4,
+                  perturb_primary:bool=True, perturb_secondary:bool=True):
         sim                         = self.csdl_simulator
         rank                        = self.rank
         comm_size                   = self.comm_size
@@ -164,8 +166,24 @@ class TrainingDataInterface():
         adj_num_primary_samples   = self.num_primary_samples   + self.primary_has_ref
         adj_num_secondary_samples = self.num_secondary_samples + self.secondary_has_ref
 
+        # Build the ordered list of (var, info) pairs whose DoFs will be perturbed
+        perturbation_dvs = []
+        if compute_perturbations:
+            if perturb_primary and primary_variables:
+                perturbation_dvs.extend(primary_variables.items())
+            if perturb_secondary and secondary_variables:
+                perturbation_dvs.extend(secondary_variables.items())
+
         # Check for an interrupted sweep to resume from
-        resume_primary_idx, resume_secondary_start, skip_h5_init = self._check_for_interrupted_sweep(adj_num_secondary_samples)
+        resume_primary_idx, base_secondary_start, skip_h5_init, pert_secondary_start = \
+            self._check_for_interrupted_sweep(adj_num_secondary_samples, compute_perturbations)
+
+        # Actual loop start for the resumed primary (may be lower than base_secondary_start
+        # when perturbations are behind and need to catch up)
+        if compute_perturbations and pert_secondary_start is not None:
+            actual_resume_secondary_start = min(base_secondary_start, pert_secondary_start)
+        else:
+            actual_resume_secondary_start = base_secondary_start
 
         for primary_idx in range(adj_num_primary_samples):
             h5file_path = self.storage_location/self.dataset_keyword/f'{self.h5_file_base_name}_{primary_idx}.h5'
@@ -176,14 +194,20 @@ class TrainingDataInterface():
                 continue
 
             # is_first_resumed: True only for the very first primary index we actually process
-            is_first_resumed = (resume_primary_idx is not None and primary_idx == resume_primary_idx)
-            secondary_start  = resume_secondary_start if is_first_resumed else 0
+            is_first_resumed      = (resume_primary_idx is not None and primary_idx == resume_primary_idx)
+            secondary_start       = actual_resume_secondary_start if is_first_resumed else 0
+            # base_catchup_end: secondary indices below this were already base-written; re-run
+            # the solve to restore DAFoam state but skip write/raw-file/grad operations.
+            base_catchup_end      = base_secondary_start if is_first_resumed else 0
+            pert_start_this_primary = (pert_secondary_start if pert_secondary_start is not None else 0) \
+                                      if (is_first_resumed and compute_perturbations) else 0
 
             # skip_h5_init is True only when resuming mid-file (file already exists on disk).
             # When the previous primary completed fully and we're starting a fresh file for the
             # next primary, skip_h5_init is False and the file must be initialised normally.
             if not (is_first_resumed and skip_h5_init):
-                self.initialize_h5_file(h5file_path, primary_idx, compute_objective_grad=compute_objective_grad)
+                self.initialize_h5_file(h5file_path, primary_idx, compute_objective_grad=compute_objective_grad,
+                                        perturbation_dvs=perturbation_dvs if compute_perturbations else None)
 
             if self.rank == 0 and self.gather_raw_files:
                 if is_first_resumed and skip_h5_init:
@@ -266,44 +290,52 @@ class TrainingDataInterface():
                     # Try running again
                     sim.run()
 
-                self.write_sample(h5file_path, secondary_idx)
+                # is_catchup: base sample was already written in a prior (interrupted) run.
+                # We still re-run the solve to restore the correct DAFoam state (needed for
+                # perturbations), but we skip write/raw-file/grad operations to avoid
+                # corrupting already-stored data.
+                is_catchup = (secondary_idx < base_catchup_end)
 
-                # Move OpenFOAM solution to solution directory
-                if self.gather_raw_files:
-                    current_directory = Path.cwd()
-                    os.chdir(dafoam_directory)
-                    dafoam_instance.renameSolution(9998)
+                if not is_catchup:
+                    self.write_sample(h5file_path, secondary_idx)
 
-                    quiet_barrier(self.comm)
-                    if rank == 0:
-                        if comm_size > 1:
-                            for i in range(comm_size):
-                                shutil.move(dafoam_directory/f'processor{i}'/'0.9998/',
-                                        raw_directory/f'processor{i}'/f'{secondary_idx:04}')
+                # Move OpenFOAM solution to solution directory (skip during catch-up)
+                if not is_catchup:
+                    if self.gather_raw_files:
+                        current_directory = Path.cwd()
+                        os.chdir(dafoam_directory)
+                        dafoam_instance.renameSolution(9998)
 
-                                # Copy constant folder to directory (only need to do this once)
-                                if secondary_idx == 0:
-                                    shutil.copytree(dafoam_directory/f'processor{i}'/'constant',
-                                    raw_directory/f'processor{i}'/'constant')
-                        else:
-                            shutil.move(dafoam_directory/'0.9998',
-                                    raw_directory/f'{secondary_idx:04}')
-                    quiet_barrier(self.comm)
-                    os.chdir(current_directory)
+                        quiet_barrier(self.comm)
+                        if rank == 0:
+                            if comm_size > 1:
+                                for i in range(comm_size):
+                                    shutil.move(dafoam_directory/f'processor{i}'/'0.9998/',
+                                            raw_directory/f'processor{i}'/f'{secondary_idx:04}')
 
-                else:
-                    current_directory = Path.cwd()
-                    os.chdir(dafoam_directory)
-                    dafoam_instance.renameSolution(primary_idx * (self.num_secondary_samples + 1) + secondary_idx + 1)
-                    os.chdir(current_directory)
+                                    # Copy constant folder to directory (only need to do this once)
+                                    if secondary_idx == 0:
+                                        shutil.copytree(dafoam_directory/f'processor{i}'/'constant',
+                                        raw_directory/f'processor{i}'/'constant')
+                            else:
+                                shutil.move(dafoam_directory/'0.9998',
+                                        raw_directory/f'{secondary_idx:04}')
+                        quiet_barrier(self.comm)
+                        os.chdir(current_directory)
 
-                if compute_objective_grad:
+                    else:
+                        current_directory = Path.cwd()
+                        os.chdir(dafoam_directory)
+                        dafoam_instance.renameSolution(primary_idx * (self.num_secondary_samples + 1) + secondary_idx + 1)
+                        os.chdir(current_directory)
+
+                if not is_catchup and compute_objective_grad:
                     # Do an objective check and issue warning only on the first iteration
                     if primary_idx == 0 and secondary_idx == 0:
                         if not self.objectives:
-                            warn(f"Rank {rank}: Objectives don't seem to be specified. Skipping gradient computation.") 
+                            warn(f"Rank {rank}: Objectives don't seem to be specified. Skipping gradient computation.")
                             compute_objective_grad = False
-                    
+
                     gradients = sim.compute_totals(self.objectives, list(self.secondary_variables.keys()) + list(self.primary_variables.keys()))
 
                     with h5py.File(h5file_path, "a", driver="mpio", comm=self.comm) as f:
@@ -319,39 +351,43 @@ class TrainingDataInterface():
                                 if rank == 0:
                                     dset[:, secondary_idx] = gradients[objective_var, secondary_var].flatten()
 
+                if compute_perturbations and secondary_idx >= pert_start_this_primary:
+                    self._run_perturbations(h5file_path, secondary_idx, perturbation_dvs, perturbation_epsilon, sim)
+
             if compute_pod:
                 self._compute_pod_modes(h5filepath=h5file_path, **pod_options)
 
     
     # region _check_for_interrupted_sweep
-    def _check_for_interrupted_sweep(self, adj_num_secondary_samples:int):
+    def _check_for_interrupted_sweep(self, adj_num_secondary_samples:int, compute_perturbations:bool=False):
         """
         Scan the storage directory for the largest-indexed h5 data file and determine
-        where the sweep should resume.  Two cases are handled:
+        where the sweep should resume.  Cases handled:
 
-          - Incomplete file: the largest file exists but has not had all secondary
-            samples written.  Resume mid-file; the h5 file and raw directory already
-            exist, so their initialisation must be skipped.
+          - Incomplete base samples: resume mid-secondary loop; h5 file and raw directory
+            already exist, so their initialisation must be skipped.
 
-          - Complete file, next primary missing: the largest file is fully written but
-            the next primary index has no h5 file.  Resume at the start of that next
-            primary index; the h5 file and raw directory must be created fresh.
+          - Base complete, perturbations incomplete (only when compute_perturbations=True):
+            stay on the same primary, skip h5 init, resume perturbations from the first
+            unfinished secondary index.
+
+          - Both complete (or no perturbations requested): advance to the next primary.
 
         Rank 0 performs all file I/O; the result is broadcast to every rank.
 
         Returns
         -------
-        (resume_primary_idx, resume_secondary_start, skip_h5_init)
-            resume_primary_idx      - first primary index that still needs work, or None
-                                      if no existing files were found / files don't match.
-            resume_secondary_start  - first secondary index to run for that primary (0 when
-                                      starting a brand-new primary file).
-            skip_h5_init            - True only when resuming mid-file (the h5 file already
-                                      exists and must not be re-initialised).
+        (resume_primary_idx, base_secondary_start, skip_h5_init, pert_secondary_start)
+            resume_primary_idx      - first primary index that still needs work, or None.
+            base_secondary_start    - first secondary index needing a base solve (0 when
+                                      starting a fresh primary file).
+            skip_h5_init            - True when the h5 file already exists on disk.
+            pert_secondary_start    - first secondary index needing perturbations, or None
+                                      when compute_perturbations=False.
         """
         self.print0("Checking for interrupted sweep...")
 
-        result = (None, 0, False)
+        result = (None, 0, False, None)
 
         if self.rank == 0:
             dataset_dir = self.storage_location / self.dataset_keyword
@@ -410,18 +446,44 @@ class TrainingDataInterface():
 
                         if primary_match:
                             if not file_complete:
-                                # Case: incomplete file — resume mid-secondary loop, skip h5 init
-                                resume_secondary_start = last_written + 1
+                                # Case: incomplete base samples — resume mid-secondary loop
+                                base_secondary_start = last_written + 1
                                 print(f"\nFound incomplete sweep file: {largest_file.name}")
                                 print(f"  Last written secondary index: {last_written} / {total_snapshots - 1}")
-                                print(f"  Resuming from primary index {largest_primary_idx}, secondary index {resume_secondary_start}.\n")
-                                result = (largest_primary_idx, resume_secondary_start, True)
+                                if compute_perturbations:
+                                    pert_index = self._read_last_perturbation_index(largest_file)
+                                    pert_secondary_start = pert_index + 1
+                                    actual_start = min(base_secondary_start, pert_secondary_start)
+                                    print(f"  Last written perturbation index: {pert_index} / {total_snapshots - 1}")
+                                    print(f"  Resuming from primary index {largest_primary_idx}, "
+                                          f"secondary index {actual_start} "
+                                          f"(base: {base_secondary_start}, pert: {pert_secondary_start}).\n")
+                                    result = (largest_primary_idx, base_secondary_start, True, pert_secondary_start)
+                                else:
+                                    print(f"  Resuming from primary index {largest_primary_idx}, secondary index {base_secondary_start}.\n")
+                                    result = (largest_primary_idx, base_secondary_start, True, None)
                             else:
-                                # Case: file complete but next primary not started — create it fresh
-                                next_primary_idx = largest_primary_idx + 1
-                                print(f"\nAll secondary samples in {largest_file.name} are complete.")
-                                print(f"  Resuming at the start of primary index {next_primary_idx}.\n")
-                                result = (next_primary_idx, 0, False)
+                                if compute_perturbations:
+                                    pert_index = self._read_last_perturbation_index(largest_file)
+                                    if pert_index < total_snapshots - 1:
+                                        # Base complete, perturbations still in progress
+                                        pert_secondary_start = pert_index + 1
+                                        print(f"\nAll base samples in {largest_file.name} are complete.")
+                                        print(f"  Last written perturbation index: {pert_index} / {total_snapshots - 1}")
+                                        print(f"  Resuming perturbations from secondary index {pert_secondary_start}.\n")
+                                        result = (largest_primary_idx, total_snapshots, True, pert_secondary_start)
+                                    else:
+                                        # Both base and perturbations complete — advance to next primary
+                                        next_primary_idx = largest_primary_idx + 1
+                                        print(f"\nAll base samples and perturbations in {largest_file.name} are complete.")
+                                        print(f"  Resuming at the start of primary index {next_primary_idx}.\n")
+                                        result = (next_primary_idx, 0, False, 0)
+                                else:
+                                    # Case: file complete, no perturbations — create next primary fresh
+                                    next_primary_idx = largest_primary_idx + 1
+                                    print(f"\nAll secondary samples in {largest_file.name} are complete.")
+                                    print(f"  Resuming at the start of primary index {next_primary_idx}.\n")
+                                    result = (next_primary_idx, 0, False, None)
 
                 except Exception as e:
                     print(f"Warning: could not read existing h5 file for resume check: {e}")
@@ -487,7 +549,8 @@ class TrainingDataInterface():
 
 
     # region initialize_h5_file
-    def initialize_h5_file(self, h5filepath:Path|str, primary_idx:int, compute_objective_grad:bool=False):
+    def initialize_h5_file(self, h5filepath:Path|str, primary_idx:int, compute_objective_grad:bool=False,
+                           perturbation_dvs:list=None):
         comm = self.comm
 
         # Global sizes across ranks
@@ -505,8 +568,7 @@ class TrainingDataInterface():
             sample_group    = f.create_group("samples")
             state_group     = sample_group.create_group("states")
             ref_group       = sample_group.create_group("reference_states")
-            mesh_group      = sample_group.create_group("mesh")
-            gradient_group  = sample_group.create_group("gradients")
+            mesh_group      = sample_group.create_group("mesh")             
 
             if self.store_residuals:
                 res_group   = sample_group.create_group("residuals")
@@ -532,6 +594,7 @@ class TrainingDataInterface():
                     ref_group.create_dataset(f"{state_name}",           (adj_num_secondary_samples,),           dtype="f8")
 
             if compute_objective_grad:
+                gradient_group  = sample_group.create_group("gradients")
                 for objective_idx, objective in enumerate(self.objectives):
                     objective_name = objective.name if objective.name is not None else f"objective_{objective_idx}"
                     if objective.name is None:
@@ -585,6 +648,9 @@ class TrainingDataInterface():
                 non_sampled_var_group = parameter_group.create_group("non_sampled_variables")
                 for var in self.non_sampled_variables:
                     non_sampled_var_group.create_dataset(var.name,          data=var.value,                         dtype="f8")
+
+            if perturbation_dvs:
+                self._initialize_perturbation_group(f, perturbation_dvs, adj_num_secondary_samples)
 
         self.print0('All set!')
 
@@ -684,6 +750,132 @@ class TrainingDataInterface():
                 sample_group.attrs["last_written_sample_index"] = sample_idx
 
         self.comm.Barrier()
+
+
+    # region _initialize_perturbation_group
+    def _initialize_perturbation_group(self, f:h5py.File, perturbation_dvs:list, adj_num_secondary_samples:int, perturbation_epsilon:float|Dict[Variable, float]):
+        """Pre-allocate perturbations/<dv_name>/dof_<i>/states/ datasets inside an open h5 file."""
+        pert_group = f.create_group("perturbations")
+        pert_group.attrs.create("last_written_perturbation_index", data=-1, dtype="i8")
+
+        for var, _ in perturbation_dvs:
+            dv_group = pert_group.create_group(var.name)
+            dv_group.attrs.create("stepsize", data=perturbation_epsilon[var] if isinstance(perturbation_epsilon, dict) else perturbation_epsilon, dtype="f8")
+            shape    = var.value.shape
+            num_dofs = int(np.prod(shape)) if shape else 1
+
+            for dof_idx in range(num_dofs):
+                dof_group    = dv_group.create_group(f"dof_{dof_idx}")
+                states_group = dof_group.create_group("states")
+
+                for state_name, info in self.state_info.items():
+                    state_type = info["type"]
+                    if   state_type in ("volScalarStates", "modelStates"): size = self.num_cells_global
+                    elif state_type == "volVectorStates":                  size = 3 * self.num_cells_global
+                    elif state_type == "surfaceScalarStates":              size = self.num_faces_no_proc_boundaries_global
+                    else:
+                        raise NotImplementedError(f"Unknown state type: {state_type}")
+
+                    dset = states_group.create_dataset(state_name, (size, adj_num_secondary_samples), dtype="f8")
+                    dset.attrs.create("addressing_type", state_type)
+
+                dof_group.create_dataset("converged", (adj_num_secondary_samples,), dtype="bool")
+
+
+    # region _run_perturbations
+    def _run_perturbations(self, h5filepath:Path, secondary_idx:int, perturbation_dvs:list,
+                           perturbation_epsilon:float|Dict[Variable, float], sim):
+        """For each DV DoF, apply a perturbation, run a solve, write the result, then restore."""
+        for var, _ in perturbation_dvs:
+            base_val = np.asarray(sim[var]).copy()
+            shape    = base_val.shape
+            flat     = base_val.flatten()
+            num_dofs = flat.size if flat.size > 0 else 1
+            eps      = perturbation_epsilon if isinstance(perturbation_epsilon, (int, float)) else \
+                       perturbation_epsilon.get(var, 1e-4)
+
+            for dof_idx in range(num_dofs):
+                self.print0(f'  Perturbation: {var.name} dof_{dof_idx} (+{eps})')
+                perturbed          = flat.copy()
+                perturbed[dof_idx] += eps
+                sim[var]           = perturbed.reshape(shape) if shape else float(perturbed[0])
+
+                sim.run()
+                self.write_perturbation_sample(h5filepath, secondary_idx, var.name, dof_idx)
+
+                sim[var] = base_val  # restore base value
+
+        self._update_perturbation_index(h5filepath, secondary_idx)
+
+
+    # region write_perturbation_sample
+    def write_perturbation_sample(self, h5filepath:Path, secondary_idx:int, dv_name:str, dof_idx:int):
+        states    = self.dafoam_instance.getStates()
+        converged = not self.dafoam_instance.primalFail
+
+        if self.parallel_write:
+            self._write_perturbation_parallel(h5filepath, secondary_idx, dv_name, dof_idx, states, converged)
+        else:
+            self._write_perturbation_root(h5filepath, secondary_idx, dv_name, dof_idx, states, converged)
+
+
+    # region _write_perturbation_parallel
+    def _write_perturbation_parallel(self, h5filepath:Path, secondary_idx:int, dv_name:str, dof_idx:int,
+                                     states:np.ndarray, converged:bool):
+        with h5py.File(h5filepath, "a", driver="mpio", comm=self.comm) as f:
+            dof_group    = f["perturbations"][dv_name][f"dof_{dof_idx}"]
+            states_group = dof_group["states"]
+
+            for state_name, info in self.state_info.items():
+                self._write_field_data_to_dataset(states_group[state_name], states[info['indices']], info['type'], secondary_idx)
+
+            dof_group["converged"][secondary_idx] = converged
+
+
+    # region _write_perturbation_root
+    def _write_perturbation_root(self, h5filepath:Path, secondary_idx:int, dv_name:str, dof_idx:int,
+                                 states:np.ndarray, converged:bool):
+        # Gather states to rank 0 (pass dummy arrays for cell_coords/state_weights — not needed here)
+        dummy_coords   = np.zeros(3 * self.num_cells, dtype=np.float64)
+        dummy_weights  = np.zeros(self.num_state_elements, dtype=np.float64)
+        gathered = self._gather_field_data(states, dummy_coords, dummy_weights)
+
+        if self.rank == 0:
+            with h5py.File(h5filepath, "a") as f:
+                dof_group    = f["perturbations"][dv_name][f"dof_{dof_idx}"]
+                states_group = dof_group["states"]
+
+                for state_name in self.state_info:
+                    states_group[state_name][:, secondary_idx] = gathered["states"][state_name]
+
+                dof_group["converged"][secondary_idx] = converged
+
+        self.comm.Barrier()
+
+
+    # region _update_perturbation_index
+    def _update_perturbation_index(self, h5filepath:Path, secondary_idx:int):
+        """Atomically record that all perturbation DoFs for secondary_idx have been written."""
+        if self.parallel_write:
+            with h5py.File(h5filepath, "a", driver="mpio", comm=self.comm) as f:
+                f["perturbations"].attrs["last_written_perturbation_index"] = secondary_idx
+        else:
+            if self.rank == 0:
+                with h5py.File(h5filepath, "a") as f:
+                    f["perturbations"].attrs["last_written_perturbation_index"] = secondary_idx
+            self.comm.Barrier()
+
+
+    # region _read_last_perturbation_index
+    def _read_last_perturbation_index(self, h5filepath:Path) -> int:
+        """Rank-0 helper: return last_written_perturbation_index from h5, or -1 if absent."""
+        try:
+            with h5py.File(h5filepath, "r") as f:
+                if "perturbations" in f:
+                    return int(f["perturbations"].attrs.get("last_written_perturbation_index", -1))
+        except Exception:
+            pass
+        return -1
 
 
     # region _gather_field_data
