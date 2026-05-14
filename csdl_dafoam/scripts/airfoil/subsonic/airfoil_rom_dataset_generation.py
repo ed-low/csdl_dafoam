@@ -329,8 +329,8 @@ i0, i1          = x_surf_dafoam_initial_indices[rank]
 # Flight condition variables
 flight_conditions_group                     = csdl.VariableGroup()
 flight_conditions_group.mach_number         = csdl.Variable(value=0.2941176471,      name="mach_number")
-flight_conditions_group.angle_of_attack_deg = csdl.Variable(value=0,     name="angle_of_attack_deg")
-flight_conditions_group.altitude_m          = csdl.Variable(value=0.,    name="altitude (m)")
+flight_conditions_group.angle_of_attack_deg = csdl.Variable(value=0,                 name="angle_of_attack_deg")
+flight_conditions_group.altitude_m          = csdl.Variable(value=0.,                name="altitude (m)")
 
 # Atmospheric condition variables
 ambient_conditions_group = sam.compute_ambient_conditions_group(flight_conditions_group.altitude_m)
@@ -354,6 +354,8 @@ with csdl.experimental.mpi.enter_mpi_region(rank, comm) as mpi_region:
                                                                 ambient_conditions_group, 
                                                                 flight_conditions_group,
                                                                 x_vol_dafoam)
+    
+    flight_conditions_group.airspeed_m_s.name = "airspeed_m_s"
     
     # DAFoamSolver Implicit component setup and evaluation
     dafoam_solver           = DAFoamSolver(dafoam_instance)
@@ -391,7 +393,7 @@ if optimization_case == 1:
     # Objectives
     objective_fun = -lift/drag
     objective_fun.set_as_objective()
-    objective_fun,name = "-L/D"
+    objective_fun.name = "-L/D"
 
 
 recorder.stop()
@@ -446,12 +448,10 @@ grassmann_vars_and_limits = {
 
 snapshot_vars_and_limits = {
     percent_change_in_thickness_dof: {
-        'name': '%_thickness_change',
         'range': [-20, 20],
         'ref_value': 0, 
     },
     normalized_percent_camber_change_dof: {
-        'name': '%_camber_change',
         'range': [-20, 20],
         'ref_value': 0, 
     }
@@ -483,7 +483,10 @@ data_generator = TrainingDataInterface(dafoam_instance=dafoam_instance,
 
 
 data_generator.sample_variables()
-data_generator.run_sweep(pod_options={"centering":"reference", "write_modes_using_write_adjoint_fields":False}, compute_objective_grad=True)
+data_generator.run_sweep(pod_options={"centering":"reference", "write_modes_using_write_adjoint_fields":False}, 
+                         compute_objective_grad=False, 
+                         compute_perturbations=True, 
+                         perturbation_epsilon=1e-6)
 
 # import glob
 # files = glob.glob(str(Path(storage_location)/dataset_keyword/f"300_samples_*.h5"))

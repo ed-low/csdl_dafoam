@@ -168,6 +168,8 @@ rank      = comm.Get_rank()
 comm_size = comm.Get_size()
 rank_str  = f"{rank:0{len(str(comm_size-1))}d}" # string with zero-padded rank index (for prints)
 
+print(f"COMM SIZE = {comm_size}")
+
 
 # region DAFoam instance
 dafoam_instance           = instantiateDAFoam(da_options, comm, dafoam_directory, mesh_options)
@@ -179,52 +181,55 @@ data_generator = TrainingDataInterface(dafoam_instance=dafoam_instance,
                                         h5_file_base_name="point")
 
 # Manually obtaining the file for now
-data = data_generator.load_h5(Path(storage_location)/dataset_keyword/"point_0.h5", only_distributed_data=False)
-
+data        = data_generator.load_h5(Path(storage_location)/dataset_keyword/"point_0.h5", only_distributed_data=False)
+state_info  = data_generator.state_info
 n_snapshots = data["samples"]["converged"].size
 
-grad_f = []
-for var_name, val in data["samples"]["gradients"]["objective_0"].items():
-    if var_name != "angle_of_attack_deg":
-        grad_f.append(val)
 
-G       = np.concatenate(grad_f, axis=0)
-# grad_f_mean  = np.mean(grad_f, axis=1)
-# grad_f_fluct = grad_f - grad_f_mean[:, None]
+def read_snapshots_into_state_format(states_dset, state_info, n_columns):
+    n_local_states = dafoam_instance.getNLocalAdjointStates()
+    snapshot_data  = np.zeros((n_local_states, n_columns)) if n_columns > 1 else np.zeros((n_local_states, ))
+    for state_var, info in state_info.items():
+        idx = info["indices"]
+        if n_columns > 1:
+            snapshot_data[idx, :] = states_dset[state_var]
+        else:
+            snapshot_data[idx] = states_dset[state_var]
 
-u, s, vt = np.linalg.svd(G, full_matrices=False)
-
-# print(u)
-# print(s)
-# print(vt)
-
-eigenvalues = s**2 / G.shape[1]
-eigenvectors = u
+    return snapshot_data
 
 
+base_data = read_snapshots_into_state_format(data["samples"]["states"], state_info, n_snapshots)
+weights   = read_snapshots_into_state_format(data["pod"]["weights"], state_info, 1)
 
-import matplotlib.pyplot as plt
+J = {}
+eps = 1e-6
 
-# plt.semilogy(range(1, len(eigenvalues)+1), eigenvalues, 'o-')
-# plt.xlabel('Index')
-# plt.ylabel('Eigenvalue')
-# # plt.axvline(x=range(G.shape[1]), linestyle='--', label='truncation')
-# plt.show()
+n_dofs = 0
 
-# cumulative_energy = np.cumsum(eigenvalues) / np.sum(eigenvalues)
-# r = np.searchsorted(cumulative_energy, 0.999) + 1
+for dv_key, dv_group in data["perturbations"].items():
+    if dv_key != "_attrs" and dv_key != "angle_of_attack_deg":
+        for dof_key, dof_group in dv_group.items():
+            if dof_key != "_attrs":
+                J[dv_key] = {dof_key : 1 / eps * (read_snapshots_into_state_format(dof_group["states"], state_info, n_snapshots) - base_data)}
+                n_dofs += 1
 
-# print(r)
+M = np.zeros((n_dofs, n_dofs))
 
+for i in range(n_snapshots):
+    J_loc = np.zeros((dafoam_instance.getNLocalAdjointStates(), n_dofs))
+    for dv_key, dv_val in J.items():
+        for j, (dof_key, dof_val) in enumerate(dv_val.items()):
+            J_loc[:, j] = J[dv_key][dof_key][:, i]
 
-n_modes     = 20
-state_info  = data_generator.state_info
-n_local_states = dafoam_instance.getNLocalAdjointStates()
+    M += J_loc.T @ (weights[:, None] * J_loc)
 
-i0 = 0
-Y   = np.zeros((n_local_states, n_snapshots))
-X_r = u[:, :3]
-W   = np.zeros((n_local_states,))
+M = comm.allreduce(M, op=MPI.SUM) / n_dofs
+
+def pullback_distance(xi, xj, M):
+    d = (xi - xj)       # (r,)
+    return np.sqrt(d @ M @ d)
+
 
 X_temp = []
 for key, val in data["parameters"]["secondary_variables"].items():
@@ -233,71 +238,175 @@ for key, val in data["parameters"]["secondary_variables"].items():
 
 X   = np.concatenate(X_temp, axis=0)
 
-for state_var, info in state_info.items():
-    idx       = info["indices"] 
-    Y[idx, :] = data["samples"]["states"][state_var]
-    W[idx]    = data["pod"]["weights"][state_var]
 
-# Step 1: offsets
-dX = X - X[:, i0:i0+1]          # (n_x, n_s)
-dY = Y - Y[:, i0:i0+1]          # (n_y, n_s)
+eucl_dists = []
+pull_dists = []
+for i in range(n_snapshots):
+    eucl_dists.append(np.sqrt(np.sum((X[:,i] - X[:,i-1]) ** 2)))
+    pull_dists.append(pullback_distance(X[:, i-1], X[:, i], M))
 
-# drop the reference column (zero offset)
-mask     = np.ones(X.shape[1], bool)
-mask[i0] = False
-dX, dY   = dX[:, mask], dY[:, mask]
-
-# Step 2: project design offsets to reduced space
-dXr = X_r.T @ dX                # (r, n_s)
-
-dists_from_x0 = np.linalg.norm(dX, axis=0)
-local_idx = np.argsort(dists_from_x0)[:20]
-dXr_local = dXr[:, local_idx]
-dY_local = dY[:, local_idx]
-
-# Step 3: snapshot kernel (already have this from POD)
-K = dY_local.T @ (W[:, None] * dY_local)    # (n_s, n_s)
-
-# Step 4: form the metric in reduced design space
-A = dXr_local @ dXr_local.T                 # (r, r)
-A_inv = np.linalg.pinv(A)       # use pinv for robustness
-M = A_inv @ dXr_local @ K @ dXr_local.T @ A_inv   # (r, r)
-
-M_norm = M * (M.shape[0] / np.trace(M))
-M = M_norm
-
-# Step 5: pairwise distances
-def pullback_distance(xi, xj, X_r, M):
-    d = X_r.T @ (xi - xj)       # (r,)
-    return np.sqrt(d @ M @ d)
+eucl_dists = np.array(eucl_dists)
+pull_dists = np.array(pull_dists)
 
 
-
-# ###
-# from scipy.spatial.distance import cdist
-
-# # Reduced coordinates for all points: shape (n_snapshots, r)
-# Z = (X_r.T @ X).T
-
-# # --- Euclidean distance matrix ---
-# eucl_dist_matrix = cdist(X.T, X.T)  # (n_snapshots, n_snapshots)
-
-# # --- Pullback distance matrix ---
-# # d^T M d = ||L d||^2, where M = L L^T (via eigendecomposition for robustness)
-# eigvals, eigvecs = np.linalg.eigh(M)
-# eigvals = np.maximum(eigvals, 0)          # clip any negative numerics from pinv
-# L = eigvecs * np.sqrt(eigvals)            # (r, r)
-# Z_transformed = Z @ L                    # (n_snapshots, r)
-# pullback_dist_matrix = cdist(Z_transformed, Z_transformed)  # (n_snapshots, n_snapshots)
+sorted_inds = np.argsort(pull_dists)
 
 
-# plt.pcolor(eucl_dist_matrix)
-# plt.colorbar()
-# plt.figure()
-# plt.pcolor(pullback_dist_matrix)
-# plt.colorbar()
-# plt.show()
+from matplotlib import pyplot as plt
 
+if rank == 0:
+    ###
+    from scipy.spatial.distance import cdist
+
+    # --- Euclidean distance matrix ---
+    eucl_dist_matrix = cdist(X.T, X.T)  # (n_snapshots, n_snapshots)
+
+    # --- Pullback distance matrix ---
+    # d^T M d = ||L d||^2, where M = L L^T (via eigendecomposition for robustness)
+    eigvals, eigvecs = np.linalg.eigh(M)
+    eigvals = np.maximum(eigvals, 0)          # clip any negative numerics from pinv
+    L = eigvecs * np.sqrt(eigvals)            # (r, r)
+    X_transformed = X.T @ L                    # (n_snapshots, r)
+    pullback_dist_matrix = cdist(X_transformed, X_transformed)  # (n_snapshots, n_snapshots)
+
+
+    plt.pcolor(eucl_dist_matrix)
+    plt.colorbar()
+    plt.figure()
+    plt.pcolor(pullback_dist_matrix)
+    plt.colorbar()
+    plt.show()
+
+
+
+
+
+
+
+
+
+
+
+
+
+# grad_f = []
+# for var_name, val in data["samples"]["gradients"]["objective_0"].items():
+#     if var_name != "angle_of_attack_deg":
+#         grad_f.append(val)
+
+# G       = np.concatenate(grad_f, axis=0)
+# # grad_f_mean  = np.mean(grad_f, axis=1)
+# # grad_f_fluct = grad_f - grad_f_mean[:, None]
+
+# u, s, vt = np.linalg.svd(G, full_matrices=False)
+
+# # print(u)
+# # print(s)
+# # print(vt)
+
+# eigenvalues = s**2 / G.shape[1]
+# eigenvectors = u
+
+
+
+# import matplotlib.pyplot as plt
+
+# # plt.semilogy(range(1, len(eigenvalues)+1), eigenvalues, 'o-')
+# # plt.xlabel('Index')
+# # plt.ylabel('Eigenvalue')
+# # # plt.axvline(x=range(G.shape[1]), linestyle='--', label='truncation')
+# # plt.show()
+
+# # cumulative_energy = np.cumsum(eigenvalues) / np.sum(eigenvalues)
+# # r = np.searchsorted(cumulative_energy, 0.999) + 1
+
+# # print(r)
+
+
+# n_modes     = 20
+# state_info  = data_generator.state_info
+# n_local_states = dafoam_instance.getNLocalAdjointStates()
+
+# i0 = 0
+# Y   = np.zeros((n_local_states, n_snapshots))
+# X_r = u[:, :3]
+# W   = np.zeros((n_local_states,))
+
+# X_temp = []
+# for key, val in data["parameters"]["secondary_variables"].items():
+#     if key != "_attrs":
+#         X_temp.append(val.T)
+
+# X   = np.concatenate(X_temp, axis=0)
+
+# for state_var, info in state_info.items():
+#     idx       = info["indices"] 
+#     Y[idx, :] = data["samples"]["states"][state_var]
+#     W[idx]    = data["pod"]["weights"][state_var]
+
+# # Step 1: offsets
+# dX = X - X[:, i0:i0+1]          # (n_x, n_s)
+# dY = Y - Y[:, i0:i0+1]          # (n_y, n_s)
+
+# # drop the reference column (zero offset)
+# mask     = np.ones(X.shape[1], bool)
+# mask[i0] = False
+# dX, dY   = dX[:, mask], dY[:, mask]
+
+# # Step 2: project design offsets to reduced space
+# dXr = X_r.T @ dX                # (r, n_s)
+
+# dists_from_x0 = np.linalg.norm(dX, axis=0)
+# local_idx = np.argsort(dists_from_x0)[:20]
+# dXr_local = dXr[:, local_idx]
+# dY_local = dY[:, local_idx]
+
+# # Step 3: snapshot kernel (already have this from POD)
+# K = dY_local.T @ (W[:, None] * dY_local)    # (n_s, n_s)
+
+# # Step 4: form the metric in reduced design space
+# A = dXr_local @ dXr_local.T                 # (r, r)
+# A_inv = np.linalg.pinv(A)       # use pinv for robustness
+# M = A_inv @ dXr_local @ K @ dXr_local.T @ A_inv   # (r, r)
+
+# M_norm = M * (M.shape[0] / np.trace(M))
+# M = M_norm
+
+# # Step 5: pairwise distances
+# def pullback_distance(xi, xj, X_r, M):
+#     d = X_r.T @ (xi - xj)       # (r,)
+#     return np.sqrt(d @ M @ d)
+
+
+
+# # ###
+# # from scipy.spatial.distance import cdist
+
+# # # Reduced coordinates for all points: shape (n_snapshots, r)
+# # Z = (X_r.T @ X).T
+
+# # # --- Euclidean distance matrix ---
+# # eucl_dist_matrix = cdist(X.T, X.T)  # (n_snapshots, n_snapshots)
+
+# # # --- Pullback distance matrix ---
+# # # d^T M d = ||L d||^2, where M = L L^T (via eigendecomposition for robustness)
+# # eigvals, eigvecs = np.linalg.eigh(M)
+# # eigvals = np.maximum(eigvals, 0)          # clip any negative numerics from pinv
+# # L = eigvecs * np.sqrt(eigvals)            # (r, r)
+# # Z_transformed = Z @ L                    # (n_snapshots, r)
+# # pullback_dist_matrix = cdist(Z_transformed, Z_transformed)  # (n_snapshots, n_snapshots)
+
+
+# # plt.pcolor(eucl_dist_matrix)
+# # plt.colorbar()
+# # plt.figure()
+# # plt.pcolor(pullback_dist_matrix)
+# # plt.colorbar()
+# # plt.show()
+
+
+Y = base_data
+W = weights
 
 ###
 from scipy.stats import spearmanr
@@ -312,7 +421,7 @@ for i in range(n):
         dy = Y[:, i] - Y[:, j]
 
         d_E.append(np.sqrt(dx @ dx))
-        d_P.append(np.sqrt(dx @ X_r @ M @ X_r.T @ dx))  # pullback in full space
+        d_P.append(np.sqrt(dx @ M @ dx))  # pullback in full space
         d_Y.append(np.sqrt(dy @ (W * dy)))               # W is diagonal, shape (n_y,)
 
 d_E, d_P, d_Y = np.array(d_E), np.array(d_P), np.array(d_Y)
@@ -345,7 +454,7 @@ DE = pairwise_distances(X.T, metric='euclidean')
 DP = np.zeros((n, n))
 for i in range(n):
     for j in range(i+1, n):
-        dx = X_r.T @ (X[:, i] - X[:, j])
+        dx = X[:, i] - X[:, j]
         DP[i, j] = DP[j, i] = np.sqrt(dx @ M @ dx)
 
 print(f"Euclidean NN state similarity: {nn_state_similarity(DE, Y, W):.4f}")
@@ -377,28 +486,28 @@ print(f"Pullback  LOO error: {loo_error(DP, Y, W):.4f}")
 
 
 
-####
-eigvals = np.linalg.eigvalsh(M)
-print("M eigenvalues:", eigvals[::-1])
-print("Condition number:", eigvals.max() / max(eigvals.min(), 1e-12))
-print("Trace of M:", np.trace(M))
-print("Euclidean scale (trace of I_r):", M.shape[0])
+# ####
+# eigvals = np.linalg.eigvalsh(M)
+# print("M eigenvalues:", eigvals[::-1])
+# print("Condition number:", eigvals.max() / max(eigvals.min(), 1e-12))
+# print("Trace of M:", np.trace(M))
+# print("Euclidean scale (trace of I_r):", M.shape[0])
 
-Jr = dY @ dXr.T @ np.linalg.pinv(dXr @ dXr.T)  # (n_y, r)
-Y_pred = Jr @ dXr                                 # (n_y, n_s)
-residuals = dY - Y_pred
-rel_error = np.linalg.norm(residuals) / np.linalg.norm(dY)
-print(f"Linear model relative error: {rel_error:.3f}")
+# Jr = dY @  np.linalg.pinv(dXr @ dXr.T)  # (n_y, r)
+# Y_pred = Jr @ dXr                                 # (n_y, n_s)
+# residuals = dY - Y_pred
+# rel_error = np.linalg.norm(residuals) / np.linalg.norm(dY)
+# print(f"Linear model relative error: {rel_error:.3f}")
 
-A = dXr @ dXr.T
-print("Condition number of A:", np.linalg.cond(A))
+# A = dXr @ dXr.T
+# print("Condition number of A:", np.linalg.cond(A))
 
 
 
 DR = np.zeros((n, n))
 for i in range(n):
     for j in range(i+1, n):
-        d = X_r.T @ (X[:, i] - X[:, j])
+        d = X[:, i] - X[:, j]
         DR[i, j] = DR[j, i] = np.sqrt(d @ d)
 
 rho_R, _ = spearmanr(DR[np.triu_indices(n,1)], d_Y)
