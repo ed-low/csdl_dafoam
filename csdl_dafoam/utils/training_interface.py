@@ -16,6 +16,7 @@ import matplotlib as mpl
 from scipy.spatial import distance
 from sklearn.neighbors import NearestNeighbors
 from warnings import warn
+from urllib.parse import quote, unquote
 
 from typing import TYPE_CHECKING, Dict, List, Tuple, Any
 if TYPE_CHECKING:
@@ -207,7 +208,7 @@ class TrainingDataInterface():
             # next primary, skip_h5_init is False and the file must be initialised normally.
             if not (is_first_resumed and skip_h5_init):
                 self.initialize_h5_file(h5file_path, primary_idx, compute_objective_grad=compute_objective_grad,
-                                        perturbation_dvs=perturbation_dvs if compute_perturbations else None)
+                                        perturbation_dvs=perturbation_dvs if compute_perturbations else None, perturbation_epsilon=perturbation_epsilon)
 
             if self.rank == 0 and self.gather_raw_files:
                 if is_first_resumed and skip_h5_init:
@@ -340,7 +341,7 @@ class TrainingDataInterface():
 
                     with h5py.File(h5file_path, "a", driver="mpio", comm=self.comm) as f:
                         for objective_idx, objective_var in enumerate(self.objectives):
-                            objective_name = objective_var.name if objective_var.name is not None else f"objective_{objective_idx}"
+                            objective_name = quote(objective_var.name , safe="")if objective_var.name is not None else f"objective_{objective_idx}"
                             for primary_var in self.primary_variables:
                                 dset = f["samples"]["gradients"][objective_name][primary_var.name]
                                 if rank  == 0:
@@ -550,7 +551,7 @@ class TrainingDataInterface():
 
     # region initialize_h5_file
     def initialize_h5_file(self, h5filepath:Path|str, primary_idx:int, compute_objective_grad:bool=False,
-                           perturbation_dvs:list=None):
+                           perturbation_dvs:list=None, perturbation_epsilon:float|Dict[Variable, float]=None):
         comm = self.comm
 
         # Global sizes across ranks
@@ -596,11 +597,11 @@ class TrainingDataInterface():
             if compute_objective_grad:
                 gradient_group  = sample_group.create_group("gradients")
                 for objective_idx, objective in enumerate(self.objectives):
-                    objective_name = objective.name if objective.name is not None else f"objective_{objective_idx}"
+                    objective_name = quote(objective.name, safe="") if objective.name is not None else f"objective_{objective_idx}"
                     if objective.name is None:
                         objective_name = f"objective_{objective_idx}"
                         warn(f"Rank {self.rank}: Found objective without name ({objective}). Saving as {objective_name}.")
-                    objective_group = gradient_group.create_group(objective_name)
+                    objective_group = gradient_group.create_group(objective_name) # Write the safe version of the name
                     
                     for primary_var in self.primary_variables:
                         objective_group.create_dataset(primary_var.name, (np.prod(primary_var.shape), adj_num_secondary_samples), dtype="f8")
@@ -650,7 +651,7 @@ class TrainingDataInterface():
                     non_sampled_var_group.create_dataset(var.name,          data=var.value,                         dtype="f8")
 
             if perturbation_dvs:
-                self._initialize_perturbation_group(f, perturbation_dvs, adj_num_secondary_samples)
+                self._initialize_perturbation_group(f, perturbation_dvs, adj_num_secondary_samples, perturbation_epsilon=perturbation_epsilon)
 
         self.print0('All set!')
 
@@ -1227,9 +1228,9 @@ class TrainingDataInterface():
     
 
     # region _compute_pod_modes
-    def _compute_pod_modes(self, h5filepath:Path, inner_product:str|None=None, centering:str|None='mean', scaling:str|None="reference", 
-                           write_h5:bool=True, new_h5_file:bool=True, overwrite_datasets:bool=False, new_file_suffix:str="modes", 
-                           write_modes_using_write_adjoint_fields:bool=True) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    def _compute_pod_modes(self, h5filepath:Path, inner_product:str|None=None, centering:str|None='mean', scaling:str|None="reference",
+                           write_h5:bool=True, new_h5_file:bool=True, overwrite_datasets:bool=False, new_file_suffix:str="modes",
+                           write_modes_using_write_adjoint_fields:bool=True) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         
         # Accepts either an h5 file path or a pre-loaded dict with keys "data" and "metadata"
         # (internal shortcut used by _leave_one_out_test; see * at end of file for expected structure)
@@ -1345,7 +1346,7 @@ class TrainingDataInterface():
                 self.dafoam_instance.solver.getOFMeshPoints(mesh)
                 self.dafoam_instance.solver.writeMeshPoints(mesh, solution_write_number)
 
-        return local_modes, reference_state, weights, scaling_values
+        return local_modes, singular_values, reference_state, weights, scaling_values
 
 
     # region _build_pod_inputs
@@ -1423,7 +1424,7 @@ class TrainingDataInterface():
 
             # --- Scaling ---
             # Options: None (ones), 'reference' (freestream patch averages), or a dict of scalars
-            # nuTilda is over-scaled by 1000x to reduce its contribution to POD mode energy.
+            # nuTilda is over-scaled by 100x to reduce its contribution to POD mode energy.
             # phi uses per-face reference values so that large-area faces don't dominate the inner
             # product via the A_face^3 effect (phi_f ~ rho*U*A_f, so a scalar rho*U normalization
             # leaves phi_normalized ~ A_f, and the face-area weighted norm picks up A_f^3).
@@ -1435,8 +1436,16 @@ class TrainingDataInterface():
                 reference_states = data_dict["reference_states"]
                 if state_var not in reference_states:
                     raise TypeError(f'Reference value not found for {state_var} in dataset during POD compute setup.')
-                if state_var == "nuTilda":
-                    scaling_values[state_var] = 1000 * reference_states[state_var][0]
+                if state_var == "p":
+                    # Scale by dynamic pressure q_inf = 0.5*rho*U^2 rather than absolute pressure p0.
+                    # p0 (~1e5 Pa) >> q_inf (~few kPa), so scaling by p0 makes pressure fluctuations
+                    # O(1e-3) in the scaled space, effectively invisible to the SVD and yielding near-
+                    # zero pressure representation in the POD basis — causing large lift/drag errors.
+                    rho_ref = reference_states["p"][0] / reference_states["T"][0] / 287.
+                    U_ref   = reference_states["U"][0]
+                    scaling_values[state_var] = 0.5 * rho_ref * U_ref**2
+                elif state_var == "nuTilda":
+                    scaling_values[state_var] = 100 * reference_states[state_var][0]
                 elif state_var == "phi":
                     # scaling_values["phi"] = rho_ref * U_ref * A_f_ref (per face, using reference
                     # snapshot face areas).  This is what the ROM uses for state reconstruction.
@@ -1533,7 +1542,7 @@ class TrainingDataInterface():
                 remaining_state[state_var]      = np.delete(state_data, read_index, axis=1)
                 supply_dict["data"]["states"]   = remaining_state
 
-            local_modes, reference_state, weights, scaling_values = self._compute_pod_modes(supply_dict, **pod_options, write_h5=False)
+            local_modes, _, reference_state, weights, scaling_values = self._compute_pod_modes(supply_dict, **pod_options, write_h5=False)
 
             '''
             For reference:
