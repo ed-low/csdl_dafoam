@@ -70,7 +70,7 @@ class BaseModel(ABC):
         # FOR SOLVER: called once before the Newton loop begins (after initial residual/basis setup).
         # Print any pre-solve diagnostics here (basis quality, scaling, etc.). No return value.
         if self.disable_presolve_diagnostics:
-            pass
+            return None
 
     # region iter_diagnostic_headers
     def iter_diagnostic_headers(self) -> list:
@@ -378,6 +378,7 @@ class DAFoamProjectionROMModel(BaseModel):
     def _project_and_reduce(self, distributed_val, fom_state=None):
         comm = self.comm
         m    = self.weights
+        
         Psi  = self._get_test_basis(fom_state)
 
         # Consider if the distributed value is a vector
@@ -492,7 +493,7 @@ class DAFoamProjectionROMModel(BaseModel):
     # region pre_solve_diagnostics
     def pre_solve_diagnostics(self, initial_rom_state: np.ndarray) -> None:
         if self.disable_presolve_diagnostics:
-            pass
+            return None
 
         W   = 72
         sep = "-" * W
@@ -627,7 +628,8 @@ class DAFoamGalerkinModel(DAFoamProjectionROMModel):
                  jac_fd_central:bool=True,
                  jac_mode:str="fd",
                  solution_leading_integer:int=1,
-                 solution_prefix:str|None=None
+                 solution_prefix:str|None=None,
+                 disable_presolve_diagnostics:bool=False
     ):
         super().__init__(
             dafoam_input_variables_group,
@@ -640,7 +642,8 @@ class DAFoamGalerkinModel(DAFoamProjectionROMModel):
             fd_step,
             jac_fd_central,
             solution_leading_integer,
-            solution_prefix
+            solution_prefix,
+            disable_presolve_diagnostics
         )
         
         self.jac_mode = jac_mode
@@ -713,7 +716,8 @@ class DAFoamLSPGModel(DAFoamProjectionROMModel):
                  fd_step:float=1e-6,
                  jac_fd_central:bool=True,
                  solution_leading_integer:int=1,
-                 solution_prefix:str|None=None
+                 solution_prefix:str|None=None,
+                 disable_presolve_diagnostics:bool=False
     ):
         super().__init__(
             dafoam_input_variables_group,
@@ -726,7 +730,8 @@ class DAFoamLSPGModel(DAFoamProjectionROMModel):
             fd_step,
             jac_fd_central,
             solution_leading_integer,
-            solution_prefix
+            solution_prefix,
+            disable_presolve_diagnostics
         )
         self._test_basis        = None
         self._freeze_test_basis = False
