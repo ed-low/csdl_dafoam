@@ -69,7 +69,6 @@ U0 = 100.0
 p0 = 101325.0
 T0 = 300.0
 nuTilda0 = 4.5e-5
-CL_target = 0.5
 aoa0 = 4.0
 A0 = 0.1
 # rho is used for normalizing CD and CL
@@ -78,8 +77,9 @@ rho0 = p0 / T0 / 287
 # Input parameters for DAFoam
 da_options = {
     "designSurfaces": ["wing"],
-    "solverName": "DARhoSimpleFoam",
+    "solverName": "DARhoSimpleCFoam",
     "primalMinResTol": 1.0e-8,
+    "primalVarBounds": {"pMin": 5000, "rhoMin": 0.05},
     "primalBC": {
         "U0": {"variable": "U", "patches": ["inout"], "value": [U0, 0.0, 0.0]},
         "p0": {"variable": "p", "patches": ["inout"], "value": [p0]},
@@ -155,14 +155,14 @@ mesh_options = {
 # region Training options
 # ===============================
 # Storage options
-dataset_keyword       = 'training_set_with_grad'
+dataset_keyword       = 'training_set_with_perturbations_300'
 storage_location      = dafoam_directory
 
 # Sampling options
 # grassmann_variables indicates the variables which correspond to points on the Grassmann manifold
 # snapshot_variables indicates the variables which correspond to "snapshots" or realizations
 num_grassmann_samples     = 2
-num_snapshot_samples      = 100
+num_snapshot_samples      = 300
 random_state_seed         = 0
 
 
@@ -279,9 +279,9 @@ ffd_block = construct_ffd_block_around_entities(entities=geometry,
 
 # region CSDL Variable declaration
 percent_change_in_thickness          = csdl.Variable(shape=(num_ffd_coefficients_chordwise, num_ffd_sections), value=0.) # (5,2)
-percent_change_in_thickness_dof      = csdl.Variable(shape=(num_ffd_coefficients_chordwise-2,), value=5*np.array([0, 0, 0]), name="normalized_thickness_dof") 
+percent_change_in_thickness_dof      = csdl.Variable(shape=(num_ffd_coefficients_chordwise-2,), value=np.array([0, 0, 0]), name="percent_change_in_thickness_dof") 
 normalized_percent_camber_change     = csdl.Variable(shape=(num_ffd_coefficients_chordwise, num_ffd_sections),  value=0.)
-normalized_percent_camber_change_dof = csdl.Variable(shape=(num_ffd_coefficients_chordwise-2,), value=5*np.array([0, 0, 0]), name="normalized_camber_dof")
+normalized_percent_camber_change_dof = csdl.Variable(shape=(num_ffd_coefficients_chordwise-2,), value=np.array([0, 0, 0]), name="normalized_percent_camber_change_dof")
 
 # ffd_block.plot()
 ffd_sectional_parameterization = VolumeSectionalParameterization(
@@ -328,7 +328,8 @@ i0, i1          = x_surf_dafoam_initial_indices[rank]
 
 # Flight condition variables
 flight_conditions_group                     = csdl.VariableGroup()
-flight_conditions_group.mach_number         = csdl.Variable(value=0.2941176471,      name="mach_number")
+flight_conditions_group.mach_number         = csdl.Variable(value=0.2938635415,      name="mach_number")
+flight_conditions_group.airspeed_m_s        = csdl.Variable(value=U0,                name="airspeed_m_s")
 flight_conditions_group.angle_of_attack_deg = csdl.Variable(value=0,                 name="angle_of_attack_deg")
 flight_conditions_group.altitude_m          = csdl.Variable(value=0.,                name="altitude (m)")
 
@@ -577,57 +578,57 @@ data_generator.run_sweep(pod_options={"centering":"reference", "write_modes_usin
 
 
 
-# local_mode_computed, reference_state, weights_computed, scaling_values = data_generator._compute_pod_modes(Path(dafoam_directory)/dataset_keyword/"point_0.h5", 
-#                                   inner_product="reference", 
-#                                   centering='reference', 
-#                                   scaling="reference", 
-#                                   write_h5=True, 
-#                                   new_h5_file=True, 
-#                                   new_file_suffix="modes", 
-#                                   write_modes_using_write_adjoint_fields=False)
+local_mode_computed, reference_state, weights_computed, scaling_values = data_generator._compute_pod_modes(Path(dafoam_directory)/dataset_keyword/"point_0.h5",
+                                  inner_product="reference",
+                                  centering='reference',
+                                  scaling="reference",
+                                  write_h5=True,
+                                  new_h5_file=False,
+                                  new_file_suffix="modes",
+                                  write_modes_using_write_adjoint_fields=False)
 
-# data = data_generator.load_h5(Path(storage_location)/dataset_keyword/"point_0.h5", only_distributed_data=False)
+data = data_generator.load_h5(Path(storage_location)/dataset_keyword/"point_0.h5", only_distributed_data=False)
 
-# local_mode_read = data["pod"]["modes"]
+local_mode_read = data["pod"]["modes"]
 
-# weights_read = data["pod"]["weights"]
+weights_read = data["pod"]["weights"]
 
 
-# indices      = np.concatenate(comm.allgather(data_generator.face_global_indices), axis=0)
-# mode_compute = np.concatenate(comm.allgather(local_mode_computed["phi"][:, 0]), axis=0)
-# mode_read    = np.concatenate(comm.allgather(local_mode_read["phi"][:, 0]), axis=0)
+indices      = np.concatenate(comm.allgather(data_generator.face_global_indices), axis=0)
+mode_compute = np.concatenate(comm.allgather(local_mode_computed["phi"][:, 0]), axis=0)
+mode_read    = np.concatenate(comm.allgather(local_mode_read["phi"][:, 0]), axis=0)
 
-# indices_abs = np.abs(indices) - 1
-# indices_neg = indices < 0
-# sign_mask   = np.ones_like(indices_abs)
-# sign_mask[indices_neg] = -1
+indices_abs = np.abs(indices) - 1
+indices_neg = indices < 0
+sign_mask   = np.ones_like(indices_abs)
+sign_mask[indices_neg] = -1
 
-# import matplotlib.pyplot as plt
+import matplotlib.pyplot as plt
 
-# if rank == 0:
-#     plt.scatter(indices_abs, mode_compute, label='Computed, abs')
-#     plt.scatter(indices_abs[indices_neg], mode_compute[indices_neg], marker='x', label='Computed, negated boundaries')
-#     plt.scatter(indices_abs, mode_read, marker='+', label='Read, abs')
-#     plt.scatter(indices_abs[indices_neg], mode_read[indices_neg], marker='x', label='Read, negated boundaries')
-#     plt.legend()
-#     plt.ylabel("phi")
+if rank == 0:
+    plt.scatter(indices_abs, mode_compute, label='Computed, abs')
+    plt.scatter(indices_abs[indices_neg], mode_compute[indices_neg], marker='x', label='Computed, negated boundaries')
+    plt.scatter(indices_abs, mode_read, marker='+', label='Read, abs')
+    plt.scatter(indices_abs[indices_neg], mode_read[indices_neg], marker='x', label='Read, negated boundaries')
+    plt.legend()
+    plt.ylabel("phi")
     
-#     plt.figure()
-#     plt.scatter(range(mode_compute.size), mode_compute, marker='x', label='compute')
-#     plt.scatter(range(mode_read.size), mode_read, marker='+', label='read')
+    plt.figure()
+    plt.scatter(range(mode_compute.size), mode_compute, marker='x', label='compute')
+    plt.scatter(range(mode_read.size), mode_read, marker='+', label='read')
     
-#     diff_greater_than_tol = np.abs(mode_compute - mode_read) > 1e-12
+    diff_greater_than_tol = np.abs(mode_compute - mode_read) > 1e-12
 
-#     plt.scatter(np.where(diff_greater_than_tol), mode_compute[diff_greater_than_tol], marker='.', label='marked errors')
-#     plt.legend()
+    plt.scatter(np.where(diff_greater_than_tol), mode_compute[diff_greater_than_tol], marker='.', label='marked errors')
+    plt.legend()
 
     
 
-#     plt.figure()
-#     plt.scatter(range(mode_read[indices_neg].size), mode_compute[indices_neg]/mode_read[indices_neg])
+    plt.figure()
+    plt.scatter(range(mode_read[indices_neg].size), mode_compute[indices_neg]/mode_read[indices_neg])
 
-#     plt.show()
-# quiet_barrier(comm)
+    plt.show()
+quiet_barrier(comm)
 
 
 

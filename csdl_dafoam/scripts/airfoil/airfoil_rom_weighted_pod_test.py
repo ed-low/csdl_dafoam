@@ -473,8 +473,10 @@ with csdl.experimental.mpi.enter_mpi_region(rank, comm) as mpi_region:
     from csdl_dafoam.utils.custom_explicit_reduced_svd import customExplicitReducedSVD
     import matplotlib.pyplot as plt
 
-    snapshots       = np.array(np.concatenate([data["samples"]["states"][state_var]         for state_var in state_info.keys()], axis=0))[:, 1:]
     s_vals          = data["pod"]["singular_values"]#[:n_modes]
+    snapshots       = np.zeros((n_local_states, s_vals.shape[0]))
+    for state_var, info in state_info.items():
+        snapshots[info["indices"], :] = data["samples"]["states"][state_var][:, 1:]
     snapshot_configs = np.array(np.concatenate([data["parameters"]["secondary_variables"]["%_camber_change"], data["parameters"]["secondary_variables"]["%_thickness_change"]], axis=1))[1:, :]
     current_config  = csdl.concatenate((normalized_percent_camber_change_dof, percent_change_in_thickness_dof), axis=0)
 
@@ -880,7 +882,7 @@ for i in range(num_samples_with_ref):
         min_diff = comm.allreduce(min(diff), op=MPI.MIN)
         max_err  = comm.allreduce(max(err), op=MPI.MAX)
         min_err  = comm.allreduce(min(err), op=MPI.MIN)
-        err_norm = np.sqrt(comm.allreduce(sum(diff ** 2), op=MPI.SUM)) / np.sqrt(comm.allreduce(sum(fom_var_state ** 2), op=MPI.SUM))
+        err_norm = np.sqrt(comm.allreduce(np.sum(diff ** 2), op=MPI.SUM)) / np.sqrt(comm.allreduce(np.sum(fom_var_state ** 2), op=MPI.SUM))
 
         diff_w     = np.abs(fom_var_state - rom_w_var_state)
         err_w      = diff_w / np.abs(fom_var_state)
@@ -889,7 +891,7 @@ for i in range(num_samples_with_ref):
         min_diff_w = comm.allreduce(min(diff_w), op=MPI.MIN)
         max_err_w  = comm.allreduce(max(err_w), op=MPI.MAX)
         min_err_w  = comm.allreduce(min(err_w), op=MPI.MIN)
-        err_norm_w = np.sqrt(comm.allreduce(sum(diff_w ** 2), op=MPI.SUM)) / np.sqrt(comm.allreduce(sum(fom_var_state ** 2), op=MPI.SUM))
+        err_norm_w = np.sqrt(comm.allreduce(np.sum(diff_w ** 2), op=MPI.SUM)) / np.sqrt(comm.allreduce(np.sum(fom_var_state ** 2), op=MPI.SUM))
 
         diag_dict["max_diff"]["weighted"][state_var][i]    = max_diff_w
         diag_dict["max_err"]["weighted"][state_var][i]     = max_err_w
