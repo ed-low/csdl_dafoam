@@ -2,85 +2,75 @@
 # region PACKAGES
 # ===============================
 import numpy as np
-import sys
 import os
-import time
 import pickle
 from pathlib import Path
 
-# MPI
 from mpi4py import MPI
 
-# CSDL packages
 import csdl_alpha as csdl
 import lsdo_geo
 
-# LSDO_geo specific
 from lsdo_geo.core.parameterization.free_form_deformation_functions import construct_ffd_block_around_entities
 from lsdo_geo.core.parameterization.volume_sectional_parameterization import (
     VolumeSectionalParameterization,
     VolumeSectionalParameterizationInputs
 )
 
-# Optimization
-from modopt import CSDLAlphaProblem
-from modopt import PySLSQP, OpenSQP, InteriorPoint
-
-# IDWarp and DAFoam
 from csdl_dafoam.core.csdl_idwarp import DAFoamMeshWarper
 from csdl_dafoam.core.csdl_dafoam import instantiateDAFoam, DAFoamFunctions, DAFoamSolver, compute_dafoam_input_variables
 from csdl_dafoam.utils.training_interface import TrainingDataInterface
 import csdl_dafoam.utils.standard_atmosphere_model as sam
 from csdl_dafoam.utils.runscript_helper_functions import *
+from csdl_dafoam.utils.interpolation import RBFInterpolator
+from csdl_dafoam.utils.custom_explicit_reduced_svd import customExplicitReducedSVD
+from csdl_dafoam.core.rom.csdl_rom import CSDLROMWrapper
+from csdl_dafoam.core.rom.rom_models import DAFoamLSPGModel
+from csdl_dafoam.core.rom.rom_solver import BroydenNewtonSolver
 
-#---- DEBUGGING TOOLS ----
+from scipy.spatial.distance import cdist
+from scipy.stats import spearmanr
+import matplotlib.pyplot as plt
+
 import faulthandler
 faulthandler.enable()
 os.environ["PETSC_OPTIONS"] = "-malloc_debug"
-#-------------------------
 
-# Write this runscript to file before anything
 print_runscript_info()
+
 
 # ===============================
 # region USER INPUT
 # ===============================
-# Keyword for optimization name (optimization results folder will be saved with this name in dafoam directory)
-problem_name              = 'training_data' #'rom_with_interpolation_comparison'
+problem_name              = 'training_data'
 
-# Geometry
-geometry_directory        =  os.path.join(os.getcwd(), 'airfoil_geometry/')
+geometry_directory        = os.path.join(os.getcwd(), 'airfoil_geometry/')
 stp_file_name             = 'airfoil_transonic_unitspan_2.stp'
 geometry_pickle_file_name = 'airfoil_stored_refit.pickle'
 
-# MPI and timing
 comm           = MPI.COMM_WORLD
-TIMING_ENABLED = True  # True if we want timing printed for the CSDL operations
+TIMING_ENABLED = True
 
-# DAFoam
-dafoam_directory = os.path.join(os.getcwd(), f'results/{problem_name}/')
+dafoam_directory    = os.path.join(os.getcwd(), f'results/{problem_name}/')
 dafoamPrintInterval = 100
 
-# Initial/reference values for DAFoam (best to use base conditions)
-U0        = 100.08596673909351         # used for normalizing CD and CL
-p0        = 101325
-T0        = 288.150
-nuTilda0  = 0.0000181206
-aoa0      = 1.416e-1
-A0        = 0.1           #
-rho0      = p0 / T0 / 287 # used for normalizing CD and CL
+U0       = 100.08596673909351
+p0       = 101325
+T0       = 288.150
+nuTilda0 = 0.0000181206
+A0       = 0.1
+rho0     = p0 / T0 / 287
 
-# Input parameters for DAFoam
 da_options = {
     "designSurfaces": ["wing"],
     "solverName": "DARhoSimpleCFoam",
     "primalMinResTol": 1.0e-8,
     "primalVarBounds": {"pMin": 5000, "rhoMin": 0.05},
     "primalBC": {
-        "U0": {"variable": "U", "patches": ["inout"], "value": [U0, 0.0, 0.0]},
-        "p0": {"variable": "p", "patches": ["inout"], "value": [p0]},
-        "T0": {"variable": "T", "patches": ["inout"], "value": [T0]},
-        "nuTilda0": {"variable": "nuTilda", "patches": ["inout"], "value": [nuTilda0]},
+        "U0":       {"variable": "U",        "patches": ["inout"], "value": [U0, 0.0, 0.0]},
+        "p0":       {"variable": "p",        "patches": ["inout"], "value": [p0]},
+        "T0":       {"variable": "T",        "patches": ["inout"], "value": [T0]},
+        "nuTilda0": {"variable": "nuTilda",  "patches": ["inout"], "value": [nuTilda0]},
         "useWallFunction": True,
     },
     "function": {
@@ -90,7 +80,7 @@ da_options = {
             "patches": ["wing"],
             "directionMode": "parallelToFlow",
             "patchVelocityInputName": "patch_velocity",
-            "scale": 1.0, #1.0 / (0.5 * U0 * U0 * A0 * rho0),
+            "scale": 1.0,
         },
         "lift": {
             "type": "force",
@@ -98,22 +88,21 @@ da_options = {
             "patches": ["wing"],
             "directionMode": "normalToFlow",
             "patchVelocityInputName": "patch_velocity",
-            "scale": 1.0, #1.0 / (0.5 * U0 * U0 * A0 * rho0),
+            "scale": 1.0,
         },
     },
     "adjEqnOption": {"gmresRelTol": 1.0e-6, "pcFillLevel": 1, "jacMatReOrdering": "rcm", "useNonZeroInitGuess": False},
-    # transonic preconditioner to speed up the adjoint convergence
     "transonicPCOption": 1,
     "normalizeStates": {
-        "U": U0,
-        "p": p0,
-        "T": T0,
+        "U":       U0,
+        "p":       p0,
+        "T":       T0,
         "nuTilda": nuTilda0 * 10.0,
-        "phi": 1.0,
+        "phi":     1.0,
     },
     "inputInfo": {
         "aero_vol_coords": {
-            "type": "volCoord", 
+            "type": "volCoord",
             "components": ["solver", "function"],
         },
         "patch_velocity": {
@@ -144,129 +133,347 @@ da_options = {
     "printInterval": dafoamPrintInterval
 }
 
-# region Mesh options
 mesh_options = {
     "gridFile": dafoam_directory,
     "fileType": "OpenFOAM",
     "symmetryPlanes": [],
 }
 
+dataset_keyword  = "training_set_with_perturbations_300" #'training_set_with_grad' #
+storage_location = Path(dafoam_directory)
 
-# ===============================
-# region Training data options
-# ===============================
-# Storage options
-dataset_keyword       = 'training_set_with_grad' #'training_set1'
-storage_location      = Path(dafoam_directory)
+# ROM / metric optionss
+n_retained_modes   = 20
+alpha_reg          = 0.1    # regularization strength added to normalized pullback metrics
+COMPUTE_PROJ_ERROR = True  # set True to also record projection errors per metric
+num_samples        = 5      # LHS test points (reference point always prepended)
+
+# Distance metrics used for RBF snapshot weighting.
+# Each metric defines a different coordinate transform L such that
+# d_metric(xi, xj) = ||L^T (xi - xj)||_2.
+METRIC_NAMES = ["unweighted", "euclidean", "pullback", "pullback_red"] #"pullback_reg", "pullback_red", "pullback_red_reg"]
 
 
 # ===============================
 # region SETUP
 # ===============================
-# MPI information
 rank      = comm.Get_rank()
 comm_size = comm.Get_size()
-rank_str  = f"{rank:0{len(str(comm_size-1))}d}" # string with zero-padded rank index (for prints)
+rank_str  = f"{rank:0{len(str(comm_size-1))}d}"
 
+dafoam_instance     = instantiateDAFoam(da_options, comm, dafoam_directory, mesh_options)
+dafoam_instance_rom = instantiateDAFoam(da_options, comm, dafoam_directory, mesh_options)
 
-# region DAFoam instance
-dafoam_instance              = instantiateDAFoam(da_options, comm, dafoam_directory, mesh_options)
-dafoam_instance_rom          = instantiateDAFoam(da_options, comm, dafoam_directory, mesh_options)
-dafoam_instance_rom_weighted = instantiateDAFoam(da_options, comm, dafoam_directory, mesh_options)
-x_surf_dafoam_initial_mpi    = dafoam_instance.getSurfaceCoordinates()
-x_vol_dafoam_initial_mpi     = dafoam_instance.xv0
+# All metric variants share one ROM instance — CSDL inline evaluation is sequential,
+# so only one ROM solve is active at a time.  The solution_prefix differentiates
+# each variant's OpenFOAM output directories.
+dafoam_instances_rom = {name: dafoam_instance_rom for name in METRIC_NAMES}
 
-local_n_surf  = x_surf_dafoam_initial_mpi.shape[0]
-local_n_vol   = x_vol_dafoam_initial_mpi.shape[0]
+x_surf_dafoam_initial_mpi = dafoam_instance.getSurfaceCoordinates()
+x_vol_dafoam_initial_mpi  = dafoam_instance.xv0
 
-# Gathering surface mesh to rank 0 (need to do this to avoid 'no-element' ranks in the projection
-# and geometry evaluation functions)
-(x_surf_dafoam_initial, 
-x_surf_dafoam_initial_size,
-x_surf_dafoam_initial_indices) = gather_array_to_rank0(x_surf_dafoam_initial_mpi, comm)
+(x_surf_dafoam_initial,
+ x_surf_dafoam_initial_size,
+ x_surf_dafoam_initial_indices) = gather_array_to_rank0(x_surf_dafoam_initial_mpi, comm)
 
-# Get hash for surface mesh projection file read/write (broadcast to other ranks)
 if rank == 0:
     x_surf_hash = hash_array_tol(x_surf_dafoam_initial, tol=1e-8)
 else:
     x_surf_hash = None
-
 x_surf_hash = comm.bcast(x_surf_hash, root=0)
 
-# region File paths
-geometry_pickle_file_path         = Path(geometry_directory)/geometry_pickle_file_name
-stp_file_path                     = Path(geometry_directory)/stp_file_name
-surface_mesh_projection_file_path = Path(dafoam_directory)/f'projected_surface_mesh_{x_surf_hash}.pickle'
+geometry_pickle_file_path         = Path(geometry_directory) / geometry_pickle_file_name
+stp_file_path                     = Path(geometry_directory) / stp_file_name
+surface_mesh_projection_file_path = Path(dafoam_directory) / f'projected_surface_mesh_{x_surf_hash}.pickle'
 
-# POD Data import
-data_generator = TrainingDataInterface(dafoam_instance=dafoam_instance, 
-                                        storage_location=storage_location, 
-                                        dataset_keyword=dataset_keyword,
-                                        h5_file_base_name="point")
 
-# Manually obtaining the file for now
-data = data_generator.load_h5(Path(storage_location)/dataset_keyword/"point_0.h5", only_distributed_data=False)
+h5_path = Path(storage_location) / dataset_keyword / "point_0.h5"
+
+# import h5py
+# with h5py.File(h5_path, "r+") as f:
+#     grp = f["perturbations"]
+#     grp.move("normalized_camber_dof", "normalized_percent_camber_change_dof")
+#     grp.move("normalized_thickness_dof", "percent_change_in_thickness_dof")
+#     print("Renamed datasets:", list(grp.keys()))
+
+data_generator = TrainingDataInterface(
+    dafoam_instance=dafoam_instance,
+    storage_location=storage_location,
+    dataset_keyword=dataset_keyword,
+    h5_file_base_name="point"
+)
+data        = data_generator.load_h5(Path(storage_location) / dataset_keyword / "point_0.h5", only_distributed_data=False)
+state_info  = data_generator.state_info
+n_snapshots = data["samples"]["converged"].size
+if rank == 0:
+    n_pod_modes = data["pod"]["singular_values"].shape[0]
+    print(f"\n  Training snapshots (incl. reference): {n_snapshots}")
+    print(f"  POD modes available:                  {n_pod_modes}")
+    print(f"  Effective rank of snapshot matrix:    {n_snapshots - 1}  (reference excluded)")
+    print(f"  n_retained_modes:                     {n_retained_modes}")
+
+
+# ===============================
+# region PULLBACK METRIC COMPUTATION
+# ===============================
+def read_snapshots_into_state_format(states_dset, state_info, n_columns):
+    n_local = dafoam_instance.getNLocalAdjointStates()
+    out = np.zeros((n_local, n_columns)) if n_columns > 1 else np.zeros((n_local,))
+    for state_var, info in state_info.items():
+        idx = info["indices"]
+        if n_columns > 1:
+            out[idx, :] = states_dset[state_var]
+        else:
+            out[idx] = states_dset[state_var]
+    return out
+
+
+base_data = read_snapshots_into_state_format(data["samples"]["states"], state_info, n_snapshots)
+weights   = read_snapshots_into_state_format(data["pod"]["weights"], state_info, 1)
+
+# FD Jacobians from perturbation data (one (n_local, n_snapshots) array per DV DOF)
+eps    = 1e-6
+J_list = []
+for dv_key, dv_group in data["perturbations"].items():
+    if dv_key in ("_attrs", "angle_of_attack_deg"):
+        continue
+    for dof_key, dof_group in dv_group.items():
+        if dof_key == "_attrs":
+            continue
+        perturbed = read_snapshots_into_state_format(dof_group["states"], state_info, n_snapshots)
+        J_list.append((1.0 / eps) * (perturbed - base_data))
+
+n_dv = len(J_list)
+
+# FD signal-level diagnostic
+delta_sq_local = np.zeros((n_dv, n_snapshots))
+for j, J_dv in enumerate(J_list):
+    delta_sq_local[j] = np.sum((eps * J_dv) ** 2, axis=0)
+delta_sq    = comm.allreduce(delta_sq_local, op=MPI.SUM)
+delta_norms = np.sqrt(delta_sq)
+
+JtJ_local = np.zeros((n_dv, n_dv))
+for i in range(n_snapshots):
+    cols      = np.stack([J_list[j][:, i] for j in range(n_dv)], axis=1)
+    col_norms = np.linalg.norm(cols, axis=0, keepdims=True) + 1e-300
+    JtJ_local += (cols / col_norms).T @ (cols / col_norms)
+JtJ = comm.allreduce(JtJ_local, op=MPI.SUM) / n_snapshots
+
+n_adj_total = comm.allreduce(dafoam_instance.getNLocalAdjointStates(), op=MPI.SUM)
+if rank == 0:
+    print("=== FD Signal-Level Diagnostic ===")
+    print(f"  eps: {eps:.2e},  n_dof: {n_adj_total}")
+    for j in range(n_dv):
+        lo, med, hi = np.percentile(delta_norms[j], [10, 50, 90])
+        print(f"    DV {j}: p10={lo:.2e}  median={med:.2e}  p90={hi:.2e}")
+    print(f"  Off-diagonal cosine mean: {(JtJ.sum() - np.trace(JtJ)) / (n_dv * (n_dv - 1)):.3f}")
+
+# Full pullback metric M = (1/n) sum_i J_i^T diag(w) J_i
+n_local_states = dafoam_instance.getNLocalAdjointStates()
+M            = np.zeros((n_dv, n_dv))
+M_unweighted = np.zeros((n_dv, n_dv))
+J_loc        = np.zeros((n_local_states, n_dv))
+
+for i in range(n_snapshots):
+    for j, J_dv in enumerate(J_list):
+        J_loc[:, j] = J_dv[:, i]
+    M            += J_loc.T @ (weights[:, None] * J_loc)
+    M_unweighted += J_loc.T @ J_loc
+
+M            = comm.allreduce(M,            op=MPI.SUM) / n_snapshots
+M_unweighted = comm.allreduce(M_unweighted, op=MPI.SUM) / n_snapshots
+
+# Reduced pullback metric via POD Gram matrix (cheap: n_snapshots x n_snapshots)
+sqrt_W    = np.sqrt(weights)
+Y_w       = sqrt_W[:, None] * base_data
+gram_loc  = Y_w.T @ Y_w
+gram      = comm.allreduce(gram_loc, op=MPI.SUM)
+
+eigvals_g, V_g = np.linalg.eigh(gram)
+order          = np.argsort(eigvals_g)[::-1]
+eigvals_g      = np.maximum(eigvals_g[order], 0.0)
+V_g            = V_g[:, order]
+
+sigma_r   = np.sqrt(eigvals_g[:n_retained_modes])
+Phi_w_loc = Y_w @ V_g[:, :n_retained_modes] / sigma_r[None, :]   # (n_local, n_retained_modes), W-orthonormal
+
+M_red    = np.zeros((n_dv, n_dv))
+J_full_i = np.zeros((n_local_states, n_dv))
+for i in range(n_snapshots):
+    for j, J_dv in enumerate(J_list):
+        J_full_i[:, j] = J_dv[:, i]
+    WJ_local  = sqrt_W[:, None] * J_full_i
+    J_red_loc = Phi_w_loc.T @ WJ_local
+    J_red_i   = comm.allreduce(J_red_loc, op=MPI.SUM)
+    M_red    += J_red_i.T @ J_red_i
+M_red /= n_snapshots
+
+# Gradient-based metric (optional, only if gradients stored in h5)
+has_gradients = "gradients" in data["samples"] and "-L/D" in data["samples"].get("gradients", {})
+if rank == 0 and has_gradients:
+    grad_cols = [
+        np.asarray(val)
+        for var_name, val in data["samples"]["gradients"]["objective_0"].items()
+        if var_name not in ("_attrs", "angle_of_attack_deg")
+    ]
+    G_mat  = np.stack(grad_cols, axis=0)   # (n_dv, n_snapshots)
+    M_grad = (G_mat @ G_mat.T) / n_snapshots
+else:
+    if rank == 0 and not has_gradients:
+        print("Note: no gradients in h5 — skipping gradient-based metric.")
+    M_grad = None
+M_grad = comm.bcast(M_grad, root=0)
+
+# Normalize (trace = n_dv) and regularize
+def normalize_metric(M_in, n):
+    return M_in * (n / np.trace(M_in))
+
+M_norm     = normalize_metric(M,     n_dv)
+M_red_norm = normalize_metric(M_red, n_dv)
+M_reg      = M_norm     + alpha_reg * np.eye(n_dv)
+M_red_reg  = M_red_norm + alpha_reg * np.eye(n_dv)
+
+# Coordinate transform L such that d_metric(xi, xj) = ||L^T (xi - xj)||_2
+# For metric M = V diag(lambda) V^T, L = V diag(sqrt(lambda)).
+def metric_to_L(M_mat):
+    eigvals, eigvecs = np.linalg.eigh(M_mat)
+    return eigvecs * np.sqrt(np.maximum(eigvals, 0.0))   # (n_dv, n_dv)
+
+metric_L = {
+    "unweighted":      None,
+    "euclidean":       np.eye(n_dv),
+    "pullback":        metric_to_L(M_norm),
+    "pullback_reg":    metric_to_L(M_reg),
+    "pullback_red":    metric_to_L(M_red_norm),
+    "pullback_red_reg": metric_to_L(M_red_reg),
+}
+
+if rank == 0:
+    print(f"\n=== Metric eigenspectra (normalized, alpha_reg={alpha_reg}) ===")
+    named_metrics = {
+        "Pullback (W=vol)": M_norm,
+        "Pullback (W=I)":   normalize_metric(M_unweighted, n_dv),
+        "Pullback-reduced": M_red_norm,
+    }
+    if M_grad is not None:
+        named_metrics["Pullback-grad"] = normalize_metric(M_grad, n_dv)
+    for name, Mm in named_metrics.items():
+        ev  = np.linalg.eigvalsh(Mm)[::-1]
+        dom = np.linalg.eigh(Mm)[1][:, -1]
+        print(f"  {name}:  cond={ev[0]/max(ev[-1], 1e-300):.2e}  dom={np.array2string(dom, precision=3)}")
+
+
+# ===============================
+# region METRIC EVALUATION (no ROM)
+# ===============================
+# Parameter matrix: shape (n_snapshots, n_dv)
+snapshot_configs_full = np.concatenate([
+    data["parameters"]["secondary_variables"]["normalized_percent_camber_change_dof"],
+    data["parameters"]["secondary_variables"]["percent_change_in_thickness_dof"]
+], axis=1)   # (n_snapshots, n_dv)
+
+
+def make_dist_matrix(L_mat, X_ns_nv):
+    """Pairwise distances under the metric defined by L: d(xi,xj) = ||L^T(xi-xj)||."""
+    Z = X_ns_nv @ L_mat   # (n_snapshots, n_dv)
+    return cdist(Z, Z)
+
+
+D_metrics = {name: make_dist_matrix(metric_L[name], snapshot_configs_full) if name != "unweighted" else None for name in METRIC_NAMES}
+
+# State-space pairwise distances via W-weighted Gram matrix (distributed)
+WY      = weights[:, None] * base_data
+G_local = base_data.T @ WY
+G_state = comm.allreduce(G_local, op=MPI.SUM)
+diag_G  = np.diag(G_state)
+D_state = np.sqrt(np.maximum(diag_G[:, None] + diag_G[None, :] - 2 * G_state, 0.0))
+
+
+def loo_knn_error(D_design, Y_local, W_local, comm, k=5):
+    """Mean W-norm LOO error: predict each state from its k-NN average."""
+    total = 0.0
+    for i in range(D_design.shape[0]):
+        row    = D_design[i].copy(); row[i] = np.inf
+        nn_idx = np.argsort(row)[:k]
+        y_pred = np.mean(Y_local[:, nn_idx], axis=1)
+        diff   = Y_local[:, i] - y_pred
+        total += np.sqrt(comm.allreduce(np.sum(W_local * diff ** 2), op=MPI.SUM))
+    return total / D_design.shape[0]
+
+
+def loo_kernel_error(D_design, Y_local, W_local, comm, sigma=None):
+    """Mean W-norm LOO error: predict each state with Gaussian kernel weights."""
+    if sigma is None:
+        sigma = np.median(D_design[D_design > 0])
+    total = 0.0
+    for i in range(D_design.shape[0]):
+        row    = D_design[i].copy(); row[i] = np.inf
+        kw     = np.exp(-row ** 2 / (2 * sigma ** 2)); kw /= kw.sum()
+        y_pred = Y_local @ kw
+        diff   = Y_local[:, i] - y_pred
+        total += np.sqrt(comm.allreduce(np.sum(W_local * diff ** 2), op=MPI.SUM))
+    return total / D_design.shape[0]
+
+
+def per_point_spearman(D_design, D_state_mat):
+    n    = D_design.shape[0]
+    rhos = []
+    for i in range(n):
+        mask = np.ones(n, bool); mask[i] = False
+        r, _ = spearmanr(D_design[i, mask], D_state_mat[i, mask])
+        if not np.isnan(r):
+            rhos.append(r)
+    return np.mean(rhos), np.std(rhos)
+
+
+err_knn         = {name: loo_knn_error   (D_metrics[name], base_data, weights, comm) if name != "unweighted" else 0 for name in METRIC_NAMES}
+err_kern        = {name: loo_kernel_error(D_metrics[name], base_data, weights, comm) if name != "unweighted" else 0 for name in METRIC_NAMES}
+upper_tri       = np.triu_indices(n_snapshots, k=1)
+spearman_global = {name: spearmanr(D_metrics[name][upper_tri], D_state[upper_tri])[0] if name != "unweighted" else 0 for name in METRIC_NAMES}
+spearman_pp     = {name: per_point_spearman(D_metrics[name], D_state) if name != "unweighted" else (0, 0) for name in METRIC_NAMES}
+
+if rank == 0:
+    print("\n=== Distance Metric Evaluation (no ROM) ===")
+    print(f"  {'Metric':<22} {'LOO-kNN':>12} {'LOO-kernel':>12} {'Spearman-global':>16} {'Spearman-pp':>14}")
+    for name in METRIC_NAMES:
+        mu, sd = spearman_pp[name]
+        print(f"  {name:<22} {err_knn[name]:>12.4e} {err_kern[name]:>12.4e} "
+              f"{spearman_global[name]:>16.4f} {mu:>10.4f}±{sd:.4f}")
 
 
 # ===============================
 # region CSDL RECORDER
 # ===============================
-# recorder 
 recorder = csdl.Recorder(inline=True, debug=True)
 recorder.start()
 
+geometry = lsdo_geo.import_geometry(stp_file_path, parallelize=False)
 
-geometry = lsdo_geo.import_geometry(stp_file_path,
-                                    parallelize=False)
-
-
-# region Surface mesh projection
-# Now do we do the same check for the surface mesh projection
+# Surface mesh projection (cached to pickle)
 if surface_mesh_projection_file_path.is_file():
     if rank == 0:
         print('Found surface mesh projection pickle!')
     projected_surf_mesh_dafoam = read_simple_pickle(surface_mesh_projection_file_path)
-
 else:
     if rank == 0:
         print(f'No projected surface mesh file found at {surface_mesh_projection_file_path}')
         try:
-            # ORIGINAL CODE
-            # with Timer('projecting on surface mesh'):
-            #     projected_surf_mesh_dafoam = geometry.project(
-            #         x_surf_dafoam_initial, 
-            #         grid_search_density_parameter = 1,      # 1     (ORIGINAL)
-            #         projection_tolerance          = 1e-4,   #1.e-3m (ORIGINAL)
-            #         grid_search_density_cutoff    = 50,     # 20    (ORIGINAL) 50
-            #         force_reprojection            = False,
-            #         plot                          = False    # UCSD_LAB
-            #     )
-
-            # Debugging/timing
-            import cProfile
-            import pstats
-            with cProfile.Profile() as pr:
+            with Timer('projecting on surface mesh'):
                 projected_surf_mesh_dafoam = geometry.project(
-                    x_surf_dafoam_initial, 
-                    grid_search_density_parameter = 1,      # 1     (ORIGINAL)
-                    projection_tolerance          = 1e-10,   #1.e-3m (ORIGINAL)
-                    grid_search_density_cutoff    = 50,     # 20    (ORIGINAL) 50
-                    force_reprojection            = False,
-                    plot                          = False    # UCSD_LAB
+                    x_surf_dafoam_initial,
+                    grid_search_density_parameter=1,
+                    projection_tolerance=1e-10,
+                    grid_search_density_cutoff=50,
+                    force_reprojection=False,
+                    plot=False
                 )
-            # Summarize top time-consuming functions
-            stats = pstats.Stats(pr)
-            stats.strip_dirs().sort_stats(pstats.SortKey.TIME).print_stats(30)
-
             print('Writing surface mesh projection pickle...')
             write_simple_pickle(projected_surf_mesh_dafoam, surface_mesh_projection_file_path)
             print('Done!')
-
-        # Added this exception because I was getting an ungraceful MPI termination
         except Exception as e:
             import traceback
             print(f"[Rank 0 ERROR] Projection/pickle step failed:\n{traceback.format_exc()}", flush=True)
-            comm.Abort(1) # Abort MPI processes instead of letting them hang
+            comm.Abort(1)
 
     comm.Barrier()
     if rank != 0:
@@ -275,751 +482,467 @@ else:
 print(f'Rank {rank_str} done reading projected surface mesh!')
 comm.Barrier()
 
-# -------------------------------------------------------------------------------------------
-# COPY PASTED GEOMETRY STUFF HERE:
-# region Create Parameterization Objects
+# Parameterization
 num_ffd_coefficients_chordwise = 5
-num_ffd_sections               = 2  # Symmetry boundaries (left, right)
-ffd_block = construct_ffd_block_around_entities(entities=geometry, 
-                                                num_coefficients=(num_ffd_coefficients_chordwise, num_ffd_sections, 2), degree=(3,1,1))
+num_ffd_sections               = 2
+ffd_block = construct_ffd_block_around_entities(
+    entities=geometry,
+    num_coefficients=(num_ffd_coefficients_chordwise, num_ffd_sections, 2),
+    degree=(3, 1, 1)
+)
 
-# region CSDL Variable declaration
-percent_change_in_thickness          = csdl.Variable(shape=(num_ffd_coefficients_chordwise, num_ffd_sections), value=0.) # (5,2)
-percent_change_in_thickness_dof      = csdl.Variable(shape=(num_ffd_coefficients_chordwise-2,), value=np.array([0,0,0])) 
-normalized_percent_camber_change     = csdl.Variable(shape=(num_ffd_coefficients_chordwise, num_ffd_sections),  value=0.)
-normalized_percent_camber_change_dof = csdl.Variable(shape=(num_ffd_coefficients_chordwise-2,), value=np.array([0,0,0]))
+percent_change_in_thickness_dof      = csdl.Variable(shape=(num_ffd_coefficients_chordwise - 2,), value=np.array([0, 0, 0]))
+normalized_percent_camber_change_dof = csdl.Variable(shape=(num_ffd_coefficients_chordwise - 2,), value=np.array([0, 0, 0]))
 
-# ffd_block.plot()
+percent_change_in_thickness      = csdl.Variable(shape=(num_ffd_coefficients_chordwise, num_ffd_sections), value=0.)
+normalized_percent_camber_change = csdl.Variable(shape=(num_ffd_coefficients_chordwise, num_ffd_sections), value=0.)
+
 ffd_sectional_parameterization = VolumeSectionalParameterization(
     name="ffd_sectional_parameterization",
-    parameterized_points=ffd_block.coefficients,    # ffd_block.coefficients.shape = (5, 2, 2, 3)
+    parameterized_points=ffd_block.coefficients,
     principal_parametric_dimension=1,
 )
 
-
-# region Evaluate Inner Parameterization Map To Define Forward Model For Parameterization Solver
 sectional_parameters = VolumeSectionalParameterizationInputs()
 ffd_coefficients     = ffd_sectional_parameterization.evaluate(sectional_parameters, plot=False)
 
-
-# Apply shape variables (NEW) : (1) THICKNESS
-original_block_thickness    = ffd_block.coefficients.value[0, 0, 1, 2] - ffd_block.coefficients.value[0, 0, 0, 2] # normal-thickness  
-percent_change_in_thickness = percent_change_in_thickness.set(csdl.slice[1:-1,0], percent_change_in_thickness_dof)
-percent_change_in_thickness = percent_change_in_thickness.set(csdl.slice[1:-1,1], percent_change_in_thickness_dof)
+# Thickness
+original_block_thickness    = ffd_block.coefficients.value[0, 0, 1, 2] - ffd_block.coefficients.value[0, 0, 0, 2]
+percent_change_in_thickness = percent_change_in_thickness.set(csdl.slice[1:-1, 0], percent_change_in_thickness_dof)
+percent_change_in_thickness = percent_change_in_thickness.set(csdl.slice[1:-1, 1], percent_change_in_thickness_dof)
 delta_block_thickness       = (percent_change_in_thickness / 100) * original_block_thickness
-thickness_upper_translation = 1/2 * delta_block_thickness
-thickness_lower_translation = -thickness_upper_translation
+ffd_coefficients = ffd_coefficients.set(csdl.slice[:, :, 1, 2], ffd_coefficients[:, :, 1, 2] + delta_block_thickness / 2)
+ffd_coefficients = ffd_coefficients.set(csdl.slice[:, :, 0, 2], ffd_coefficients[:, :, 0, 2] - delta_block_thickness / 2)
 
-ffd_coefficients = ffd_coefficients.set(csdl.slice[:,:,1,2], ffd_coefficients[:,:,1,2] + thickness_upper_translation)
-ffd_coefficients = ffd_coefficients.set(csdl.slice[:,:,0,2], ffd_coefficients[:,:,0,2] + thickness_lower_translation)
-
-
-# Parameterize camber change as normalized by the original block (kind of like chord) length (NEW) : (2) CAMBER
+# Camber
+block_length                     = ffd_block.coefficients.value[1, 0, 0, 0] - ffd_block.coefficients.value[0, 0, 0, 0]
 normalized_percent_camber_change = normalized_percent_camber_change.set(csdl.slice[1:-1, 0], normalized_percent_camber_change_dof)
 normalized_percent_camber_change = normalized_percent_camber_change.set(csdl.slice[1:-1, 1], normalized_percent_camber_change_dof)
-
-block_length     = ffd_block.coefficients.value[1, 0, 0, 0] - ffd_block.coefficients.value[0, 0, 0, 0]
-camber_change    = (normalized_percent_camber_change/100)*block_length
-ffd_coefficients = ffd_coefficients.set(csdl.slice[:,:,:,2], ffd_coefficients[:,:,:,2] + csdl.expand(camber_change, (num_ffd_coefficients_chordwise, num_ffd_sections, 2), 'ij->ijk'))
+camber_change                    = (normalized_percent_camber_change / 100) * block_length
+ffd_coefficients = ffd_coefficients.set(
+    csdl.slice[:, :, :, 2],
+    ffd_coefficients[:, :, :, 2] + csdl.expand(camber_change, (num_ffd_coefficients_chordwise, num_ffd_sections, 2), 'ij->ijk')
+)
 
 geometry_coefficients = ffd_block.evaluate_ffd(coefficients=ffd_coefficients, plot=False)
-geometry.set_coefficients(geometry_coefficients) 
-# -------------------------------------------------------------------------------------------
+geometry.set_coefficients(geometry_coefficients)
 
-with Timer(f'evaluating geometry component', rank, TIMING_ENABLED):
+with Timer('evaluating geometry component', rank, TIMING_ENABLED):
     x_surf_dafoam_full = geometry.evaluate(projected_surf_mesh_dafoam, plot=False)
 
-# region Surface mesh distribution
-i0, i1          = x_surf_dafoam_initial_indices[rank]
-
-# Flight condition variables
-flight_conditions_group                 = csdl.VariableGroup()
-flight_conditions_group.mach_number     = csdl.Variable(value=0.2938635415, name="mach_number")
-flight_conditions_group.angle_of_attack_deg = csdl.Variable(value=data["parameters"]["primary_variables"]["angle_of_attack_deg"], name="angle_of_attack_deg")
-flight_conditions_group.altitude_m      = csdl.Variable(value=data["parameters"]["non_sampled_variables"]["altitude_m"], name="altitude (m)")
-
-# Atmospheric condition variables
+# Flight conditions
+flight_conditions_group                     = csdl.VariableGroup()
+flight_conditions_group.airspeed_m_s        = csdl.Variable(
+    value=data["parameters"]["non_sampled_variables"]["airspeed_m_s"], name="airspeed_m_s")
+flight_conditions_group.angle_of_attack_deg = csdl.Variable(
+    value=data["parameters"]["primary_variables"]["angle_of_attack_deg"], name="angle_of_attack_deg"
+)
+flight_conditions_group.altitude_m          = csdl.Variable(
+    value=data["parameters"]["non_sampled_variables"]["altitude (m)"], name="altitude (m)"
+)
 ambient_conditions_group = sam.compute_ambient_conditions_group(flight_conditions_group.altitude_m)
 
+i0, i1 = x_surf_dafoam_initial_indices[rank]
+
 with csdl.experimental.mpi.enter_mpi_region(rank, comm) as mpi_region:
-    
-    x_surf_dafoam   = x_surf_dafoam_full[i0:i1, :]
-    x_surf_dafoam   = x_surf_dafoam.flatten()
 
-    # region IDWarp and DAFoam
-    idwarp_model    = DAFoamMeshWarper(dafoam_instance)
-    x_vol_dafoam    = idwarp_model.evaluate(x_surf_dafoam)
+    x_surf_dafoam = x_surf_dafoam_full[i0:i1, :].flatten()
 
-    # Need to split up angle-of-attack (and any other CSDL variables which DAFoam takes the derivative with respect to)
-    flight_conditions_group.angle_of_attack_deg = mpi_region.split_custom(flight_conditions_group.angle_of_attack_deg, split_func = lambda x:x)
-    
-    # DAFoam input variable generation
-    # Generate our DAFoam CSDL input variable group 
-    # (this will add airspeed_m_s to the flight conditions group if not already present)
-    dafoam_input_variables_group = compute_dafoam_input_variables(dafoam_instance, 
-                                                                ambient_conditions_group, 
-                                                                flight_conditions_group,
-                                                                x_vol_dafoam)
-    
-    # Assemble POD modes and relevant vectors:
-    # Assemble POD modes and relevant vectors in DAFoam's state-vector ordering.
-    # POD data is stored per-variable in the H5 file; info["indices"] gives each
-    # variable's positions in DAFoam's local state vector (cell-interleaved for
-    # adjStateOrdering="cell").  Scattering into those positions ensures that
-    # setStates(), getResiduals(), and the ROM diagnostics all see consistently
-    # ordered arrays.
-    n_modes     = 20
-    state_info  = data_generator.state_info
-    n_local_states = dafoam_instance.getNLocalAdjointStates()
+    idwarp_model = DAFoamMeshWarper(dafoam_instance)
+    x_vol_dafoam = idwarp_model.evaluate(x_surf_dafoam)
+
+    flight_conditions_group.angle_of_attack_deg = mpi_region.split_custom(
+        flight_conditions_group.angle_of_attack_deg, split_func=lambda x: x
+    )
+
+    dafoam_input_variables_group = compute_dafoam_input_variables(
+        dafoam_instance, ambient_conditions_group, flight_conditions_group, x_vol_dafoam
+    )
+
+    # POD data assembled into DAFoam's cell-interleaved state-vector ordering
     s_vals          = data["pod"]["singular_values"]
-    pod_modes       = np.zeros((n_local_states, s_vals.shape[0]))
-    scaling         = np.zeros(n_local_states)
-    weights         = np.zeros(n_local_states)
-    reference_state = np.zeros(n_local_states)
+    n_local         = dafoam_instance.getNLocalAdjointStates()
+    pod_modes       = np.zeros((n_local, s_vals.shape[0]))
+    scaling         = np.zeros(n_local)
+    reference_state = np.zeros(n_local)
+    snapshots_rbf   = np.zeros((n_local, s_vals.shape[0]))
+
     for state_var, info in state_info.items():
         idx = info["indices"]
         pod_modes[idx, :]    = data["pod"]["modes"][state_var]
         scaling[idx]         = data["pod"]["scaling"][state_var]
         weights[idx]         = data["pod"]["weights"][state_var]
         reference_state[idx] = data["pod"]["reference_state"][state_var]
-    residual_scaling = np.ones_like(dafoam_instance.getStateWeights())
-    residual_scaling[state_info["T"]["indices"]] *= 1005
 
+        if state_var == "phi":
+            # POD modes were computed from phi normalized by per-snapshot face areas
+            # (rho*U*A_face_j per snapshot j), not the reference face areas stored in
+            # scaling[phi_idx] = rho*U*A_face_ref.  Pre-correct the snapshots so that
+            # (snapshots_rbf - ref) / scaling gives the same quantity as in the POD SVD.
+            phi_raw  = data["samples"]["states"][state_var][:, 1:]      # (n_phi, n_rbf_snaps)
+            n_rbf    = phi_raw.shape[1]
+            fa_ref   = np.abs(data["samples"]["mesh"]["face_areas"][:, 0:1])       # (n_phi, 1)
+            fa_snap  = np.abs(data["samples"]["mesh"]["face_areas"][:, 1:n_rbf+1]) # (n_phi, n_rbf_snaps)
+            fa_snap  = np.where(fa_snap < 1e-300, fa_ref, fa_snap)
+            phi_ref  = reference_state[idx, None]
+            snapshots_rbf[idx, :] = phi_ref + (phi_raw - phi_ref) * (fa_ref / fa_snap)
+        else:
+            snapshots_rbf[idx, :] = data["samples"]["states"][state_var][:, 1:]
+        
 
-    ### DIAGNOSTICS
-    cumulative_ratio = np.cumsum(s_vals) / np.sum(s_vals)
-    # print(cumulative_ratio)
+    # --- POD Basis Diagnostics (pre-weighting) ---
+    if rank == 0:
+        print("\n" + "-"*60)
+        print("  POD Basis Diagnostics (unweighted)")
+        print("-"*60)
 
-    cutoff_index = np.where(cumulative_ratio >= 0.999)
-    cutoff_index = cutoff_index[0][0]
-    # print(np.where(np.cumsum(s_vals) / np.sum(s_vals) >= 0.999))
-    print(cutoff_index, cumulative_ratio[cutoff_index])
-    
-    # snapshots   = np.array(np.concatenate([data["samples"]["states"][state_var] for state_var in state_info.keys()], axis=0))
-    # scld_cntrd  = 1 / scaling[:, None] * (snapshots - reference_state[:, None])
-    # phi_tmp     = pod_modes[:,:10]
+        # Singular value decay and cumulative energy
+        energy     = s_vals**2
+        cum_energy = np.cumsum(energy) / np.sum(energy)
+        n_modes    = len(s_vals)
+        print(f"\n  {'Mode':>5}  {'s_i/s_0':>10}  {'cum_energy':>12}")
+        for i in range(n_modes):
+            print(f"  {i:>5}  {s_vals[i]/s_vals[0]:>10.4e}  {cum_energy[i]:>12.6f}")
 
-    # coeffs      = comm.allreduce(phi_tmp.T @ (weights[:, None] * scld_cntrd), op=MPI.SUM)
-    
-    # import numpy as np
-    # import pandas as pd
-    # import seaborn as sns
-    # import matplotlib.pyplot as plt
-    # import matplotlib.pyplot as plt
+    # Basis orthogonality checks
+    # Modes live in scaled space; W = diag(weights) is the POD inner product
+    PhiTPhi  = comm.allreduce(pod_modes.T @ pod_modes,                     op=MPI.SUM)
+    PhiTWPhi = comm.allreduce(pod_modes.T @ (weights[:, None] * pod_modes), op=MPI.SUM)
+    orth_err   = np.linalg.norm(PhiTPhi  - np.eye(PhiTPhi.shape[0]),  'fro')
+    orth_W_err = np.linalg.norm(PhiTWPhi - np.eye(PhiTWPhi.shape[0]), 'fro')
+    if rank == 0:
+        print(f"\n  Basis ortho ‖ΦᵀΦ - I‖_F:   {orth_err:.4e}  (unweighted, expected large)")
+        print(f"  Basis ortho ‖ΦᵀWΦ - I‖_F:   {orth_W_err:.4e}  (W = diag(weights), expected ~0)")
 
-    # camber_samples = data["parameters"]["secondary_variables"]["%_camber_change"]
-    # thick_samples  = data["parameters"]["secondary_variables"]["%_thickness_change"]
-    # params = np.concatenate([camber_samples, thick_samples], axis=1)
+    # Per-variable contribution to ‖ΦᵀWΦ - I‖_F to locate the source of any discrepancy
+    if rank == 0:
+        print(f"\n  Per-variable ‖ΦᵀWΦ - I‖_F contribution:")
+        print(f"  {'Variable':>10}  {'orth_W_err':>12}  {'weight_min':>12}  {'weight_max':>12}")
+    for state_var, info in state_info.items():
+        idx      = info["indices"]
+        Phi_v    = pod_modes[idx, :]
+        w_v      = weights[idx]
+        PhiTWPhi_v = comm.allreduce(Phi_v.T @ (w_v[:, None] * Phi_v), op=MPI.SUM)
+        err_v      = np.linalg.norm(PhiTWPhi_v - np.eye(PhiTWPhi_v.shape[0]), 'fro')
+        w_min      = comm.allreduce(w_v.min(), op=MPI.MIN)
+        w_max      = comm.allreduce(w_v.max(), op=MPI.MAX)
+        if rank == 0:
+            print(f"  {state_var:>10}  {err_v:>12.4e}  {w_min:>12.4e}  {w_max:>12.4e}")
 
-    # # if rank == 0:
-    # # --- Build DataFrame ---
-    # n_modes = coeffs.shape[0]
-    # df = pd.DataFrame(
-    #     coeffs.T,
-    #     columns=[f"a{i+1}" for i in range(n_modes)]
-    # )
+    # Per-variable snapshot reconstruction error.
+    # alpha = Phi^T W z must be computed from the FULL state (all variables), not per-variable.
+    # Using only one variable's rows gives a partial projection that misses cross-variable modal
+    # contributions, leading to artificially large errors even when the basis is correct.
+    n_snaps = snapshots_rbf.shape[1]
+    alpha_global = comm.allreduce(
+        pod_modes.T @ ((weights / scaling)[:, None] * (snapshots_rbf - reference_state[:, None])),
+        op=MPI.SUM
+    )                                                          # (n_modes, n_snaps)
 
-    # # choose ONE parameter dimension to color by
-    # # for i in range(params.shape[1]):
-    # df["param"] = params[:, rank]
-
-    # # --- Pairplot ---
-    # sns.pairplot(
-    #     df,
-    #     vars=[f"a{i+1}" for i in range(n_modes)],
-    #     hue="param",
-    #     palette="viridis",
-    #     corner=True,        # avoids redundant upper triangle
-    #     plot_kws={"s": 25, "alpha": 0.8}
-    # )
-
-    # plt.suptitle(f"POD Coefficient Pairplot Colored by Parameter (index {rank})", y=1.02)
-    # plt.show()
-
-    # quiet_barrier(comm)
-    ###
-
-
-    ### TESTING REGION
-    from csdl_dafoam.utils.interpolation import RBFInterpolator, IDWInterpolator
-    from csdl_dafoam.utils.custom_explicit_reduced_svd import customExplicitReducedSVD
-    import matplotlib.pyplot as plt
-
-    snapshots        = np.array(np.concatenate([data["samples"]["states"][state_var]         for state_var in state_info.keys()], axis=0))[:, 1:]
-    s_vals           = data["pod"]["singular_values"]#[:n_modes]
-    snapshot_configs = np.array(np.concatenate([data["parameters"]["secondary_variables"]["%_camber_change"], data["parameters"]["secondary_variables"]["%_thickness_change"]], axis=1))[1:, :]
-    current_config   = csdl.concatenate((normalized_percent_camber_change_dof, percent_change_in_thickness_dof), axis=0)
-
-    
-
-    snapshot_weights_pre = RBFInterpolator(current_config, snapshot_configs, positive_non_reproducing_weights=True).weights() # IDWInterpolator(current_config, snapshot_configs, exponent=2).weights()
-    snapshot_weights     = snapshot_weights_pre / csdl.sum(snapshot_weights_pre) # Enforce unity, if it happens to not be
-    
-    VT = 1 / s_vals[:, None] * comm.allreduce((pod_modes.T @ ((weights / scaling)[:, None] * (snapshots - reference_state[:, None]))), op=MPI.SUM)
-
-    D = csdl.einsum(s_vals, csdl.einsum(VT, csdl.sqrt(snapshot_weights ** 2), action='ij,j->ij'), action='i,ij->ij')
-
-    UD, SD, VTD = customExplicitReducedSVD().evaluate(A=D)
-
-    pod_modes_weighted = pod_modes @ UD[:, :n_modes]
-
-
-    num_samples=5
-
-    snapshot_vars_and_limits = {
-        percent_change_in_thickness_dof: {
-            'name': '%_thickness_change',
-            'range': [-10, 10],
-            'ref_value': 0, 
-        },
-        normalized_percent_camber_change_dof: {
-            'name': '%_camber_change',
-            'range': [-10, 10],
-            'ref_value': 0, 
-        }
-    }
-
-    data_generator._generate_lhs_samples(snapshot_vars_and_limits, num_samples=num_samples, random_state=42)
-    print(snapshot_vars_and_limits) if rank == 0 else None
-    diag_dict = {"max_diff":{"weighted"     : {state:np.zeros(num_samples) for state in state_info.keys()}, "unweighted":{state:np.zeros(num_samples) for state in state_info.keys()}}, 
-                "max_err":{"weighted"      : {state:np.zeros(num_samples) for state in state_info.keys()}, "unweighted":{state:np.zeros(num_samples) for state in state_info.keys()}}, 
-                "err_norm":{"weighted"     : {state:np.zeros(num_samples) for state in state_info.keys()}, "unweighted":{state:np.zeros(num_samples) for state in state_info.keys()}}, 
-                "proj_err":{"weighted"     : np.zeros(num_samples),         "unweighted":np.zeros(num_samples)}, 
-                "proj_err_rel":{"weighted" : np.zeros(num_samples),         "unweighted":np.zeros(num_samples)}}
+    # Per-variable cumulative energy fraction vs. truncation rank.
+    # Shows how quickly each variable's snapshot content is captured as modes are added.
+    rank_checkpoints = [rc for rc in [1, 5, 10, 20, 30, 50, 70, 100] if rc <= n_snaps]
+    per_var_cum_frac = {}
+    for state_var, info in state_info.items():
+        idx        = info["indices"]
+        phys_diffs = snapshots_rbf[idx, :] - reference_state[idx, None]
+        total_sq   = comm.allreduce(np.sum(phys_diffs ** 2), op=MPI.SUM)
+        fracs = []
+        for rc in rank_checkpoints:
+            recon_r  = scaling[idx, None] * (pod_modes[idx, :rc] @ alpha_global[:rc, :])
+            err_sq_r = comm.allreduce(np.sum((phys_diffs - recon_r) ** 2), op=MPI.SUM)
+            fracs.append(1.0 - err_sq_r / max(total_sq, 1e-300))
+        per_var_cum_frac[state_var] = fracs
 
     if rank == 0:
-        # plt.plot(np.cumsum(s_vals ** 2)/np.sum(s_vals ** 2), label="original", linestyle='--')
-        # plt.plot(np.cumsum(SD.value ** 2)/np.sum(SD.value ** 2), label="weighted", linestyle='-.')
-        # plt.title("Cumulative Energy Fraction")
-        # plt.ylabel(r"$\sum_0^r{\sigma_i^2} / \sum{\sigma_i^2}$")
-        # plt.xlabel("Number of modes, r")
-        # plt.legend()
+        print(f"\n  Per-variable cumulative energy fraction vs. truncation rank:")
+        print(f"  (fraction of variable's snapshot energy captured by first r modes)")
+        header_ce = f"  {'Variable':>10}"
+        for rc in rank_checkpoints:
+            header_ce += f"  {'r='+str(rc):>8}"
+        print(header_ce)
+        for state_var, fracs in per_var_cum_frac.items():
+            row_ce = f"  {state_var:>10}"
+            for f in fracs:
+                row_ce += f"  {f:>8.4f}"
+            print(row_ce)
 
-        # plt.figure()
-        # plt.plot(s_vals, label="original", linestyle='--')
-        # plt.plot(SD.value, label="weighted", linestyle='-.')
-        # plt.title("Singular values")
-        # plt.ylabel(r"$\sigma$")
-        # plt.xlabel("Mode number")
-        # plt.legend()
+    if rank == 0:
+        print(f"\n  Snapshot reconstruction error (mean/max relative L2 per variable):")
+        print(f"  {'Variable':>10}  {'mean_rel_err':>14}  {'max_rel_err':>13}")
+    for state_var, info in state_info.items():
+        idx        = info["indices"]
+        phys_diffs = snapshots_rbf[idx, :] - reference_state[idx, None]
+        recon_phys = scaling[idx, None] * (pod_modes[idx, :] @ alpha_global)
+        err_sq     = comm.allreduce(np.sum((phys_diffs - recon_phys)**2, axis=0), op=MPI.SUM)
+        norm_sq    = comm.allreduce(np.sum(phys_diffs**2,                axis=0), op=MPI.SUM)
+        rel_err    = np.sqrt(err_sq / np.maximum(norm_sq, 1e-30))
+        if rank == 0:
+            print(f"  {state_var:>10}  {rel_err.mean():>14.4e}  {rel_err.max():>13.4e}")
+    if rank == 0:
+        print("-"*60 + "\n")
+    # --- End POD Basis Diagnostics ---
 
-        # plt.show()
+    # Temperature residual rescaling (improves LSPG conditioning)
+    residual_scaling                              = np.ones_like(dafoam_instance.getStateWeights())
+    residual_scaling[state_info["T"]["indices"]] *= 1005
 
+    # Snapshot data for weighted POD.
+    # Index 0 is the reference condition (already captured in reference_state), so skip it.
+    # snapshots_rbf        = np.concatenate(
+    #     [data["samples"]["states"][sv] for sv in state_info.keys()], axis=0
+    # )[:, 1:]                                                  # (n_local, n_snapshots-1)
+    snapshot_configs_rbf = np.concatenate([
+        data["parameters"]["secondary_variables"]["normalized_percent_camber_change_dof"],
+        data["parameters"]["secondary_variables"]["percent_change_in_thickness_dof"]
+    ], axis=1)[1:, :]                                         # (n_snapshots-1, n_dv)
 
-        import pandas as pd
-        import seaborn as sns
-        import matplotlib.pyplot as plt
-        import matplotlib.pyplot as plt
+    # VT = Sigma^{-1} U^T diag(w/sigma) (Y - y_ref): metric-independent, computed once
+    VT = (1.0 / s_vals[:, None]) * comm.allreduce(
+        pod_modes.T @ ((weights / scaling)[:, None] * (snapshots_rbf - reference_state[:, None])),
+        op=MPI.SUM
+    )
 
-        # --- Build the samples DataFrame ---
-        camber_samples = data["parameters"]["secondary_variables"]["%_camber_change"]
-        thick_samples  = data["parameters"]["secondary_variables"]["%_thickness_change"]
-        params = np.concatenate([camber_samples, thick_samples], axis=1)
+    current_config = csdl.concatenate(
+        (normalized_percent_camber_change_dof, percent_change_in_thickness_dof), axis=0
+    )
 
-        if params.shape[0] == 6:
-            params = params.T
+    # Build one weighted-POD ROM per metric
+    rom_outputs  = {}
+    rbf_w_csdl   = {}   # keyed by metric_name; populated inside the loop for diagnostics
 
-        columns = ["camber_1", "camber_2", "camber_3",
-                "thickness_1", "thickness_2", "thickness_3"]
+    for metric_name in METRIC_NAMES:
+        L = metric_L[metric_name]   # (n_dv, n_dv) numpy transform
 
-        df = pd.DataFrame(params, columns=columns)
-        df["type"] = "Sample"  # hue label for samples
+        if L is not None:
+            # Transform parameter coordinates into the metric's space.
+            # Euclidean: L = I, no transform needed.
+            if np.allclose(L, np.eye(n_dv)):
+                z_current   = current_config
+                Z_snapshots = snapshot_configs_rbf
+            else:
+                L_T_const   = csdl.Variable(value=L.T, name=f"L_T_{metric_name}")
+                z_current   = csdl.einsum(L_T_const, current_config, action='ij,j->i')
+                Z_snapshots = snapshot_configs_rbf @ L
+            
+            rbf_w_pre = RBFInterpolator(z_current, Z_snapshots, positive_non_reproducing_weights=True).weights()
+            rbf_w     = rbf_w_pre / csdl.sum(rbf_w_pre)
+            rbf_w_csdl[metric_name] = rbf_w
 
-        # --- Build the target row ---
-        target_param = [info["samples"] for var, info in snapshot_vars_and_limits.items()]
+            # Weighted SVD: D = diag(sigma) * VT * diag(sqrt(w_rbf))
+            D_svd = csdl.einsum(
+                s_vals,
+                csdl.einsum(VT, csdl.sqrt(rbf_w ** 2), action='ij,j->ij'),
+                action='i,ij->ij'
+            )
+            UD, _, _ = customExplicitReducedSVD().evaluate(A=D_svd)
+            pod_modes_metric = pod_modes @ UD[:, :n_retained_modes]   # (n_local, n_retained_modes) CSDL
+        else:
+            pod_modes_metric = pod_modes[:, :n_retained_modes]
 
-        target_param_flat = np.concatenate(target_param, axis=1)  # shape (6,) after flattening
-
-        target_df = pd.DataFrame(target_param_flat, columns=columns)
-        target_df["type"] = "Target"
-
-        # --- Combine into one DataFrame ---
-        combined_df = pd.concat([df, target_df], ignore_index=True)
-
-        # --- Pair plot with hue ---
-        sns.set(style="ticks")
-        palette = {"Sample": "steelblue", "Target": "crimson"}
-
-        g = sns.pairplot(
-            combined_df,
-            hue="type",
-            corner=True,
-            palette=palette,
-            diag_kind="kde",
-            plot_kws={"alpha": 0.6},
-            hue_order=["Sample", "Target"],  # samples drawn first, target on top
+        rom_model = DAFoamLSPGModel(
+            dafoam_input_variables_group=dafoam_input_variables_group,
+            pod_modes=pod_modes_metric,
+            reference_fom_state=reference_state,
+            scaling=scaling,
+            weights=1.0 / residual_scaling ** 2,
+            dafoam_instance=dafoam_instances_rom[metric_name],
+            normalize_residuals=False,
+            fd_step=1e-6,
+            solution_prefix=metric_name,  
+            disable_presolve_diagnostics=False          
         )
+        rom_wrapper     = CSDLROMWrapper(
+            model=rom_model,
+            solver=BroydenNewtonSolver(options={"tol_rel": 1e-9, "tol_step_abs": 1e-13}),
+            start_with_zero_state=True
+        )
+        rom_states      = rom_wrapper.evaluate()
+        state_est       = reference_state + scaling * (pod_modes_metric @ rom_states)
 
-        for i, row_col in enumerate(columns):
-            for j, col_col in enumerate(columns):
-                if i != j:
-                    ax = g.axes[i, j]
-                    if ax is None:  # upper triangle is None when corner=True
-                        continue
-                    for idx, row in target_df.iterrows():
-                        ax.annotate(
-                            str(idx),
-                            xy=(row[col_col], row[row_col]),
-                            xytext=(4, 4),           # pixel offset from the point
-                            textcoords="offset points",
-                            fontsize=7,
-                            color=palette["Target"],
-                        )
+        fn_model        = DAFoamFunctions(dafoam_instances_rom[metric_name], disable_jacvec_normalization=True)
+        fn_outputs      = fn_model.evaluate(state_est, dafoam_input_variables_group)
 
-        # # --- Make the target point larger and more visible on scatter axes ---
-        # # The single target row will render tiny by default, so re-draw it as a star
-        # for i, row_col in enumerate(columns):
-        #     for j, col_col in enumerate(columns):
-        #         if i != j:  # off-diagonal only
-        #             ax = g.axes[i, j]
-        #             ax.scatter(
-        #                 target_df[col_col],
-        #                 target_df[row_col],
-        #                 color=palette["Target"],
-        #                 marker="*",
-        #                 s=250,          # star size
-        #                 zorder=5,       # draw on top
-        #                 label="_nolegend_",
-        #             )
+        rom_outputs[metric_name] = {
+            "state":     state_est,
+            "functions": fn_outputs,
+            "pod_modes": pod_modes_metric,
+        }
 
-        plt.suptitle("Parameter Pair Plot", y=1.02)
-        # plt.show()
+        mpi_region.set_as_global_output(state_est)
+        for out_name in dafoam_instance.getOption("function").keys():
+            mpi_region.set_as_global_output(getattr(fn_outputs, out_name))
 
-    quiet_barrier(comm)
-    ###
+    # FOM solver
+    dafoam_solver        = DAFoamSolver(dafoam_instance, write_residual_fields=True)
+    dafoam_solver_states = dafoam_solver.evaluate(dafoam_input_variables_group)
+    dafoam_fn_model      = DAFoamFunctions(dafoam_instance)
+    dafoam_fn_outputs    = dafoam_fn_model.evaluate(dafoam_solver_states, dafoam_input_variables_group)
 
-    pod_modes = pod_modes[:, :n_modes]
+    # Projection errors (optional)
+    if COMPUTE_PROJ_ERROR:
+        x_scaled = (1.0 / scaling) * (dafoam_solver_states - reference_state)
+        for metric_name in METRIC_NAMES:
+            Phi          = rom_outputs[metric_name]["pod_modes"]
+            PhiT         = Phi.T() if is_csdl(Phi) else Phi.T
+            proj_coeff   = csdl.experimental.mpi.mpi_sum(PhiT @ (weights * x_scaled), comm=comm)
+            proj_err_vec = x_scaled - Phi @ proj_coeff
+            rom_outputs[metric_name]["proj_error"] = proj_err_vec
+            mpi_region.set_as_global_output(proj_err_vec)
 
-    from csdl_dafoam.core.rom.csdl_rom import CSDLROMWrapper
-    from csdl_dafoam.core.rom.rom_models import DAFoamLSPGModel, DAFoamGalerkinModel
-    from csdl_dafoam.core.rom.rom_solver import NewtonSolver, BroydenNewtonSolver
-    
-    # WEIGHTED ROM
-    # dafoam_rom_model_weighted       = DAFoamGalerkinModel(dafoam_input_variables_group=dafoam_input_variables_group,
-    #                                                   pod_modes=pod_modes_weighted,
-    #                                                   reference_fom_state=reference_state,
-    #                                                   scaling=scaling,
-    #                                                   weights=1/residual_scaling,
-    #                                                   dafoam_instance=dafoam_instance_rom_weighted,
-    #                                                   normalize_residuals=False,
-    #                                                   fd_step=1e-6,
-    #                                                   solution_prefix="weighted")
-    dafoam_rom_model_weighted       = DAFoamLSPGModel(dafoam_input_variables_group=dafoam_input_variables_group,
-                                                      pod_modes=pod_modes_weighted,
-                                                      reference_fom_state=reference_state,
-                                                      scaling=scaling,
-                                                      weights=1 / residual_scaling ** 2,
-                                                      dafoam_instance=dafoam_instance_rom_weighted,
-                                                      normalize_residuals=False,
-                                                      fd_step=1e-6,
-                                                      solution_prefix="weighted")
-    
-    dafoam_rom_weighted             = CSDLROMWrapper(model=dafoam_rom_model_weighted, 
-                                                     solver=BroydenNewtonSolver(options={"tol_rel":1e-9, "tol_step_abs":1e-13}),
-                                                     start_with_zero_state=True)   
-    dafoam_rom_states_weighted      = dafoam_rom_weighted.evaluate()
-
-    # Reconstruct state
-    dafoam_state_estimate_weighted  = reference_state + scaling * (pod_modes_weighted @ dafoam_rom_states_weighted)
-
-    # Functions
-    dafoam_functions_rom_weighted   = DAFoamFunctions(dafoam_instance_rom_weighted, 
-                                                      disable_jacvec_normalization=True)
-    dafoam_function_rom_outputs_weighted = dafoam_functions_rom_weighted.evaluate(dafoam_state_estimate_weighted, 
-                                                                                  dafoam_input_variables_group)
-    
-
-    # UNWEIGHTED ROM
-    # dafoam_rom_model                = DAFoamGalerkinModel(dafoam_input_variables_group=dafoam_input_variables_group,
-    #                                                   pod_modes=pod_modes_weighted,
-    #                                                   reference_fom_state=reference_state,
-    #                                                   scaling=scaling,
-    #                                                   weights=1/residual_scaling,
-    #                                                   dafoam_instance=dafoam_instance_rom_weighted,
-    #                                                   normalize_residuals=False,
-    #                                                   fd_step=1e-6,
-    #                                                   solution_prefix="weighted")
-    dafoam_rom_model                = DAFoamLSPGModel(dafoam_input_variables_group=dafoam_input_variables_group,
-                                                      pod_modes=pod_modes,
-                                                      reference_fom_state=reference_state,
-                                                      scaling=scaling,
-                                                      weights=1 / residual_scaling ** 2,
-                                                      dafoam_instance=dafoam_instance_rom,
-                                                      normalize_residuals=False,
-                                                      fd_step=1e-6,
-                                                      solution_prefix="unweighted")
-    dafoam_rom                      = CSDLROMWrapper(model=dafoam_rom_model, 
-                                                     solver=BroydenNewtonSolver(options={"tol_rel":1e-9, "tol_step_abs":1e-13}),
-                                                     start_with_zero_state=True)   
-    dafoam_rom_states               = dafoam_rom.evaluate()
-
-    # Reconstruct state
-    dafoam_state_estimate           = reference_state + scaling * (pod_modes @ dafoam_rom_states)
-
-    # Functions
-    dafoam_functions_rom            = DAFoamFunctions(dafoam_instance_rom, 
-                                                      disable_jacvec_normalization=True)
-    dafoam_function_rom_outputs     = dafoam_functions_rom.evaluate(dafoam_state_estimate, 
-                                                                    dafoam_input_variables_group) 
-    
-
-    # DAFoamSolver Implicit component setup and evaluation
-    dafoam_solver           = DAFoamSolver(dafoam_instance, write_residual_fields=True)
-    dafoam_solver_states    = dafoam_solver.evaluate(dafoam_input_variables_group)
-
-    # DAFoamFunctions Explicit component setup and evaluation
-    dafoam_functions = DAFoamFunctions(dafoam_instance)
-    dafoam_function_outputs = dafoam_functions.evaluate(dafoam_solver_states, 
-                                                        dafoam_input_variables_group)
-    
-       
-    
-    x = 1 / scaling * (dafoam_solver_states - reference_state)
-
-    error   = x - pod_modes          @ csdl.experimental.mpi.mpi_sum(pod_modes.T @ (weights * x), comm=comm)
-    error_w = x - pod_modes_weighted @ csdl.experimental.mpi.mpi_sum(pod_modes_weighted.T() @ (weights * x), comm=comm)
-
-    mpi_region.set_as_global_output(error)
-    mpi_region.set_as_global_output(error_w)
-    
-    outputDict = dafoam_instance.getOption("function")
-    for outputName in outputDict.keys():
-        mpi_region.set_as_global_output(getattr(dafoam_function_rom_outputs_weighted, outputName))
-        mpi_region.set_as_global_output(getattr(dafoam_function_rom_outputs, outputName))
-        mpi_region.set_as_global_output(getattr(dafoam_function_outputs, outputName))
-    # mpi_region.set_as_global_output(dafoam_function_outputs.drag)
-
-
-# region Optimization problem selection
-# optimization_case options
-# 1: Maximize CL/CD wrt angle-of-attack
-# 2: Minimize CD wrt angle-of-attack, wing shape (thickness/camber ffd), constrained by CL=0.5
-# 3: Maximize CL/CD wrt angle-of-attack, wing shape (thickness/camber ffd)
-# 4: Minimize D wrt angle-of-attack (test case)
-# 5: Maximize CL/CD wrt wing shape (thickness/camber ffd)
-optimization_case = 5
-
-
-if optimization_case == 1:
-    # Declaring and naming some variables
-    lift = dafoam_function_outputs.lift
-    drag = dafoam_function_outputs.drag
-
-    # Design variables
-    flight_conditions_group.angle_of_attack_deg.set_as_design_variable(lower=0, upper=10, scaler=1./10)
-
-    # Objectives
-    objective_fun = -lift/drag
-    objective_fun.set_as_objective()
-
-
-elif optimization_case == 2:
-    # Declaring and naming some variables
-    dynamic_pressure = 0.5*ambient_conditions_group.rho_kg_m3*flight_conditions_group.airspeed_m_s*flight_conditions_group.airspeed_m_s
-    lift = dafoam_function_outputs.lift
-    drag = dafoam_function_outputs.drag
-    CL   = lift/(dynamic_pressure*A0)
-    CD   = drag/(dynamic_pressure*A0)
-
-    # Design variables
-    flight_conditions_group.angle_of_attack_deg.set_as_design_variable(lower=0, upper=10, scaler=1./10)
-    percent_change_in_thickness_dof.set_as_design_variable(lower=-100, upper=100, scaler=1./100)
-    normalized_percent_camber_change_dof.set_as_design_variable(lower=-50, upper=50, scaler=1./50)
-
-    # Constraints
-    CL.set_as_constraint(equals=0.5)
-
-    # Objective
-    CD.set_as_objective()
-
-
-elif optimization_case == 3:
-    lift = dafoam_function_outputs.lift
-    drag = dafoam_function_outputs.drag
-
-    # Design variables
-    flight_conditions_group.angle_of_attack_deg.set_as_design_variable(lower=0, upper=10, scaler=1./10)
-    percent_change_in_thickness_dof.set_as_design_variable(lower=-10, upper=10, scaler=1./10)
-    normalized_percent_camber_change_dof.set_as_design_variable(lower=-10, upper=10, scaler=1./10)
-
-    # Objectives
-    objective_fun = -lift/drag
-    objective_fun.set_as_objective()
-
-
-elif optimization_case == 4:
-    # Declaring and naming some variables
-    drag = dafoam_function_outputs.drag
-
-    # Design variables
-    flight_conditions_group.angle_of_attack_deg.set_as_design_variable(lower=0, upper=10, scaler=1./10)
-
-    # Objectives
-    objective_fun = drag
-    objective_fun.set_as_objective()
-
-
-elif optimization_case == 5:
-    lift = dafoam_function_outputs.lift
-    drag = dafoam_function_outputs.drag
-    lift_rom = dafoam_function_rom_outputs.lift
-    drag_rom = dafoam_function_rom_outputs.drag
-    lift_rom_weighted = dafoam_function_rom_outputs_weighted.lift
-    drag_rom_weighted = dafoam_function_rom_outputs_weighted.drag
-
-    # Design variables
-    percent_change_in_thickness_dof.set_as_design_variable(lower=-5, upper=5, scaler=1./5) #(lower=-10, upper=10, scaler=1./10)
-    normalized_percent_camber_change_dof.set_as_design_variable(lower=-5, upper=5, scaler=1./5) #(lower=-10, upper=10, scaler=1./10)
-
-    # Objectives
-    objective_fun = - lift / drag - 0 * lift_rom / drag_rom - 0 * lift_rom_weighted / drag_rom_weighted
-    objective_fun.set_as_objective()
-
-
-else:
-    print('Not a valid case number')
-
+    mpi_region.set_as_global_output(dafoam_solver_states)
+    for out_name in dafoam_instance.getOption("function").keys():
+        mpi_region.set_as_global_output(getattr(dafoam_fn_outputs, out_name))
 
 recorder.stop()
 
 
-
 # ===============================
-# region SIM
+# region SIMULATION
 # ===============================
 sim = csdl.experimental.PySimulator(recorder)
 
+snapshot_vars_and_limits = {
+    percent_change_in_thickness_dof: {
+        'range': [-10, 10],
+        'ref_value': 0,
+    },
+    normalized_percent_camber_change_dof: {
+        'range': [-10, 10],
+        'ref_value': 0,
+    }
+}
 
 data_generator._generate_lhs_samples(snapshot_vars_and_limits, num_samples=num_samples, random_state=42)
+num_samples_with_ref = num_samples + 1  # prepend reference point (all zeros)
 
-num_samples_with_ref = num_samples + 1
-
-diag_dict = {"max_diff":{"weighted"     : {state:np.zeros(num_samples_with_ref) for state in state_info.keys()}, "unweighted":{state:np.zeros(num_samples_with_ref) for state in state_info.keys()}}, 
-             "max_err":{"weighted"      : {state:np.zeros(num_samples_with_ref) for state in state_info.keys()}, "unweighted":{state:np.zeros(num_samples_with_ref) for state in state_info.keys()}}, 
-             "err_norm":{"weighted"     : {state:np.zeros(num_samples_with_ref) for state in state_info.keys()}, "unweighted":{state:np.zeros(num_samples_with_ref) for state in state_info.keys()}}, 
-             "proj_err":{"weighted"     : np.zeros(num_samples_with_ref),         "unweighted":np.zeros(num_samples_with_ref)}, 
-             "proj_err_rel":{"weighted" : np.zeros(num_samples_with_ref),         "unweighted":np.zeros(num_samples_with_ref)}}
-
-from csdl_dafoam.core.rom.csdl_grassmann import Grassmann
-
-manifold_local = Grassmann(m=comm.allreduce(dafoam_instance.getNLocalAdjointStates(), op=MPI.SUM), k=n_modes, inner_product_weights=weights, comm=comm)
+diag_dict = {
+    "err_norm":     {m: {sv: np.zeros(num_samples_with_ref) for sv in state_info.keys()} for m in METRIC_NAMES},
+    "drag_rel_err": {m: np.zeros(num_samples_with_ref) for m in METRIC_NAMES},
+    "lift_rel_err": {m: np.zeros(num_samples_with_ref) for m in METRIC_NAMES},
+}
+if COMPUTE_PROJ_ERROR:
+    diag_dict["proj_err"]         = {m: np.zeros(num_samples_with_ref) for m in METRIC_NAMES}
+    diag_dict["proj_err_rel"]     = {m: np.zeros(num_samples_with_ref) for m in METRIC_NAMES}
+    diag_dict["proj_err_rel_var"] = {m: {sv: np.zeros(num_samples_with_ref) for sv in state_info.keys()} for m in METRIC_NAMES}
 
 for i in range(num_samples_with_ref):
     for var, info in snapshot_vars_and_limits.items():
         sim[var] = info["samples"][i]
     sim.run()
-    print(f"Rank {rank} : Weights {snapshot_weights.value}")
-    print(f"Rank {rank} : Weights_sum {np.sum(snapshot_weights.value)}")
-    print(f"Rank {rank} : Orth_err {np.linalg.norm(comm.allreduce(pod_modes_weighted.value.T @ (weights[:, None] * pod_modes_weighted.value), op=MPI.SUM) - np.eye(n_modes), ord='fro')}")
-    print(f"Rank {rank} : basis angles {(manifold_local.subspace_angles(pod_modes, pod_modes_weighted.value)) * 180 / np.pi}")
 
     fom_state = dafoam_solver_states.value
-    rom_state = dafoam_state_estimate.value
-    rom_w_state = dafoam_state_estimate_weighted.value
+    fom_drag  = dafoam_fn_outputs.drag.value
+    fom_lift  = dafoam_fn_outputs.lift.value
 
-    for state_var, info in state_info.items():
-        state_idx = info["indices"]
+    if rank == 0 and i == 1:   # first non-reference test point
+        print(f"\n=== RBF weight diagnostics (test point {i}) ===")
+        for mname, rw in rbf_w_csdl.items():
+            w = np.sort(rw.value)[::-1]
+            eff_n = 1.0 / (w**2).sum()  # effective number of snapshots
+            print(f"  {mname:<18} top-5: {np.array2string(w[:5], precision=3)}  eff_n={eff_n:.1f}")
 
-        fom_var_state   = fom_state[state_idx]
-        rom_var_state   = rom_state[state_idx]
-        rom_w_var_state = rom_w_state[state_idx]
-        
-        # Field diffs/errs
-        diff     = np.abs(fom_var_state - rom_var_state)
-        err      = diff / np.abs(fom_var_state)
+    for metric_name in METRIC_NAMES:
+        rom_state = rom_outputs[metric_name]["state"].value
+        rom_drag  = rom_outputs[metric_name]["functions"].drag.value
+        rom_lift  = rom_outputs[metric_name]["functions"].lift.value
 
-        max_diff = comm.allreduce(max(diff), op=MPI.MAX)
-        min_diff = comm.allreduce(min(diff), op=MPI.MIN)
-        max_err  = comm.allreduce(max(err), op=MPI.MAX)
-        min_err  = comm.allreduce(min(err), op=MPI.MIN)
-        err_norm = np.sqrt(comm.allreduce(sum(diff ** 2), op=MPI.SUM)) / np.sqrt(comm.allreduce(sum(fom_var_state ** 2), op=MPI.SUM))
+        for state_var, info in state_info.items():
+            idx      = info["indices"]
+            fom_var  = fom_state[idx]
+            rom_var  = rom_state[idx]
+            diff     = np.abs(fom_var - rom_var)
+            err_norm = (
+                np.sqrt(comm.allreduce(np.sum(diff ** 2), op=MPI.SUM)) /
+                np.sqrt(comm.allreduce(np.sum(fom_var ** 2), op=MPI.SUM))
+            )
+            diag_dict["err_norm"][metric_name][state_var][i] = err_norm
 
-        diff_w     = np.abs(fom_var_state - rom_w_var_state)
-        err_w      = diff_w / np.abs(fom_var_state)
+        diag_dict["drag_rel_err"][metric_name][i] = abs(fom_drag - rom_drag) / (abs(fom_drag) + 1e-300)
+        diag_dict["lift_rel_err"][metric_name][i] = abs(fom_lift - rom_lift) / (abs(fom_lift) + 1e-300)
 
-        max_diff_w = comm.allreduce(max(diff_w), op=MPI.MAX)
-        min_diff_w = comm.allreduce(min(diff_w), op=MPI.MIN)
-        max_err_w  = comm.allreduce(max(err_w), op=MPI.MAX)
-        min_err_w  = comm.allreduce(min(err_w), op=MPI.MIN)
-        err_norm_w = np.sqrt(comm.allreduce(sum(diff_w ** 2), op=MPI.SUM)) / np.sqrt(comm.allreduce(sum(fom_var_state ** 2), op=MPI.SUM))
+        if COMPUTE_PROJ_ERROR:
+            x_sc         = (1.0 / scaling) * (fom_state - reference_state)
+            sol_norm     = np.sqrt(comm.allreduce(x_sc @ (weights * x_sc), op=MPI.SUM))
+            proj_ev      = rom_outputs[metric_name]["proj_error"].value
+            proj_err_val = np.sqrt(comm.allreduce(proj_ev @ (weights * proj_ev), op=MPI.SUM))
+            diag_dict["proj_err"][metric_name][i]     = proj_err_val
+            diag_dict["proj_err_rel"][metric_name][i] = proj_err_val / (sol_norm + 1e-300)
+            for state_var, sv_info in state_info.items():
+                idx          = sv_info["indices"]
+                num          = np.sqrt(comm.allreduce(proj_ev[idx] @ (weights[idx] * proj_ev[idx]), op=MPI.SUM))
+                den          = np.sqrt(comm.allreduce(x_sc[idx]    @ (weights[idx] * x_sc[idx]),    op=MPI.SUM))
+                diag_dict["proj_err_rel_var"][metric_name][state_var][i] = num / (den + 1e-300)
 
-        diag_dict["max_diff"]["weighted"][state_var][i]    = max_diff_w
-        diag_dict["max_err"]["weighted"][state_var][i]     = max_err_w
-        diag_dict["err_norm"]["weighted"][state_var][i]    = err_norm_w
 
-        diag_dict["max_diff"]["unweighted"][state_var][i]  = max_diff
-        diag_dict["max_err"]["unweighted"][state_var][i]   = max_err
-        diag_dict["err_norm"]["unweighted"][state_var][i]  = err_norm
+# ===============================
+# region REPORTING
+# ===============================
+if rank == 0:
+    state_vars = list(state_info.keys())
 
+    print("\n=== ROM Error Summary (mean over test points) ===")
+    header = f"  {'Metric':<22} {'drag_rel_err':>14} {'lift_rel_err':>14}"
+    for sv in state_vars:
+        header += f"  {'err_norm_' + sv:>18}"
+    print(header)
+    for metric_name in METRIC_NAMES:
+        row = (f"  {metric_name:<22}"
+               f" {np.mean(diag_dict['drag_rel_err'][metric_name]):>14.4e}"
+               f" {np.mean(diag_dict['lift_rel_err'][metric_name]):>14.4e}")
+        for sv in state_vars:
+            row += f"  {np.mean(diag_dict['err_norm'][metric_name][sv]):>18.4e}"
+        print(row)
 
-    # Projection errors
-    sol_norm     = np.sqrt(comm.allreduce(x.value.T @ (weights * x.value), op=MPI.SUM))
+    if COMPUTE_PROJ_ERROR:
+        print("\n=== Projection Error Summary (mean over test points) ===")
+        print(f"  {'Metric':<22} {'proj_err_abs':>14} {'proj_err_rel':>14}")
+        for metric_name in METRIC_NAMES:
+            print(f"  {metric_name:<22}"
+                  f" {np.mean(diag_dict['proj_err'][metric_name]):>14.4e}"
+                  f" {np.mean(diag_dict['proj_err_rel'][metric_name]):>14.4e}")
 
-    proj_err     = np.sqrt(comm.allreduce(error.value.T @ (weights * error.value), op=MPI.SUM))
-    proj_err_rel = proj_err / sol_norm
+        print("\n=== Per-Variable Projection Error (relative, mean over test points, unweighted basis) ===")
+        header_pv = f"  {'Variable':<12}"
+        for metric_name in METRIC_NAMES:
+            header_pv += f"  {metric_name:>18}"
+        print(header_pv)
+        for state_var in state_info.keys():
+            row_pv = f"  {state_var:<12}"
+            for metric_name in METRIC_NAMES:
+                row_pv += f"  {np.mean(diag_dict['proj_err_rel_var'][metric_name][state_var]):>18.4e}"
+            print(row_pv)
 
-    proj_err_w     = np.sqrt(comm.allreduce(error_w.value.T @ (weights * error_w.value), op=MPI.SUM))
-    proj_err_rel_w = proj_err_w / sol_norm
+    # Per-state error norm plots
+    n_states = len(state_vars)
+    fig, axes = plt.subplots(1, n_states, figsize=(4 * n_states, 4), sharey=False)
+    if n_states == 1:
+        axes = [axes]
+    for ax, sv in zip(axes, state_vars):
+        for metric_name in METRIC_NAMES:
+            ax.plot(diag_dict["err_norm"][metric_name][sv], marker='o', label=metric_name)
+        ax.set_title(sv)
+        ax.set_xlabel("Test point")
+        ax.set_ylabel(r"$\|w_{ROM} - w_{FOM}\| / \|w_{FOM}\|$")
+        ax.set_ylim(bottom=0)
+        ax.legend(fontsize=7)
+    plt.tight_layout()
+    plt.savefig("rom_metric_comparison_err_norm.png", dpi=150)
 
-    diag_dict["proj_err"]["unweighted"][i]      = proj_err
-    diag_dict["proj_err_rel"]["unweighted"][i]  = proj_err_rel
-
-    diag_dict["proj_err"]["weighted"][i]        = proj_err_w
-    diag_dict["proj_err_rel"]["weighted"][i]    = proj_err_rel_w
-
-if rank == 0:   
-    print(diag_dict)
-
-    plt.figure()
-    # for i, state_var in enumerate(state_info.keys()):
-    #     plt.subplot(2, 5, i + 1)
-    #     plt.plot(diag_dict["max_diff"]["weighted"][state_var], label='weighted', linestyle="--")
-    #     plt.plot(diag_dict["max_diff"]["unweighted"][state_var], label='unweighted', linestyle="-.")
-    #     plt.ylim(bottom=0)
-    #     plt.title(state_var)
-    #     if i == 0:
-    #         plt.ylabel(r"Max difference, $|q_{FOM} - q_{ROM}|$")
-
-    # for i, state_var in enumerate(state_info.keys()):
-    #     plt.subplot(3, 5, i + 6)
-    #     plt.plot(diag_dict["max_err"]["weighted"][state_var], label='weighted', linestyle="--")
-    #     plt.plot(diag_dict["max_err"]["unweighted"][state_var], label='unweighted', linestyle="-.")
-    #     plt.ylim(bottom=0)
-
-    for i, state_var in enumerate(state_info.keys()):
-        plt.subplot(1, 5, i + 1)
-        plt.plot(diag_dict["err_norm"]["weighted"][state_var], label='weighted', linestyle="--")
-        plt.plot(diag_dict["err_norm"]["unweighted"][state_var], label='unweighted', linestyle="-.")
-        plt.ylim(bottom=0)
-        if i == 0:
-            plt.ylabel(r"Error norm, $\frac{||w_{ROM} - w_{FOM}||}{||w_{FOM}||}$")
-        plt.xlabel("Snapshot")
-        plt.title(state_var)
-        plt.legend()
-        
-
-    plt.figure()
-    plt.subplot(1, 2, 1)
-    plt.plot(diag_dict["proj_err"]["weighted"], label='weighted', linestyle="--")
-    plt.plot(diag_dict["proj_err"]["unweighted"], label='unweighted', linestyle="-.")
-    plt.ylim(bottom=0)
-
-    plt.subplot(1, 2, 2)
-    plt.plot(diag_dict["proj_err_rel"]["weighted"], label='weighted', linestyle="--")
-    plt.plot(diag_dict["proj_err_rel"]["unweighted"], label='unweighted', linestyle="-.")
-    plt.ylim(bottom=0)
+    # Drag / lift relative error plots
+    fig2, (ax_drag, ax_lift) = plt.subplots(1, 2, figsize=(10, 4))
+    for metric_name in METRIC_NAMES:
+        ax_drag.plot(diag_dict["drag_rel_err"][metric_name], marker='o', label=metric_name)
+        ax_lift.plot(diag_dict["lift_rel_err"][metric_name], marker='o', label=metric_name)
+    ax_drag.set_title("Drag relative error")
+    ax_drag.set_xlabel("Test point")
+    ax_drag.set_ylim(bottom=0)
+    ax_drag.legend(fontsize=7)
+    ax_lift.set_title("Lift relative error")
+    ax_lift.set_xlabel("Test point")
+    ax_lift.set_ylim(bottom=0)
+    ax_lift.legend(fontsize=7)
+    plt.tight_layout()
+    plt.savefig("rom_metric_comparison_functions.png", dpi=150)
 
     plt.show()
-    plt.figure()
-
-
-        
-
-
-
-
-# # Only allow visualization and modopt output files on the root rank
-# visualize_on_this_rank           = True  if rank == 0 and not is_headless() else False
-# turn_off_outputs_on_nonroot_rank = False if rank == 0 else True
-# recording_on_root_rank           = True  if rank == 0 else False
-# rank_outputs                     = ['x'] if rank == 0 else []
-
-# # Optimization solver setup and run
-# prob                = CSDLAlphaProblem(problem_name=f'{problem_name}', simulator=sim)
-
-# # Print the FOM projection error norm after each model evaluation
-# _orig_run_model = prob.check_if_warm_and_run_model
-# def _run_model_with_proj_error(dvs, *args, **kwargs):
-#     result = _orig_run_model(dvs, *args, **kwargs)
-    
-#     numerator = np.sqrt(comm.allreduce(error.value.T @ (weights * error.value), op=MPI.SUM))
-#     denominator = np.sqrt(comm.allreduce(x.value.T @ (weights * x.value), op=MPI.SUM))
-#     if rank == 0:
-#         print(f'[proj_error] L2 norm: {numerator:.6e}', flush=True)
-#         print(f'[proj_error] relative norm: {numerator / denominator:.6e}', flush=True)
-#     return result
-
-# prob.check_if_warm_and_run_model = _run_model_with_proj_error
-
-# optimizer_choice    = 3 # Set to 1 for PySLSQP, 2 for OpenSQP, or 3 for InteriorPoint
-
-# if optimizer_choice == 1:
-#     # PySLSQP optimizer setup
-#     solver_options = {'maxiter': 20,
-#                     'iprint': 2,
-#                     'readable_outputs': rank_outputs,
-#                     'recording': recording_on_root_rank,
-#                     'turn_off_outputs': turn_off_outputs_on_nonroot_rank}
-#     optimizer   = PySLSQP(prob, solver_options=solver_options)
-#     optimizer.solve()
-#     optimizer.print_results()
-
-# elif optimizer_choice == 2:
-#     # OpenSQP optimizer setup
-#     open_sqp_options = {'maxiter': 100,
-#                         'readable_outputs': rank_outputs,
-#                         'recording': recording_on_root_rank,
-#                         'ls_max_step': 1.,
-#                         'turn_off_outputs': turn_off_outputs_on_nonroot_rank,}
-#     optimizer = OpenSQP(prob, **open_sqp_options)
-#     optimizer.solve()
-#     optimizer.print_results()
-
-# elif optimizer_choice == 3:
-#     # InteriorPoint optimizer setup
-#     interior_point_options = {'maxiter': 100,
-#                             'readable_outputs': rank_outputs,
-#                             'recording': recording_on_root_rank,
-#                             'ls_max_step': 1.,
-#                             'turn_off_outputs': turn_off_outputs_on_nonroot_rank}
-#     optimizer   = InteriorPoint(prob, **interior_point_options)
-#     optimizer.solve()
-#     optimizer.print_results()
-    
-# else:
-#     print(f'Check optimizer choice. {optimizer_choice} is not an option.')
-
-
-
-
-# # Used this to test the component
-# from csdl_dafoam.utils.csdl_test_functions import test_jacvec_product, test_idempotence, test_inverse_jacobian
-# import matplotlib.pyplot as plt
-# np.random.seed(0)
-
-# test_component = dafoam_rom
-
-# inputs  = {k: vv.value for k, vv in test_component.input_dict.items()}
-# v       = {k: np.random.rand(*vv.value.shape)*vv.value for k, vv in test_component.output_dict.items()}
-# w       = {k: np.random.rand(*vv.value.shape)*vv.value for k, vv in test_component.input_dict.items()}
-
-# for key in w.keys():
-#     if key != "aero_vol_coords":
-#         w[key] = 0 * w[key]
-
-# print(f'Inputs: {inputs}')
-# print(f'v: {v}')
-# print(f'w: {w}')
-
-# eps_test_vals = [1e-3, 1e-4, 1e-5, 1e-6, 1e-7, 1e-8, 1e-9, 1e-10]
-# err = np.zeros_like(eps_test_vals)
-# i = 0
-# for eps in eps_test_vals:
-#     lhs, rhs, err[i] = test_jacvec_product(test_component, inputs, v, w, eps=eps)
-#     i += 1 
-
-# plt.rcParams['text.usetex'] = True
-# plt.figure()
-# # ax = plt.subplot(2, 1, 1)
-
-# plt.loglog(eps_test_vals, err)
-# plt.title(r'jacvec_product vs FD ($w^T J^T v = v^T J w$)')
-# plt.xlabel(r'Stepsize, $\epsilon$')
-# plt.ylabel(r'Error, $\frac{lhs - rhs}{rhs}$')
-# plt.grid(visible=True)
-# plt.show(block=False)
-
-# if rank == 0:
-#     input('Press ENTER to continue...')
-# else:
-#     quiet_barrier(comm)
