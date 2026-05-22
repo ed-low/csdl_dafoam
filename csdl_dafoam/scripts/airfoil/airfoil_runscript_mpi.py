@@ -469,11 +469,48 @@ recorder.stop()
 # ===============================
 sim = csdl.experimental.PySimulator(recorder)
 
-loss_var    = objective_fun
-wrt         = flight_conditions_group.angle_of_attack_deg
-grad        = sim.compute_totals(loss_var, wrt)[loss_var, wrt]
+names, inds = dafoam_instance.getStateVariableMap(includeComponentSuffix=False)
+nFaces = dafoam_instance.solver.getNLocalFaces()
+phi_of = np.zeros(nFaces, dtype=float)
+states = dafoam_instance.getStates()
+phi_of = states[inds == names.index("phi")]
 
-print(f"Rank {rank} grad : {grad}")
+
+
+
+phi_reconstructed = dafoam_instance.computePhiFromU()
+
+abs_err = np.abs(phi_reconstructed - phi_of)
+rel_err = abs_err / (np.abs(phi_of) + 1e-30)
+
+import matplotlib.pyplot as plt
+
+plt.figure()
+plt.plot(phi_of, label="state")
+plt.plot(phi_reconstructed, label="reconstructed")
+plt.plot(phi_of - phi_reconstructed, label="diff")
+plt.title(f"Rank {rank}: Phi")
+
+plt.figure()
+plt.plot(rel_err)
+plt.title(f"Rank {rank}: Relative error")
+plt.show()
+
+print(f"Rank {rank}: Allclose? {np.allclose(phi_of, phi_reconstructed, rtol=1e-5, atol=1e-10)}")
+
+
+print(f"max abs error: {abs_err.max():.3e}")
+print(f"max rel error: {rel_err.max():.3e}")
+print(f"mean rel error: {rel_err.mean():.3e}")
+print(f"Relative norm: { np.linalg.norm(phi_reconstructed - phi_of) / max(np.linalg.norm(phi_of), 1e-12)}")
+
+
+
+# loss_var    = objective_fun
+# wrt         = flight_conditions_group.angle_of_attack_deg
+# grad        = sim.compute_totals(loss_var, wrt)[loss_var, wrt]
+
+# print(f"Rank {rank} grad : {grad}")
 
 
 
