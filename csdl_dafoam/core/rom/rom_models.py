@@ -1,5 +1,6 @@
 # BaseModel packages
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 
 # DAFoamROMModel packages
 from csdl_dafoam.core.csdl_dafoam import has_global_nan_or_inf
@@ -11,6 +12,141 @@ from csdl_alpha import Variable, VariableGroup
 # DAFoamLSPGModel
 from contextlib import contextmanager, nullcontext
 
+
+
+# region NORMALIZATIONCONFIG
+@dataclass
+class NormalizationConfig:
+    """Fixed global reference values for non-dimensionalisation of compressible flow ROMs.
+
+    Usage (no DAFoam dependency — safe to use in offline basis scripts):
+        cfg = NormalizationConfig(p_ref=..., rho_ref=..., U_ref=..., T_ref=...,
+                                  nu_ref=..., M_ref=..., cv=...)
+        s = cfg.make_scaling_vector(state_indices)
+        w = cfg.make_chu_weight_vector(state_indices)
+    """
+    p_ref:   float          # reference pressure [Pa]
+    rho_ref: float          # reference density [kg/m^3]
+    U_ref:   float          # reference velocity magnitude [m/s]
+    T_ref:   float          # reference temperature [K]
+    nu_ref:  float          # reference kinematic viscosity [m^2/s]
+    M_ref:   float          # reference Mach number (for Chu energy weights)
+    cv:      float          # specific heat at constant volume [J/(kg K)]
+    gamma:   float = 1.4    # ratio of specific heats
+
+    # ------------------------------------------------------------------
+    # Scaling vector
+    # ------------------------------------------------------------------
+    def make_scaling_vector(self, state_indices: dict) -> np.ndarray:
+        """Per-DOF linear scaling denominators s (length n_local_states).
+
+        Variable conventions (DAFoam getStateVariableMap with includeComponentSuffix=False):
+            p       -> rho_ref * U_ref^2   (dynamic pressure scale)
+            U       -> U_ref               (all velocity components grouped as "U")
+            T       -> T_ref
+            nuTilda -> 1.0                 (log scaling is nonlinear; handled at reconstruction)
+            phi     -> 1.0                 (face flux; not in ROM basis)
+            other   -> 1.0  (with warning)
+        """
+        n_total = sum(mask.sum() for mask in state_indices.values())
+        s = np.ones(n_total)
+
+        _var_scale = {
+            "p":       self.rho_ref * self.U_ref**2,
+            "U":       self.U_ref,
+            "T":       self.T_ref,
+            "nuTilda": 1.0,
+            "phi":     1.0,
+        }
+
+        for var, mask in state_indices.items():
+            if var in _var_scale:
+                s[mask] = _var_scale[var]
+            else:
+                print(f"NormalizationConfig.make_scaling_vector: unknown variable '{var}', defaulting to 1.0")
+
+        return s
+
+    # ------------------------------------------------------------------
+    # Chu energy weight vector
+    # ------------------------------------------------------------------
+    def make_chu_weight_vector(self, state_indices: dict) -> np.ndarray:
+        """Per-DOF Chu energy norm weights on *scaled* variables (length n_local_states).
+
+        Cell volumes V_i are applied externally (multiply result by expand_cell_volumes output).
+
+        Weights on scaled variables:
+            p*      -> M_ref^2
+            U*      -> 1.0   (each velocity component)
+            T*      -> 1.0 / ((gamma - 1) * gamma * M_ref^2)
+            nuTilda*-> 1.0   (turbulence, unit weight; cell volume applied externally)
+            phi     -> 1.0   (not in basis; weight inconsequential)
+            other   -> 1.0  (with warning)
+        """
+        n_total = sum(mask.sum() for mask in state_indices.values())
+        w = np.ones(n_total)
+
+        T_weight = 1.0 / ((self.gamma - 1.0) * self.gamma * self.M_ref**2)
+        _var_weight = {
+            "p":       self.M_ref**2,
+            "U":       1.0,
+            "T":       T_weight,
+            "nuTilda": 1.0,
+            "phi":     1.0,
+        }
+
+        for var, mask in state_indices.items():
+            if var in _var_weight:
+                w[mask] = _var_weight[var]
+            else:
+                print(f"NormalizationConfig.make_chu_weight_vector: unknown variable '{var}', defaulting to 1.0")
+
+        return w
+
+    # ------------------------------------------------------------------
+    # Spalart–Allmaras log scaling (applied to nuTilda DOFs)
+    # ------------------------------------------------------------------
+    def apply_log_scaling_sa(self, nu_tilda: np.ndarray) -> np.ndarray:
+        """Map nuTilda -> log(1 + nuTilda / nu_ref) elementwise (numerically stable)."""
+        return np.log1p(nu_tilda / self.nu_ref)
+
+    def invert_log_scaling_sa(self, nu_tilda_star: np.ndarray) -> np.ndarray:
+        """Inverse: nu_ref * (exp(nu_tilda_star) - 1) elementwise (numerically stable)."""
+        return self.nu_ref * np.expm1(nu_tilda_star)
+
+
+# region EXPAND_CELL_VOLUMES
+def expand_cell_volumes(cell_volumes: np.ndarray, state_indices: dict) -> np.ndarray:
+    """Expand a per-cell volume array to a per-DOF array.
+
+    For each variable block identified by state_indices, repeats V_i for every
+    DOF belonging to cell i.
+
+    NOTE: assumes component-major DOF ordering within each variable block, i.e.
+    [cell_0_comp0, cell_1_comp0, ..., cell_N_comp0, cell_0_comp1, ...].
+    If DAFoam uses cell-major ordering (interleaved), replace np.tile with np.repeat.
+
+    Parameters
+    ----------
+    cell_volumes : (n_local_cells,) array of mesh cell volumes (distributed).
+    state_indices : dict mapping variable names to boolean DOF index arrays,
+                    as returned by getStateVariableMap(includeComponentSuffix=False).
+
+    Returns
+    -------
+    (n_local_dofs,) array of per-DOF volumes.
+    """
+    n_local_cells = len(cell_volumes)
+    n_total_dofs  = sum(mask.sum() for mask in state_indices.values())
+    result        = np.zeros(n_total_dofs)
+
+    for var, mask in state_indices.items():
+        n_var_dofs   = int(mask.sum())
+        n_components = n_var_dofs // n_local_cells  # DOFs per cell for this variable
+        # Component-major: tile cell volumes once per component
+        result[mask] = np.tile(cell_volumes, n_components)
+
+    return result
 
 
 # region BASEMODEL
@@ -782,3 +918,242 @@ class DAFoamLSPGModel(DAFoamProjectionROMModel):
         r = fom_residual
         JT_r = self._jacT_vec_product(fom_state=fom_state, vec=m * r)
         return s[:, None] * np.outer(JT_r, vec)
+
+
+# region SPLITBASISLSPGMODEL
+class SplitBasisLSPGModel(DAFoamLSPGModel):
+    """LSPG ROM with separate POD bases for flow ([p, U, T]) and turbulence (nuTilda).
+
+    The face-flux variable phi is excluded from both bases. After reconstructing the
+    flow and turbulence states, phi must be computed separately by overriding
+    _compute_phi_from_states().
+
+    Turbulence is handled in log space: nuTilda is reconstructed as
+        w_nu = nu_ref * (exp(log_ref + Phi_nu @ q_nu) - 1)
+    where log_ref = log(1 + w_ref_nu / nu_ref).
+
+    Inner product weights follow the fixed-reference Chu energy norm on scaled variables,
+    multiplied by cell volumes.
+
+    Parameters
+    ----------
+    dafoam_input_variables_group : VariableGroup
+    pod_modes_flow  : (n_flow_dofs_local, n_modes_flow)  — basis for p, U, T
+    pod_modes_turb  : (n_turb_dofs_local, n_modes_turb)  — basis for nuTilda
+    reference_fom_state : (n_local_states,) full FOM state vector (distributed)
+    norm_config     : NormalizationConfig instance
+    cell_volumes    : (n_local_cells,) mesh cell volumes (distributed)
+    dafoam_instance : PYDAFOAM solver
+    turb_var_name   : variable name for turbulence in getStateVariableMap (default "nuTilda")
+    **kwargs        : forwarded to DAFoamLSPGModel (normalize_residuals, fd_step, etc.)
+    """
+
+    def __init__(self,
+                 dafoam_input_variables_group,
+                 pod_modes_flow:  np.ndarray,
+                 pod_modes_turb:  np.ndarray,
+                 reference_fom_state: np.ndarray,
+                 norm_config: NormalizationConfig,
+                 cell_volumes: np.ndarray,
+                 dafoam_instance,
+                 turb_var_name: str = "nuTilda",
+                 **kwargs):
+
+        n_local_states = dafoam_instance.getNLocalAdjointStates()
+        n_modes_flow   = pod_modes_flow.shape[1]
+        n_modes_turb   = pod_modes_turb.shape[1]
+
+        # --- DOF masks ---------------------------------------------------
+        names, indices = dafoam_instance.getStateVariableMap(includeComponentSuffix=False)
+        state_indices  = {name: indices == names.index(name) for name in names}
+
+        phi_var_name = "phi"
+        turb_mask    = state_indices[turb_var_name]
+        phi_mask     = state_indices.get(phi_var_name, np.zeros(n_local_states, dtype=bool))
+        flow_mask    = np.zeros(n_local_states, dtype=bool)
+        for var, mask in state_indices.items():
+            if var not in (turb_var_name, phi_var_name):
+                flow_mask |= mask
+
+        # --- Block-diagonal combined basis Phi ---------------------------
+        # phi rows remain zero — phi is reconstructed separately via _compute_phi_from_states
+        n_modes_total = n_modes_flow + n_modes_turb
+        Phi           = np.zeros((n_local_states, n_modes_total))
+        Phi[flow_mask, :n_modes_flow] = pod_modes_flow
+        Phi[turb_mask, n_modes_flow:] = pod_modes_turb
+
+        # --- Scaling and weight vectors ----------------------------------
+        scaling          = norm_config.make_scaling_vector(state_indices)
+        chu_weights      = norm_config.make_chu_weight_vector(state_indices)
+        cell_vol_per_dof = expand_cell_volumes(cell_volumes, state_indices)
+        weights          = cell_vol_per_dof * chu_weights
+
+        # --- Initialise parent -------------------------------------------
+        super().__init__(
+            dafoam_input_variables_group,
+            Phi,
+            reference_fom_state,
+            scaling,
+            weights,
+            dafoam_instance,
+            **kwargs,
+        )
+
+        # --- Private attributes ------------------------------------------
+        self._flow_mask      = flow_mask
+        self._turb_mask      = turb_mask
+        self._phi_mask       = phi_mask
+        self._n_modes_flow   = n_modes_flow
+        self._n_modes_turb   = n_modes_turb
+        self._pod_modes_flow = pod_modes_flow
+        self._pod_modes_turb = pod_modes_turb
+        self._norm_config    = norm_config
+        # Precompute log-space reference for turbulence reconstruction.
+        # NOTE: if reference_fom_state is a csdl Variable, its .value will be extracted
+        # by the parent's evaluate_input_output(); update _log_ref_nu there if needed.
+        self._log_ref_nu     = norm_config.apply_log_scaling_sa(reference_fom_state[turb_mask])
+
+        # Store split state_indices for diagnostics
+        self._split_state_indices = state_indices
+
+    # region _reconstruct_fom_state
+    def _reconstruct_fom_state(self, rom_state: np.ndarray) -> np.ndarray:
+        # 1. Linear reconstruction for all DOFs via parent formula: w_ref + s * Phi @ q.
+        #    phi rows are zero in Phi, so phi DOFs initialise to w_ref[phi_mask].
+        w = super()._reconstruct_fom_state(rom_state)
+
+        # 2. Override turbulence DOFs with log-space reconstruction.
+        q_nu = rom_state[self._n_modes_flow:]
+        w[self._turb_mask] = self._norm_config.invert_log_scaling_sa(
+            self._log_ref_nu + self._pod_modes_turb @ q_nu
+        )
+
+        # 3. Compute face-flux phi from the reconstructed flow state and overwrite.
+        if self._phi_mask.any():
+            w[self._phi_mask] = self._compute_phi_from_states(w)
+
+        return w
+
+    # region _compute_phi_from_states
+    def _compute_phi_from_states(self, w: np.ndarray) -> np.ndarray:
+        """Compute face-flux (phi) DOFs from the reconstructed flow state w.
+
+        Override this method with the DAFoam phi computation routine.
+
+        Parameters
+        ----------
+        w : full reconstructed FOM state vector (n_local_states,), distributed.
+
+        Returns
+        -------
+        phi_vals : (n_phi_dofs_local,) array of face-flux values to be written
+                   into w[self._phi_mask].
+        """
+        raise NotImplementedError(
+            "SplitBasisLSPGModel._compute_phi_from_states must be implemented. "
+            "Subclass this model and override _compute_phi_from_states() with the "
+            "DAFoam phi reconstruction routine (e.g. dafoam_instance.updatePhi(w)), "
+            "then return the local phi DOF array."
+        )
+
+    # region pre_solve_diagnostics
+    def pre_solve_diagnostics(self, initial_rom_state: np.ndarray) -> None:
+        # Parent prints combined-basis diagnostics (ortho check + variable summary + energy table)
+        super().pre_solve_diagnostics(initial_rom_state)
+
+        if self.disable_presolve_diagnostics:
+            return
+
+        W   = 72
+        sep = "-" * W
+        self.print_fn(f"\n{sep}")
+        self.print_fn(f"  SplitBasisLSPGModel — Per-Basis Diagnostics")
+        self.print_fn(sep)
+
+        m = self.weights
+
+        # --- Flow basis orthogonality: Phi_f^T W_f Phi_f = I ---
+        Phi_f = self._pod_modes_flow
+        m_f   = m[self._flow_mask]
+        nf    = Phi_f.shape[1]
+        Gf_local    = Phi_f.T @ (m_f[:, None] * Phi_f)
+        Gf          = self.comm.allreduce(Gf_local, op=MPI.SUM)
+        err_f       = np.linalg.norm(Gf - np.eye(nf), "fro")
+        ok_f        = err_f < 1e-10
+        self.print_fn(
+            f"  {'Flow basis ortho ‖Φf^T Wf Φf - I‖_F':<40} "
+            + (f"PASS ({err_f:.2e})" if ok_f else f"WARN ({err_f:.2e})")
+        )
+
+        # --- Turb basis orthogonality: Phi_nu^T W_nu Phi_nu = I ---
+        Phi_nu = self._pod_modes_turb
+        m_nu   = m[self._turb_mask]
+        nnu    = Phi_nu.shape[1]
+        Gnu_local   = Phi_nu.T @ (m_nu[:, None] * Phi_nu)
+        Gnu         = self.comm.allreduce(Gnu_local, op=MPI.SUM)
+        err_nu      = np.linalg.norm(Gnu - np.eye(nnu), "fro")
+        ok_nu       = err_nu < 1e-10
+        self.print_fn(
+            f"  {'Turb  basis ortho ‖Φν^T Wν Φν - I‖_F':<40} "
+            + (f"PASS ({err_nu:.2e})" if ok_nu else f"WARN ({err_nu:.2e})")
+        )
+
+        # --- Flow mode energy fractions per sub-variable ---
+        flow_var_names = [v for v in self._split_state_indices
+                          if v not in ("nuTilda", "phi")]
+        # Map from full-state indices to flow-DOF local indices
+        flow_idx_map   = {v: self._split_state_indices[v][self._flow_mask]
+                          for v in flow_var_names}
+
+        self.print_fn(f"\n  Flow basis — mode M-weighted energy fraction per variable")
+        header = f"  {'Mode':>6}" + "".join(f"  {v:>10}" for v in flow_var_names) + f"  {'‖φ‖²_M':>10}"
+        self.print_fn(header)
+        self.print_fn("  " + "-" * (len(header) - 2))
+        for k in range(nf):
+            phi_k = Phi_f[:, k]
+            total = self.comm.allreduce(np.sum(m_f * phi_k**2), op=MPI.SUM)
+            fracs = []
+            for v in flow_var_names:
+                idx_v  = flow_idx_map[v]
+                v_tot  = self.comm.allreduce(np.sum(m_f[idx_v] * phi_k[idx_v]**2), op=MPI.SUM)
+                fracs.append(v_tot / max(total, 1e-300))
+            row = f"  {k:>6d}" + "".join(f"  {f:>10.4f}" for f in fracs) + f"  {total:>10.4f}"
+            self.print_fn(row)
+
+        # --- Turb mode energies ---
+        self.print_fn(f"\n  Turb  basis — mode M-weighted energy")
+        self.print_fn(f"  {'Mode':>6}  {'‖φ‖²_M':>10}")
+        self.print_fn(f"  {'------':>6}  {'----------':>10}")
+        for k in range(nnu):
+            phi_k = Phi_nu[:, k]
+            total = self.comm.allreduce(np.sum(m_nu * phi_k**2), op=MPI.SUM)
+            self.print_fn(f"  {k:>6d}  {total:>10.4f}")
+
+        self.print_fn(sep)
+
+    # region from_norm_config
+    @classmethod
+    def from_norm_config(cls,
+                         dafoam_input_variables_group,
+                         pod_modes_flow:  np.ndarray,
+                         pod_modes_turb:  np.ndarray,
+                         reference_fom_state: np.ndarray,
+                         norm_config: NormalizationConfig,
+                         cell_volumes: np.ndarray,
+                         dafoam_instance,
+                         **kwargs) -> "SplitBasisLSPGModel":
+        """Convenience constructor — delegates directly to __init__.
+
+        Provided as a named entry point for clarity in offline basis-construction scripts
+        that import NormalizationConfig without a live DAFoam instance for scaling setup.
+        """
+        return cls(
+            dafoam_input_variables_group,
+            pod_modes_flow,
+            pod_modes_turb,
+            reference_fom_state,
+            norm_config,
+            cell_volumes,
+            dafoam_instance,
+            **kwargs,
+        )
