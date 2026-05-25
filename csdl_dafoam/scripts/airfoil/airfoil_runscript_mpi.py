@@ -470,39 +470,84 @@ recorder.stop()
 sim = csdl.experimental.PySimulator(recorder)
 
 names, inds = dafoam_instance.getStateVariableMap(includeComponentSuffix=False)
+phi_inds    = inds == names.index("phi")
 nFaces = dafoam_instance.solver.getNLocalFaces()
-phi_of = np.zeros(nFaces, dtype=float)
-states = dafoam_instance.getStates()
-phi_of = states[inds == names.index("phi")]
+
+states1 = dafoam_instance.getStates()
+states1_reconstructed = states1.copy()
+states1_reconstructed[phi_inds] = dafoam_instance.computePhiFromU()
+
+dafoam_instance.solver.writeAdjointFields("standard_phi", 0.0001, states1, dropAdjointPrefix=False)
+dafoam_instance.solver.writeAdjointFields("computed_phi", 0.0001, states1_reconstructed, dropAdjointPrefix=False)
+
+phi_of1 = states1[phi_inds]
+phi_reconstructed1 = dafoam_instance.computePhiFromU()
+
+abs_err1 = np.abs(phi_reconstructed1 - phi_of1)
+rel_err1 = abs_err1 / (np.abs(phi_of1) + 1e-30)
 
 
 
+sim[flight_conditions_group.angle_of_attack_deg] = 2
+sim.run()
 
-phi_reconstructed = dafoam_instance.computePhiFromU()
+states2 = dafoam_instance.getStates()
+states2_reconstructed = states2.copy()
+states2_reconstructed[phi_inds] = dafoam_instance.computePhiFromU()
 
-abs_err = np.abs(phi_reconstructed - phi_of)
-rel_err = abs_err / (np.abs(phi_of) + 1e-30)
+dafoam_instance.solver.writeAdjointFields("standard_phi", 0.0002, states2, dropAdjointPrefix=False)
+dafoam_instance.solver.writeAdjointFields("computed_phi", 0.0002, states2_reconstructed, dropAdjointPrefix=False)
+
+phi_of2 = states2[phi_inds]
+phi_reconstructed2 = dafoam_instance.computePhiFromU()
+
+abs_err2 = np.abs(phi_reconstructed2 - phi_of1)
+rel_err2 = abs_err2 / (np.abs(phi_of2) + 1e-30)
+
+
+
 
 import matplotlib.pyplot as plt
 
 plt.figure()
-plt.plot(phi_of, label="state")
-plt.plot(phi_reconstructed, label="reconstructed")
-plt.plot(phi_of - phi_reconstructed, label="diff")
+plt.plot(phi_of1,                                   label="state")
+plt.plot(phi_reconstructed1,                        label="reconstructed")
+plt.plot(phi_of1 - phi_reconstructed1,              label="diff")
 plt.title(f"Rank {rank}: Phi")
+plt.legend()
 
 plt.figure()
-plt.plot(rel_err)
+plt.plot(rel_err1)
 plt.title(f"Rank {rank}: Relative error")
+
+plt.figure()
+plt.plot(phi_of1 - phi_of2,                         label="diff from state")
+plt.plot(phi_reconstructed1 - phi_reconstructed2,   label="diff from reconstruct")
+plt.title(f"Rank {rank}: Phi diffs (between AoA=0deg and AoA=2deg)")
+plt.legend()
+plt.plot()
+
+plt.figure()
+all_phi_of1 = np.concatenate(comm.allgather(phi_of1), axis=0)
+eps         = 1e-3 * np.sqrt(np.mean(all_phi_of1 ** 2))
+stab_err1   = np.abs(phi_of1 - phi_reconstructed1) / (np.abs(phi_of1) + eps)
+symm_err1   = 2 * np.abs(phi_of1 - phi_reconstructed1) / (np.abs(phi_of1) + np.abs(phi_reconstructed1) + eps)
+plt.plot(stab_err1, label="Stabilized")
+plt.plot(symm_err1, label="Symmetric")
+plt.title(f"Rank {rank}: Stable relative errors (eps = {eps})")
+plt.legend()
+plt.plot()
+
+
 plt.show()
 
-print(f"Rank {rank}: Allclose? {np.allclose(phi_of, phi_reconstructed, rtol=1e-5, atol=1e-10)}")
+print(f"Rank {rank}: Allclose? {np.allclose(phi_of1, phi_reconstructed1, rtol=1e-5, atol=1e-8)}")
 
 
-print(f"max abs error: {abs_err.max():.3e}")
-print(f"max rel error: {rel_err.max():.3e}")
-print(f"mean rel error: {rel_err.mean():.3e}")
-print(f"Relative norm: { np.linalg.norm(phi_reconstructed - phi_of) / max(np.linalg.norm(phi_of), 1e-12)}")
+print(f"max abs error: {abs_err1.max():.3e}")
+print(f"max rel error: {rel_err1.max():.3e}")
+print(f"mean rel error: {rel_err1.mean():.3e}")
+print(f"Relative norm: { np.linalg.norm(phi_reconstructed1 - phi_of1) / max(np.linalg.norm(phi_of1), 1e-12)}")
 
 
 
