@@ -122,9 +122,9 @@ def expand_cell_volumes(cell_volumes: np.ndarray, state_indices: dict) -> np.nda
     For each variable block identified by state_indices, repeats V_i for every
     DOF belonging to cell i.
 
-    NOTE: assumes component-major DOF ordering within each variable block, i.e.
-    [cell_0_comp0, cell_1_comp0, ..., cell_N_comp0, cell_0_comp1, ...].
-    If DAFoam uses cell-major ordering (interleaved), replace np.tile with np.repeat.
+    NOTE: assumes cell-major (interleaved) DOF ordering for vector fields, i.e.
+    [cell_0=(comp0,comp1,comp2), cell_1=(comp0,comp1,comp2), ...],
+    consistent with OpenFOAM/DAFoam and with how _compute_split_pod_modes weights snapshots.
 
     Parameters
     ----------
@@ -138,13 +138,19 @@ def expand_cell_volumes(cell_volumes: np.ndarray, state_indices: dict) -> np.nda
     """
     n_local_cells = len(cell_volumes)
     n_total_dofs  = sum(mask.sum() for mask in state_indices.values())
-    result        = np.zeros(n_total_dofs)
+    result        = np.ones(n_total_dofs)  # default 1.0 for non-cell variables (e.g. phi)
 
     for var, mask in state_indices.items():
-        n_var_dofs   = int(mask.sum())
-        n_components = n_var_dofs // n_local_cells  # DOFs per cell for this variable
-        # Component-major: tile cell volumes once per component
-        result[mask] = np.tile(cell_volumes, n_components)
+        n_var_dofs = int(mask.sum())
+        if n_var_dofs % n_local_cells != 0:
+            # Face variable (e.g. phi): DOF count not divisible by n_cells — leave at 1.0.
+            # phi rows are zero in the combined basis so this weight has no effect.
+            continue
+        n_components = n_var_dofs // n_local_cells
+        # DAFoam/OpenFOAM stores vector fields in cell-major (interleaved) order:
+        # [Ux0,Uy0,Uz0, Ux1,Uy1,Uz1, ...] so each cell's volume repeats n_components times.
+        # np.repeat is consistent with how _compute_split_pod_modes weights vector snapshots.
+        result[mask] = np.repeat(cell_volumes, n_components)
 
     return result
 
@@ -338,7 +344,7 @@ class DAFoamProjectionROMModel(BaseModel):
         w = self._reconstruct_fom_state(rom_state=q)
         
         if not has_global_nan_or_inf(w, self.comm):
-            self.dafoam_instance.setStates(w)
+            self._set_fom_states(w)
         else:
             self.print_fn("DAFoamROMModel: Detected NaN(s) in input_vals. Skipping DAFoam setStates")
 
@@ -505,7 +511,7 @@ class DAFoamProjectionROMModel(BaseModel):
         # This assumes we have already set the inputs! Should generally be the case
         w = fom_state
         dafoam_instance = self.dafoam_instance
-        dafoam_instance.setStates(w)
+        self._set_fom_states(w)
         residuals = dafoam_instance.getResiduals()
         return residuals if self.normalize_residuals else residuals * dafoam_instance.getStateWeights()
         
@@ -539,7 +545,7 @@ class DAFoamProjectionROMModel(BaseModel):
         v = vec
         w = fom_state
 
-        dafoam_instance.setStates(w)
+        self._set_fom_states(w)
 
         seed    = np.ascontiguousarray(v.copy())
         product = np.zeros_like(seed)
@@ -579,7 +585,7 @@ class DAFoamProjectionROMModel(BaseModel):
             v        = M[:, i]
             JM[:, i] = self._jac_vec_product(fom_state=w, direction=v, fom_residual=r0, step=step, reset_state=False)
 
-        self.dafoam_instance.setStates(w)  # reset OF state to w (due to perturbation step in _jac_vec_product)
+        self._set_fom_states(w)  # reset OF state to w (due to perturbation step in _jac_vec_product)
 
         return JM
 
@@ -610,10 +616,15 @@ class DAFoamProjectionROMModel(BaseModel):
             result = (r_fwd - r0) / h
 
         if reset_state:
-            self.dafoam_instance.setStates(w)
+            self._set_fom_states(w)
 
         return result
         
+
+    # region _set_fom_states
+    def _set_fom_states(self, w: np.ndarray) -> None:
+        """Set DAFoam states. Subclasses may override to add post-set processing."""
+        self.dafoam_instance.setStates(w)
 
     # region print_fn
     # Custom print function, if necessary (mainly for MPI business)
@@ -636,6 +647,19 @@ class DAFoamProjectionROMModel(BaseModel):
         self.print_fn(f"\n{sep}")
         self.print_fn(f"  DAFoam ROM — Pre-Solve Diagnostics")
         self.print_fn(sep)
+
+        # --- FOM residual at reference state (q=0) ---
+        w_ref     = self.reference_fom_state
+        r_ref     = self._eval_fom_residual(fom_state=w_ref)
+        r_ref_sq  = self.comm.allreduce(np.dot(r_ref, r_ref), op=MPI.SUM)
+        r_ref_norm = np.sqrt(r_ref_sq)
+        self.print_fn(f"  {'‖r_fom(w_ref)‖ (q=0 initial residual)':<40} {r_ref_norm:.4e}")
+        self.print_fn(f"  {'Per-variable ‖r_fom(w_ref)‖':<40}")
+        for var, idx in self.state_indices.items():
+            rv    = r_ref[idx]
+            n_v   = np.sqrt(self.comm.allreduce(np.dot(rv, rv), op=MPI.SUM))
+            self.print_fn(f"    {var:>10}: {n_v:.4e}")
+        self.print_fn("")
 
         # --- Basis orthogonality: Phi^T M Phi = I ---
         Phi = self.pod_modes
@@ -920,6 +944,120 @@ class DAFoamLSPGModel(DAFoamProjectionROMModel):
         return s[:, None] * np.outer(JT_r, vec)
 
 
+# region PHICOMPUTINGLSPGMODEL
+class PhiComputingLSPGModel(DAFoamLSPGModel):
+    """LSPG ROM that computes face-flux phi from the reconstructed velocity field.
+
+    Identical to DAFoamLSPGModel except that after the standard linear reconstruction
+    (w_ref + s * Phi @ q), phi DOFs are overwritten with values derived from the
+    reconstructed velocity via setPhiFromU / computePhiFromU.  The POD basis is a
+    single combined basis spanning all state variables (including phi columns, which
+    are simply ignored at reconstruction time).
+
+    Use this as a stepping-stone between the plain LSPG and the full SplitBasisLSPGModel
+    to isolate the effect of phi computation alone.
+    """
+
+    def __init__(self,
+                 dafoam_input_variables_group,
+                 pod_modes: np.ndarray,
+                 reference_fom_state: np.ndarray,
+                 scaling: np.ndarray,
+                 weights: np.ndarray,
+                 dafoam_instance,
+                 phi_var_name: str = "phi",
+                 **kwargs):
+        super().__init__(
+            dafoam_input_variables_group,
+            pod_modes,
+            reference_fom_state,
+            scaling,
+            weights,
+            dafoam_instance,
+            **kwargs,
+        )
+
+        n_local_states = dafoam_instance.getNLocalAdjointStates()
+        names, indices = dafoam_instance.getStateVariableMap(includeComponentSuffix=False)
+        state_indices  = {name: indices == names.index(name) for name in names}
+        self._phi_mask = state_indices.get(phi_var_name, np.zeros(n_local_states, dtype=bool))
+
+    # region _reconstruct_fom_state
+    def _reconstruct_fom_state(self, rom_state: np.ndarray) -> np.ndarray:
+        w = super()._reconstruct_fom_state(rom_state)
+        if self._phi_mask.any():
+            w[self._phi_mask] = self._compute_phi_from_states(w)
+        return w
+
+    # region _compute_phi_from_states
+    def _compute_phi_from_states(self, w: np.ndarray) -> np.ndarray:
+        """Return face-flux phi consistent with the velocity in w."""
+        self.dafoam_instance.setStates(w)
+        self.dafoam_instance.setPhiFromU()
+        return self.dafoam_instance.computePhiFromU()
+
+
+# region PERVARIABLELSPGMODEL
+class PerVariableLSPGModel(DAFoamLSPGModel):
+    """LSPG ROM with a separate POD basis for every state variable.
+
+    The combined trial basis Phi is block-diagonal: each variable occupies its own
+    column block, sized by the number of modes chosen for that variable.  Phi is
+    included as one of those blocks (linear reconstruction, no velocity-based phi
+    computation).  All state variables are reconstructed linearly.
+
+    Parameters
+    ----------
+    dafoam_input_variables_group : VariableGroup
+    pod_modes_per_var : dict[str, np.ndarray]
+        {var_name: (n_local_dofs_var, n_modes_var)} in variable-order DOF layout
+        as returned by TrainingDataInterface.load_per_variable_pod_modes.
+    reference_fom_state : (n_local_states,) full state vector, cell-interleaved
+    scaling  : (n_local_states,) per-DOF scaling, cell-interleaved
+    weights  : (n_local_states,) per-DOF inner-product weights, cell-interleaved
+    dafoam_instance : PYDAFOAM solver
+    **kwargs : forwarded to DAFoamLSPGModel (normalize_residuals, fd_step, etc.)
+    """
+
+    def __init__(self,
+                 dafoam_input_variables_group,
+                 pod_modes_per_var: dict,
+                 reference_fom_state: np.ndarray,
+                 scaling: np.ndarray,
+                 weights: np.ndarray,
+                 dafoam_instance,
+                 **kwargs):
+
+        n_local_states = dafoam_instance.getNLocalAdjointStates()
+        names, indices = dafoam_instance.getStateVariableMap(includeComponentSuffix=False)
+        state_indices  = {name: indices == names.index(name) for name in names}
+
+        n_modes_total = sum(m.shape[1] for m in pod_modes_per_var.values())
+        Phi           = np.zeros((n_local_states, n_modes_total))
+
+        col_offset = 0
+        var_mode_slices = {}
+        for var in names:
+            modes       = pod_modes_per_var[var]
+            n_modes_var = modes.shape[1]
+            mask        = state_indices[var]
+            Phi[mask, col_offset:col_offset + n_modes_var] = modes
+            var_mode_slices[var] = slice(col_offset, col_offset + n_modes_var)
+            col_offset += n_modes_var
+
+        super().__init__(
+            dafoam_input_variables_group,
+            Phi,
+            reference_fom_state,
+            scaling,
+            weights,
+            dafoam_instance,
+            **kwargs,
+        )
+
+        self._var_mode_slices = var_mode_slices
+
+
 # region SPLITBASISLSPGMODEL
 class SplitBasisLSPGModel(DAFoamLSPGModel):
     """LSPG ROM with separate POD bases for flow ([p, U, T]) and turbulence (nuTilda).
@@ -1036,25 +1174,17 @@ class SplitBasisLSPGModel(DAFoamLSPGModel):
 
     # region _compute_phi_from_states
     def _compute_phi_from_states(self, w: np.ndarray) -> np.ndarray:
-        """Compute face-flux (phi) DOFs from the reconstructed flow state w.
+        """Return face-flux phi consistent with the velocity in w.
 
-        Override this method with the DAFoam phi computation routine.
-
-        Parameters
-        ----------
-        w : full reconstructed FOM state vector (n_local_states,), distributed.
-
-        Returns
-        -------
-        phi_vals : (n_phi_dofs_local,) array of face-flux values to be written
-                   into w[self._phi_mask].
+        setPhiFromU() is called here (once, during reconstruction) but NOT in
+        _set_fom_states, because w already carries the correct phi after reconstruction.
+        Calling setPhiFromU() again during residual evaluation would overwrite phi
+        with a potentially inconsistent value (e.g. volume flux U·A instead of mass
+        flux ρU·A for a compressible solver), corrupting the energy residual.
         """
-        raise NotImplementedError(
-            "SplitBasisLSPGModel._compute_phi_from_states must be implemented. "
-            "Subclass this model and override _compute_phi_from_states() with the "
-            "DAFoam phi reconstruction routine (e.g. dafoam_instance.updatePhi(w)), "
-            "then return the local phi DOF array."
-        )
+        self.dafoam_instance.setStates(w)
+        self.dafoam_instance.setPhiFromU()
+        return self.dafoam_instance.computePhiFromU()
 
     # region pre_solve_diagnostics
     def pre_solve_diagnostics(self, initial_rom_state: np.ndarray) -> None:
