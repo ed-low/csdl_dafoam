@@ -5,6 +5,8 @@
     "python.analysis.extraPaths": [
         "/home/edward/dafoam/packages/miniconda3/envs/dafoam310/lib/python3.10/site-packages",
         "/media/edward/DATA/Edward/AFRL_project/repos/CSDL_alpha",
-        "/media/edward/DATA/Edward/AFRL_project/repos/csdl_dafoam"
+        "/media/edward/DATA/Edward/AFRL_project/repos/csdl_dafoam",
+        "/media/edward/DATA/Edward/AFRL_project/repos/aframe",
+        "/media/edward/DATA/Edward/AFRL_project/repos/aeroelastic_coupling_utils"
     ]
 }
