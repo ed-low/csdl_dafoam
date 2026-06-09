@@ -158,6 +158,13 @@ mesh_options = {
 dataset_keyword       = 'training_set_with_perturbations_300'
 storage_location      = dafoam_directory
 
+# Basis mode — choose which POD basis to compute:
+#   "all"          : single combined basis for all variables (phi included)
+#   "no_phi"       : single combined basis, phi excluded (use with PhiComputingLSPGModel)
+#   "split"        : separate flow (p, U, T) and turbulence (nuTilda) bases, phi excluded
+#   "per_variable" : separate basis per variable, phi included (use with PerVariableLSPGModel)
+BASIS_MODE = "per_variable"
+
 # Sampling options
 # grassmann_variables indicates the variables which correspond to points on the Grassmann manifold
 # snapshot_variables indicates the variables which correspond to "snapshots" or realizations
@@ -328,7 +335,7 @@ i0, i1          = x_surf_dafoam_initial_indices[rank]
 
 # Flight condition variables
 flight_conditions_group                     = csdl.VariableGroup()
-flight_conditions_group.mach_number         = csdl.Variable(value=0.2938635415,      name="mach_number")
+# flight_conditions_group.mach_number         = csdl.Variable(value=0.2938635415,      name="mach_number")
 flight_conditions_group.airspeed_m_s        = csdl.Variable(value=U0,                name="airspeed_m_s")
 flight_conditions_group.angle_of_attack_deg = csdl.Variable(value=0,                 name="angle_of_attack_deg")
 flight_conditions_group.altitude_m          = csdl.Variable(value=0.,                name="altitude (m)")
@@ -483,11 +490,11 @@ data_generator = TrainingDataInterface(dafoam_instance=dafoam_instance,
                                             gather_raw_files=True)
 
 
-data_generator.sample_variables()
-data_generator.run_sweep(pod_options={"centering":"reference", "write_modes_using_write_adjoint_fields":False}, 
-                         compute_objective_grad=False, 
-                         compute_perturbations=True, 
-                         perturbation_epsilon=1e-6)
+# data_generator.sample_variables()
+# data_generator.run_sweep(pod_options={"centering":"reference", "write_modes_using_write_adjoint_fields":False}, 
+#                          compute_objective_grad=False, 
+#                          compute_perturbations=True, 
+#                          perturbation_epsilon=1e-6)
 
 # import glob
 # files = glob.glob(str(Path(storage_location)/dataset_keyword/f"300_samples_*.h5"))
@@ -573,66 +580,122 @@ data_generator.run_sweep(pod_options={"centering":"reference", "write_modes_usin
 
     
 
+h5_path = Path(dafoam_directory) / dataset_keyword / "point_0.h5"
+
+if BASIS_MODE == "all":
+    # Single combined basis for all variables including phi — use with DAFoamLSPGModel
+    local_modes, sv, reference_state, weights, scaling_vals = data_generator._compute_pod_modes(
+        h5_path,
+        inner_product="reference",
+        centering="reference",
+        scaling="reference",
+        write_h5=True,
+        new_h5_file=False,
+        overwrite_datasets=True,
+        new_file_suffix="modes",
+        write_modes_using_write_adjoint_fields=False,
+    )
+
+elif BASIS_MODE == "no_phi":
+    # Single combined basis, phi excluded — use with PhiComputingLSPGModel
+    local_modes, sv, reference_state, weights, scaling_vals = data_generator._compute_pod_modes(
+        h5_path,
+        inner_product="reference",
+        centering="reference",
+        scaling="reference",
+        exclude_vars=["phi"],
+        write_h5=True,
+        new_h5_file=False,
+        overwrite_datasets=True,
+        new_file_suffix="modes",
+        write_modes_using_write_adjoint_fields=False,
+    )
+
+elif BASIS_MODE == "split":
+    # Separate flow (p, U, T) and turbulence (nuTilda) bases, phi excluded — use with SplitBasisLSPGModel
+    from csdl_dafoam.core.rom.rom_models import NormalizationConfig
+    gamma_air   = 1.4
+    R_air       = 287.0
+    M_ref       = flight_conditions_group.mach_number.value
+    cv0         = R_air / (gamma_air - 1.0)
+    norm_config = NormalizationConfig(p_ref=p0, rho_ref=rho0, U_ref=U0, T_ref=T0,
+                                      nu_ref=nuTilda0, M_ref=M_ref, cv=cv0)
+
+    flow_modes, turb_modes, flow_sv, turb_sv, reference_state = data_generator._compute_split_pod_modes(
+        h5_path,
+        norm_config=norm_config,
+        flow_var_names=None,
+        centering="reference",
+        write_h5=True,
+        new_h5_file=False,
+        overwrite_datasets=True,
+        write_modes_using_write_adjoint_fields=False,
+    )
+
+elif BASIS_MODE == "per_variable":
+    # Separate basis per variable, phi included — use with PerVariableLSPGModel
+    results = data_generator._compute_per_variable_pod_modes(
+        h5_path,
+        inner_product="reference",
+        centering="reference",
+        scaling="reference",
+        write_h5=True,
+        new_h5_file=False,
+        overwrite_datasets=True,
+        new_file_suffix="modes_per_var",
+        write_modes_using_write_adjoint_fields=False,
+    )
+
+else:
+    raise ValueError(f"Unknown BASIS_MODE: {BASIS_MODE!r}. "
+                     "Choose from 'all', 'no_phi', 'split', 'per_variable'.")
+
+# data = data_generator.load_h5(Path(storage_location)/dataset_keyword/"point_0.h5", only_distributed_data=False)
+
+# local_mode_read = data["pod"]["modes"]
+
+# weights_read = data["pod"]["weights"]
 
 
+# indices      = np.concatenate(comm.allgather(data_generator.face_global_indices), axis=0)
+# mode_compute = np.concatenate(comm.allgather(local_mode_computed["phi"][:, 0]), axis=0)
+# mode_read    = np.concatenate(comm.allgather(local_mode_read["phi"][:, 0]), axis=0)
 
+# indices_abs = np.abs(indices) - 1
+# indices_neg = indices < 0
+# sign_mask   = np.ones_like(indices_abs)
+# sign_mask[indices_neg] = -1
 
+# import matplotlib.pyplot as plt
 
-local_mode_computed, reference_state, weights_computed, scaling_values = data_generator._compute_pod_modes(Path(dafoam_directory)/dataset_keyword/"point_0.h5",
-                                  inner_product="reference",
-                                  centering='reference',
-                                  scaling="reference",
-                                  write_h5=True,
-                                  new_h5_file=False,
-                                  new_file_suffix="modes",
-                                  write_modes_using_write_adjoint_fields=False)
-
-data = data_generator.load_h5(Path(storage_location)/dataset_keyword/"point_0.h5", only_distributed_data=False)
-
-local_mode_read = data["pod"]["modes"]
-
-weights_read = data["pod"]["weights"]
-
-
-indices      = np.concatenate(comm.allgather(data_generator.face_global_indices), axis=0)
-mode_compute = np.concatenate(comm.allgather(local_mode_computed["phi"][:, 0]), axis=0)
-mode_read    = np.concatenate(comm.allgather(local_mode_read["phi"][:, 0]), axis=0)
-
-indices_abs = np.abs(indices) - 1
-indices_neg = indices < 0
-sign_mask   = np.ones_like(indices_abs)
-sign_mask[indices_neg] = -1
-
-import matplotlib.pyplot as plt
-
-if rank == 0:
-    plt.scatter(indices_abs, mode_compute, label='Computed, abs')
-    plt.scatter(indices_abs[indices_neg], mode_compute[indices_neg], marker='x', label='Computed, negated boundaries')
-    plt.scatter(indices_abs, mode_read, marker='+', label='Read, abs')
-    plt.scatter(indices_abs[indices_neg], mode_read[indices_neg], marker='x', label='Read, negated boundaries')
-    plt.legend()
-    plt.ylabel("phi")
+# if rank == 0:
+#     plt.scatter(indices_abs, mode_compute, label='Computed, abs')
+#     plt.scatter(indices_abs[indices_neg], mode_compute[indices_neg], marker='x', label='Computed, negated boundaries')
+#     plt.scatter(indices_abs, mode_read, marker='+', label='Read, abs')
+#     plt.scatter(indices_abs[indices_neg], mode_read[indices_neg], marker='x', label='Read, negated boundaries')
+#     plt.legend()
+#     plt.ylabel("phi")
     
-    plt.figure()
-    plt.scatter(range(mode_compute.size), mode_compute, marker='x', label='compute')
-    plt.scatter(range(mode_read.size), mode_read, marker='+', label='read')
+#     plt.figure()
+#     plt.scatter(range(mode_compute.size), mode_compute, marker='x', label='compute')
+#     plt.scatter(range(mode_read.size), mode_read, marker='+', label='read')
     
-    diff_greater_than_tol = np.abs(mode_compute - mode_read) > 1e-12
+#     diff_greater_than_tol = np.abs(mode_compute - mode_read) > 1e-12
 
-    plt.scatter(np.where(diff_greater_than_tol), mode_compute[diff_greater_than_tol], marker='.', label='marked errors')
-    plt.legend()
+#     plt.scatter(np.where(diff_greater_than_tol), mode_compute[diff_greater_than_tol], marker='.', label='marked errors')
+#     plt.legend()
 
     
 
-    plt.figure()
-    plt.scatter(range(mode_read[indices_neg].size), mode_compute[indices_neg]/mode_read[indices_neg])
+#     plt.figure()
+#     plt.scatter(range(mode_read[indices_neg].size), mode_compute[indices_neg]/mode_read[indices_neg])
 
-    plt.show()
-quiet_barrier(comm)
+#     plt.show()
+# quiet_barrier(comm)
 
 
 
-# h5file = "/media/edward/DATA/Edward/AFRL_project/csdl_dafoam_workspace/airfoil_case/results/training_test/airfoil_training/point_0.h5"
-# data_generator._compute_pod_modes(h5filepath=h5file, inner_product="reference", centering='reference', scaling="reference", new_file=True)
+# # h5file = "/media/edward/DATA/Edward/AFRL_project/csdl_dafoam_workspace/airfoil_case/results/training_test/airfoil_training/point_0.h5"
+# # data_generator._compute_pod_modes(h5filepath=h5file, inner_product="reference", centering='reference', scaling="reference", new_file=True)
 
-# data_generator.read_h5_file()
+# # data_generator.read_h5_file()

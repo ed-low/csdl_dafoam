@@ -37,7 +37,7 @@ import csdl_alpha as csdl
 import lsdo_function_spaces as lfs
 
 from modopt import CSDLAlphaProblem
-from modopt import PySLSQP #, SNOPT
+from modopt import PySLSQP, OpenSQP, InteriorPoint
 
 import lsdo_geo
 import sys
@@ -48,14 +48,14 @@ from aeroelastic_coupling_utils import NodalMap
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-from geometry_functions import setup_geometry, compute_volume, project_centerbody_volume_points
-from geometry_functions import project_transition_volume_points
+from csdl_dafoam.utils.theairforce.geometry_functions import setup_geometry, compute_volume, project_centerbody_volume_points
+from csdl_dafoam.utils.theairforce.geometry_functions import project_transition_volume_points
 import time
 import pickle
 from datetime import datetime
 
-from additional_solvers import compute_static_margin, estimate_CDw, estimate_Cf, estimate_fuel_volume
-from additional_solvers import estimate_fuel_burn_w_reserve, atmos_model, takeoff, landing
+from csdl_dafoam.utils.theairforce.additional_solvers import compute_static_margin, estimate_CDw, estimate_Cf, estimate_fuel_volume
+from csdl_dafoam.utils.theairforce.additional_solvers import estimate_fuel_burn_w_reserve, atmos_model, takeoff, landing
 
 
 #---- DEBUGGING TOOLS ----
@@ -77,7 +77,7 @@ if comm.Get_rank() == 0:
 # region USER INPUT
 # ===============================
 # Keyword for optimization name (optimization results folder will be saved with this name)
-problem_name              = 'fix_indexing'
+problem_name              = '191k_test_run'#'89k_test_run'#'669k_test_run'#
 
 # Geometry
 geometry_directory        =  os.path.join(os.getcwd(), 'bwb_geometry/')
@@ -110,14 +110,14 @@ aoa0      = 0
 A0        = 518           # Projected area of entire BWB. Used for normalizing CD and CL
 rho0      = p0 / T0 / 287 # used for normalizing CD and CL
 
-# wall_list = ["wall"]
-wall_list = ['wall_body_lower',
-             'wall_body_upper', 
-             'wall_wing_lower', 
-             'wall_transition_lower', 
-             'wall_wing_upper', 
-             'wall_transition_upper', 
-             'wall_wing_cap']  
+wall_list = ["wall"]
+# wall_list = ['wall_body_lower',
+#              'wall_body_upper', 
+#              'wall_wing_lower', 
+#              'wall_transition_lower', 
+#              'wall_wing_upper', 
+#              'wall_transition_upper', 
+#              'wall_wing_cap']  
 
 # region Dafoam options
 da_options = {
@@ -238,7 +238,16 @@ shutdown_inline = True
 # END USER INPUT
 # ===============================
 
+# ###
+# import signal, traceback, sys
 
+# def dump_trace(sig, frame):
+#     print(f"[Rank {comm.Get_rank()}] STACK TRACE:", flush=True)
+#     traceback.print_stack(frame)
+#     sys.stdout.flush()
+
+# signal.signal(signal.SIGUSR1, dump_trace)
+# ###
 
 
 
@@ -252,7 +261,6 @@ rank_str  = f"{rank:0{len(str(comm_size-1))}d}" # string with zero-padded rank i
 
 # region DAFoam instance
 dafoam_instance               = instantiateDAFoam(da_options, comm, str(dafoam_directory), mesh_options)
-dafoam_instance_rom           = instantiateDAFoam(da_options, comm, str(dafoam_directory), mesh_options)
 x_surf_dafoam_initial_local   = dafoam_instance.getSurfaceCoordinates()
 x_vol_dafoam_initial_local    = dafoam_instance.xv0
 
@@ -281,7 +289,7 @@ surface_mesh_projection_file_path = Path(dafoam_directory)/f'projected_surface_m
 
 
 
-recorder = csdl.Recorder(inline=True, debug=True)
+recorder = csdl.Recorder(inline=False, debug=True)
 recorder.start()
 
 
@@ -357,18 +365,19 @@ if surface_mesh_projection_file_path.is_file():
 else:
     if rank == 0:
         print('No projected surface mesh file found.')
-        # region Surface normal computation
-        points  = x_surf_dafoam_initial
-        normals_local, face_normals_local, face_centers_local = compute_vertex_normals(dafoam_instance, outward_ref=None)
 
-        normals      = gather_array_to_rank0(-normals_local, comm)[0]
-        face_normals = gather_array_to_rank0(-face_normals_local, comm)[0]
-        face_centers = gather_array_to_rank0(face_centers_local, comm)[0]
+     # region Surface normal computation
+    points  = x_surf_dafoam_initial
+    normals_local, face_normals_local, face_centers_local = compute_vertex_normals(dafoam_instance, outward_ref=None)
+    
+    normals      = gather_array_to_rank0(-normals_local, comm)[0]
+    face_normals = gather_array_to_rank0(-face_normals_local, comm)[0]
+    face_centers = gather_array_to_rank0(face_centers_local, comm)[0]
 
-        # Edge normal handling
-        if rank == 0:
-            if average_normals_at_edges:
-                normals = average_normals_at_duplicate_points(x_surf_dafoam_initial, normals)
+    # Edge normal handling
+    if rank == 0:
+        if average_normals_at_edges:
+            normals = average_normals_at_duplicate_points(x_surf_dafoam_initial, normals)
         
         try:
             # # ORIGINAL CODE
@@ -578,6 +587,7 @@ payload_weight_N = payload_weight_lbf*lbf_to_N
 cruise_range_m = cruise_range_nmi*nmi_to_m
 weighting_grid = np.einsum('i,j->ij', payload_weighting, range_weighting)
 weighting_array = weighting_grid.flatten()
+print(f"WEIGHTING ARRAY SHAPE: {weighting_array.shape}")
 
 # number of missions
 num_cruise = len(weighting_array)
@@ -725,9 +735,8 @@ with Timer(f'setting up geometry', rank, timing_enabled):
     # Had to "serialize" this because I was getting race conditions in cache I/O
     for r in range(comm_size):
         quiet_barrier(comm)
-        geometry, ffd_block = setup_geometry(geometry, geometry_values_dict, make_video=False)
         if rank == r:
-            geometry = setup_geometry(geometry, geometry_values_dict)
+            geometry, ffd_block = setup_geometry(geometry, geometry_values_dict, make_video=False)
         quiet_barrier(comm)
 
 centerbody_volume = 2*compute_volume(geometry, volume_projection_points)
@@ -745,13 +754,14 @@ recorder.inline = not shutdown_inline
 # region ============================ aero solver setup ============================
 # Flight condition variables
 flight_conditions_group                     = csdl.VariableGroup()
-flight_conditions_group.mach_number         = csdl.Variable(value=0.6,          name="mach_number")
-flight_conditions_group.angle_of_attack_deg = csdl.Variable(value=aoa0,         name="angle_of_attack")
-flight_conditions_group.altitude_m          = csdl.Variable(value=9144.,        name="altitude (m)")
-flight_conditions_group.airspeed_m_s        = csdl.Variable(value=U0,           name="airspeed (m/s)")
+flight_conditions_group.mach_number         = csdl.Variable(value=cruise_mach,      name="mach_number")
+flight_conditions_group.angle_of_attack_deg = csdl.Variable(value=aoa0,             name="angle_of_attack")
+flight_conditions_group.altitude_m          = csdl.Variable(value=cruise_h_km/1000, name="altitude (m)")
 
 # Atmospheric condition variables
 ambient_conditions_group = sam.compute_ambient_conditions_group(flight_conditions_group.altitude_m)
+
+flight_conditions_group.airspeed_m_s  = flight_conditions_group.mach_number * ambient_conditions_group.a_m_s
 
 with Timer(f'evaluating geometry component', rank, timing_enabled):
     x_surf_dafoam_full = geometry.evaluate(projected_surf_mesh_dafoam, plot=False)
@@ -787,27 +797,32 @@ with csdl.experimental.mpi.enter_mpi_region(rank, comm) as mpi_region:
     # DAFoamForces explicit component
     dafoam_force_comp       = DAFoamForces(dafoam_instance=dafoam_instance)
     dafoam_forces           = dafoam_force_comp.evaluate(dafoam_solver_states, dafoam_input_variables_group)
+    dafoam_forces_array     = csdl.reshape(dafoam_forces, (-1, 3))
+    dafoam_forces_full      = csdl.experimental.mpi.index_gatherer(i0, i1, comm)(dafoam_forces_array)
 
     # DAFoamFunctions Explicit component setup and evaluation
     dafoam_functions = DAFoamFunctions(dafoam_instance)
     dafoam_function_outputs = dafoam_functions.evaluate(dafoam_solver_states, 
                                                         dafoam_input_variables_group)
+    
+    comm.Barrier()
 
     mpi_region.set_as_global_output(dafoam_function_outputs.lift)
     mpi_region.set_as_global_output(dafoam_function_outputs.drag)
-    mpi_region.set_as_global_output(dafoam_forces)
+    mpi_region.set_as_global_output(dafoam_function_outputs.moment_y)
+    mpi_region.set_as_global_output(dafoam_forces_full)
 
 
 # Perform reflection of surface points and forces for structural solver
+y_reflect_mat = np.eye(3)
+y_reflect_mat[1, 1] = -1
 x_surf_dafoam_full_reflected  = x_surf_dafoam_full
-x_surf_dafoam_full_reflected  = -1. * x_surf_dafoam_full_reflected[:, 1]
+x_surf_dafoam_full_reflected  = x_surf_dafoam_full_reflected @ y_reflect_mat
 x_surf_dafoam_full_all_points = csdl.concatenate([x_surf_dafoam_full, x_surf_dafoam_full_reflected], axis=0)
 
 # TODO: NEED ALLGATHER EQUIVALENT HERE (THESE ARE ALL DEFINED ONLY ON PARTITIONS)
-dafoam_forces            = csdl.reshape(dafoam_forces, (-1, 3))
-dafoam_forces_reflected  = dafoam_forces
-dafoam_forces_reflected  = -1. * dafoam_forces[:, 1]
-dafoam_forces_all_points = csdl.concatenate([dafoam_forces, dafoam_forces_reflected], axis=0)
+dafoam_forces_full_reflected  = dafoam_forces_full @ y_reflect_mat
+dafoam_forces_full_all_points = csdl.concatenate([dafoam_forces_full, dafoam_forces_full_reflected], axis=0)
 
 # endregion
 
@@ -877,13 +892,14 @@ width.save()
 beam_CS = af.CSBox(ttop=ttop, tbot=ttop, tweb=tweb, height=height, width=width)
 
 # beam material
-aluminum = af.Material(name='aluminum', E=69E9, G=26E9, density=2700)
+aluminum = {"E":69E9, "G":26E9, "density":2700}#af.Material(name='aluminum', E=69E9, G=26E9, density=2700)
 
 # beam OBJECT
 BWB_beam = af.Beam(
     name='BWB_beam',
     mesh=beam_mesh,
-    material=aluminum,
+    **aluminum,
+    #material=aluminum,
     cs=beam_CS
 )
 BWB_beam_mass = BWB_beam.mass # property of beam
@@ -974,14 +990,6 @@ Computations for conditions:
 - structural conditions need none of these
 '''
 
-panel_method.declare_outputs([
-    'Cp',
-    'L',
-    'Di',
-    'M',
-    'panel_forces'
-])
-
 L = dafoam_function_outputs.lift
 L.add_name('L')
 L.save()
@@ -1046,7 +1054,7 @@ weighted_fuel_burn = csdl.sum(weighted_fuel_burn_array)
 # structural sizing missions
 # TODO: Only need 1 structural sizing condition (keep the first one)
 beam_forces = csdl.Variable(value=np.zeros((2,num_beam_nodes,3)))
-beam_forces = beam_forces.set(csdl.slice[0,:], force_map.T() @ dafoam_forces_all_points)
+beam_forces = beam_forces.set(csdl.slice[0,:], force_map.T() @ dafoam_forces_full_all_points)
 
 beam_loads = csdl.Variable(value=np.zeros((2,num_beam_nodes, 6)))
 beam_loads = beam_loads.set(csdl.slice[:,:,:3], beam_forces)
@@ -1079,20 +1087,20 @@ beam_max_stress_S2_SF = beam_max_stress_S2*safety_factor
 TOGW_nn = csdl.Variable(shape=(num_nodes,), value=0.)
 TOGW_nn = TOGW_nn.set(csdl.slice[:num_cruise], value=TOGW)
 TOGW_nn = TOGW_nn.set(csdl.slice[num_cruise:num_cruise+num_sizing], value=TOGW[0])
-# if do_stability:
-TOGW_nn = TOGW_nn.set(csdl.slice[stab_ind], value=TOGW[nominal_ind])
+if do_stability:
+    TOGW_nn = TOGW_nn.set(csdl.slice[stab_ind], value=TOGW[nominal_ind])
 
 Wf_nn = csdl.Variable(shape=(num_nodes,), value=0.)
 Wf_nn = Wf_nn.set(csdl.slice[:num_cruise], value=Wf)
 Wf_nn = Wf_nn.set(csdl.slice[num_cruise:num_cruise+num_sizing], value=Wf[0])
-# if do_stability:
-Wf_nn = Wf_nn.set(csdl.slice[stab_ind], value=Wf[nominal_ind])
+if do_stability:
+    Wf_nn = Wf_nn.set(csdl.slice[stab_ind], value=Wf[nominal_ind])
 
 payload_weight_nn = csdl.Variable(shape=(num_nodes,), value=0.)
 payload_weight_nn = payload_weight_nn.set(csdl.slice[:num_cruise], value=payload_weight_N)
 payload_weight_nn = payload_weight_nn.set(csdl.slice[num_cruise:num_cruise+num_sizing], value=payload_weight_N[0])
-# if do_stability:
-payload_weight_nn = payload_weight_nn.set(csdl.slice[stab_ind], value=payload_weight_N[nominal_ind])
+if do_stability:
+    payload_weight_nn = payload_weight_nn.set(csdl.slice[stab_ind], value=payload_weight_N[nominal_ind])
 
 add_weight = TOGW_nn - wing_weight_N - 2*engine_weight_N - Wf_nn - payload_weight_nn # computing remaining weight at CG
 
@@ -1129,9 +1137,11 @@ cg_x = cg[:,0]
 
 # force trim:
 cruise_trim = L-TOGW
-
-L_SS = L[num_cruise:num_cruise+num_sizing]
-load_factors = csdl.Variable(value=np.array([2.5, -1.])) # TODO: Keep the 2.5
+print(f"Rank {rank}: num_cruise {num_cruise}")
+print(f"Rank {rank}: num_sizing {num_sizing}")
+print(f"Rank {rank}: L.shape {L.shape}")
+L_SS = L#L[num_cruise:num_cruise+num_sizing]
+load_factors = csdl.Variable(value=2.5)#np.array([2.5, -1.])) # TODO: Keep the 2.5
 SS_trim = L_SS - load_factors*TOGW[0]
 
 # moment trim
@@ -1156,26 +1166,26 @@ takeoff_length_ft = takeoff_length/.3048
 landing_length_ft = landing_length/.3048
 
 # static margin
-# if do_stability: # NOTE: UPDATE FOR NOMINAL INDEX
-alpha_list = [pitch_array[nominal_ind], pitch_array[stab_ind]] # pitch array is different from pitch dv
-CL_list = [CL[nominal_ind], CL[stab_ind]]
-CM_list = [CM_cg[nominal_ind], CM_cg[stab_ind]] # y-component taken above
+if do_stability: # NOTE: UPDATE FOR NOMINAL INDEX
+    alpha_list = [pitch_array[nominal_ind], pitch_array[stab_ind]] # pitch array is different from pitch dv
+    CL_list = [CL[nominal_ind], CL[stab_ind]]
+    CM_list = [CM_cg[nominal_ind], CM_cg[stab_ind]] # y-component taken above
 
-static_margin = compute_static_margin(alpha_list, CL_list, CM_list)
+    static_margin = compute_static_margin(alpha_list, CL_list, CM_list)
 
-neutral_point = static_margin*MAC + cg[nominal_ind,0] # neutral point based on nominal condition
-neutral_point.add_name('neutral_point')
-neutral_point.save()
-SM_missions = (neutral_point-cg[:,0])/MAC
-SM_missions.add_name('static_margin_missions')
-SM_missions.save()
+    neutral_point = static_margin*MAC + cg[nominal_ind,0] # neutral point based on nominal condition
+    neutral_point.add_name('neutral_point')
+    neutral_point.save()
+    SM_missions = (neutral_point-cg[:,0])/MAC
+    SM_missions.add_name('static_margin_missions')
+    SM_missions.save()
 
 
 # endregion
 
 # region ============================ DVs ============================
-pitch.set_as_design_variable(lower=-5, upper=10)
-pitch.add_name('pitch')
+flight_conditions_group.angle_of_attack_deg.set_as_design_variable(lower=-5, upper=10)
+flight_conditions_group.angle_of_attack_deg.add_name('pitch')
 
 half_ttop.set_as_design_variable(lower=0.001, upper=0.1, scaler=100)
 half_ttop.add_name('half_ttop')
@@ -1283,20 +1293,11 @@ weighted_fuel_burn.add_name('weighted_fuel_burn_objective')
 
 csdl.save_optimization_variables()
 
-optimizer_name = 'SLSQP'
 
-problem_name = problem_type
-if problem_type == 'stability' or problem_type == 'full':
-    problem_name += f'_{stability_level}'
+recorder.stop()
 
-fname = f'{problem_name}_opt_{optimizer_name}_{num_cruise}_missions'
-sim = csdl.experimental.JaxSimulator(recorder, 
-                                     gpu=False, 
-                                     save_on_update=True, 
-                                     filename=fname, 
-                                     output_saved=True)
 
-if True:
+if False:
     print('starting compile of sample forward run')
     start_time = time.time()
     sim.run()
@@ -1318,60 +1319,53 @@ print(f'prob start date: {prob_start_date}')
 print(f'prob start time: {prob_start_time}')
 print('================')
 
-start_problem_time = time.time()
-prob = CSDLAlphaProblem(problem_name=fname, simulator=sim)
-end_problem_time = time.time()
-print(f'problem compile time: {end_problem_time-start_problem_time} seconds')
+sim = csdl.experimental.PySimulator(recorder)
 
-now = datetime.now()
-prob_end_date = now.date()
-prob_end_time = now.time()
-print('================')
-print(f'prob end date: {prob_end_date}')
-print(f'prob end time: {prob_end_time}')
-print('================')
+# Only allow visualization and modopt output files on the root rank
+visualize_on_this_rank           = True  if rank == 0 and not is_headless() else False
+turn_off_outputs_on_nonroot_rank = False if rank == 0 else True
+recording_on_root_rank           = True  if rank == 0 else False
+rank_outputs                     = ['x'] if rank == 0 else []
 
-print('setting up optimizer')
-start_opt_setup = time.time()
-if optimizer_name == 'SLSQP':
-    optimizer = PySLSQP(prob, solver_options={'maxiter':500, 'acc':1e-5})
-# elif optimizer_name == 'SNOPT':
-#     snopt_options = {
-#         'Major iterations': 200,
-#         'Major optimality': 1.e-6,
-#         'Major feasibility': 1.e-6,
-#         'Print frequency': 1,
-#         'Summary frequency': 1,
-#     }
-#     optimizer = SNOPT(prob, solver_options=snopt_options)
+# Optimization solver setup and run
+prob                = CSDLAlphaProblem(problem_name=f'{problem_name}', simulator=sim)
+optimizer_choice    = 2 # Set to 1 for PySLSQP, 2 for OpenSQP, or 3 for InteriorPoint
+
+if optimizer_choice == 1:
+    # PySLSQP optimizer setup
+    solver_options = {'maxiter': 20,
+                    'iprint': 2,
+                    'readable_outputs': rank_outputs,
+                    'recording': recording_on_root_rank,
+                    'turn_off_outputs': turn_off_outputs_on_nonroot_rank}
+    optimizer   = PySLSQP(prob, solver_options=solver_options)
+    optimizer.solve()
+    optimizer.print_results()
+
+elif optimizer_choice == 2:
+    # OpenSQP optimizer setup
+    open_sqp_options = {'maxiter': 80,
+                        'readable_outputs': rank_outputs,
+                        'recording': recording_on_root_rank,
+                        'ls_max_step': 1.,
+                        'turn_off_outputs': turn_off_outputs_on_nonroot_rank,
+                        }
+                        # 'hot_start_from': '/media/edward/DATA/Edward/AFRL_project/csdl_dafoam_workspace/blended_wing_body_case/results/case5_opensqp/case5_opensqp_outputs/2026-02-05_07.59.06.838711/record.hdf5',
+                        # 'hot_start_rtol': 1e-4}
+    optimizer = OpenSQP(prob, **open_sqp_options)
+    optimizer.solve()
+    optimizer.print_results()
+
+elif optimizer_choice == 3:
+    # InteriorPoint optimizer setup
+    interior_point_options = {'maxiter': 40,
+                            'readable_outputs': rank_outputs,
+                            'recording': recording_on_root_rank,
+                            'ls_max_step': 1.,
+                            'turn_off_outputs': turn_off_outputs_on_nonroot_rank}
+    optimizer   = InteriorPoint(prob, **interior_point_options)
+    optimizer.solve()
+    optimizer.print_results()
+    
 else:
-    raise ValueError('Invalid optimizer selected. Please try again.')
-end_opt_setup = time.time()
-print(f'optimizer setup time: {end_opt_setup-start_opt_setup} seconds')
-
-now = datetime.now()
-opt_start_date = now.date()
-opt_start_time = now.time()
-print('================')
-print(f'optimizer start date: {opt_start_date}')
-print(f'optimizer start time: {opt_start_time}')
-print('================')
-
-print('running optimizer')
-opt_start = time.time()
-optimizer.solve()
-opt_end = time.time()
-
-now = datetime.now()
-opt_end_date = now.date()
-opt_end_time = now.time()
-print('================')
-print(f'optimizer end date: {opt_end_date}')
-print(f'optimizer end time: {opt_end_time}')
-print('================')
-
-success = optimizer.results['success']
-print('\tTime:', opt_end - opt_start)
-print('\tSuccess:', success)
-# print('\tOptimized vars:', optimizer.results['x'])
-print('\tOptimized obj:', optimizer.results['objective'])
+    print(f'Check optimizer choice. {optimizer_choice} is not an option.')
