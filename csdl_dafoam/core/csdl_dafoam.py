@@ -455,7 +455,7 @@ class DAFoamFunctions(csdl.CustomExplicitOperation):
         dafoam_instance = self.dafoam_instance
         comm            = dafoam_instance.comm
         rank            = dafoam_instance.rank
-
+        
         # Check if states contain any NaN values (NaNs would be passed from optimizer)
         states = input_vals['dafoam_solver_states']
 
@@ -615,12 +615,13 @@ class DAFoamForces(csdl.CustomExplicitOperation):
     # region compute
     def compute(self, input_vals, output_vals):
         dafoam_instance = self.dafoam_instance
-
+        
         states      = input_vals["dafoam_solver_states"]
         vol_coords  = input_vals[self.vol_coords_name]
 
         dafoam_instance.setStates(states)
-        dafoam_instance.setVolCoords(vol_coords)
+        dafoam_instance.setVolCoords(vol_coords)        
+
         for output_name, output_info in self.force_output_dict.items():
             output_type = output_info["type"]
             forces      = np.zeros((output_info["output_size"],))
@@ -711,6 +712,8 @@ def compute_dafoam_input_variables(dafoam_instance, ambient_conditions_group:csd
                 flight_conditions_group.airspeed_m_s = flight_conditions_group.mach_number*ambient_conditions_group.a_m_s
                 # flight_conditions_group.airspeed_m_s.name = "airspeed_m_s"
 
+            else:
+                flight_conditions_group.mach_number = flight_conditions_group.airspeed_m_s / ambient_conditions_group.a_m_s
             # Create the patchVelocity input
             patchVelocity = csdl.concatenate((flight_conditions_group.airspeed_m_s, flight_conditions_group.angle_of_attack_deg))
             setattr(dafoam_input_variables_group, input_name, patchVelocity)
