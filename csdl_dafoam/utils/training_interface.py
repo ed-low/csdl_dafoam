@@ -11,7 +11,6 @@ from mpi4py import MPI
 from vedo import Arrows, Points, Plotter, Text2D
 from csdl_dafoam.utils.runscript_helper_functions import quiet_barrier
 from csdl_dafoam.utils.decompositions import method_of_snapshots_distributed
-from csdl_dafoam.core.rom.rom_models import NormalizationConfig
 import matplotlib.pyplot as plt
 import matplotlib as mpl
 from scipy.spatial import distance
@@ -631,8 +630,10 @@ class TrainingDataInterface():
             mesh_group["centroid_coordinates"].attrs.create("addressing_type",  "volVectorStates")
             mesh_group["cell_volumes"].attrs.create("addressing_type",          "volScalarStates")
             mesh_group["face_areas"].attrs.create("addressing_type",            "surfaceScalarStates")
+            mesh_group["face_areas"].attrs.create("apply_sign_convention",      False)
             mesh_group["cell_indices"].attrs.create("addressing_type",          "volScalarStates")
             mesh_group["face_indices"].attrs.create("addressing_type",          "surfaceScalarStates")
+            mesh_group["face_indices"].attrs.create("apply_sign_convention",    True)
 
             sample_group.attrs.create("last_written_sample_index",          data=-1,                                dtype="i8")
             sample_group.attrs.create("generated_on_n_processors",          data=self.comm_size,                    dtype="i8")
@@ -1236,158 +1237,281 @@ class TrainingDataInterface():
         return data
     
 
+    # region _normalize_var_groups
+    def _normalize_var_groups(self, var_groups) -> list[list[str]]:
+        """
+        Normalize the var_groups argument into a list of lists of variable names.
+
+        Accepted forms:
+          None                    -> one group containing all state variables
+          "p"                     -> [["p"]]
+          ["p", "T"]              -> [["p", "T"]]   (flat list of strings = one combined group)
+          [["p", "T"], "U"]       -> [["p", "T"], ["U"]]
+          [["p", "T"], ["U"]]     -> [["p", "T"], ["U"]]
+        """
+        all_vars = list(self.state_info.keys())
+
+        if var_groups is None:
+            return [all_vars]
+
+        if isinstance(var_groups, str):
+            groups = [[var_groups]]
+        elif isinstance(var_groups, list):
+            if all(isinstance(v, str) for v in var_groups):
+                # Flat list of strings → single combined group
+                groups = [var_groups]
+            else:
+                # Mixed: each element is either a str or a list[str]
+                groups = [([v] if isinstance(v, str) else list(v)) for v in var_groups]
+        else:
+            raise TypeError(f"var_groups must be None, a str, or a list; got {type(var_groups)}")
+
+        for group in groups:
+            for v in group:
+                if v not in self.state_info:
+                    raise ValueError(f"Variable '{v}' in var_groups not found in state_info. "
+                                     f"Available: {all_vars}")
+        return groups
+
+
     # region _compute_pod_modes
-    def _compute_pod_modes(self, h5filepath:Path, inner_product:str|None=None, centering:str|None='mean', scaling:str|None="reference",
-                           exclude_vars:list[str]|None=None,
+    def _compute_pod_modes(self, h5filepath:Path,
+                           var_groups=None,
+                           inner_product:str|None=None, centering:str|None='mean', scaling:str|None="reference",
+                           phi_mode:str="phi",
                            write_h5:bool=True, new_h5_file:bool=True, overwrite_datasets:bool=False, new_file_suffix:str="modes",
-                           write_modes_using_write_adjoint_fields:bool=True) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        
+                           write_modes_using_write_adjoint_fields:bool=True) -> list[dict]:
+        """
+        Compute POD modes for one or more variable groups.
+
+        var_groups controls which variables are included and whether they share a basis:
+          None              – all variables in one combined basis (default, backward-compatible)
+          "p"               – single variable
+          ["p", "T"]        – combined basis for p and T together
+          [["p","T"], "U"]  – two independent bases: {p,T} and {U}
+
+        phi_mode: "phi"      – scale by ρ_ref·U_ref·A_f_ref (per-face vector, constant reference);
+                               uniform inner product for phi.
+                 "phi_star"  – divide each phi snapshot by its own A_f_j, then by scalar ρ_ref·U_ref;
+                               area-weighted inner product (W = diag(A_f_ref)) for phi.
+
+        Returns a list of dicts, one per group:
+          [{"vars": [...], "modes": {var: array}, "singular_values": array,
+            "reference_state": {...}, "weights": {...}|None, "scaling_values": {...}}, ...]
+
+        HDF5 layout:
+          single group  → /pod/modes/, /pod/reference_state/, ... (backward-compatible)
+          multiple groups → /pod/<group_key>/modes/, /pod/<group_key>/reference_state/, ...
+          where group_key = "_".join(group_vars).
+        """
         # Accepts either an h5 file path or a pre-loaded dict with keys "data" and "metadata"
         # (internal shortcut used by _leave_one_out_test; see * at end of file for expected structure)
         if isinstance(h5filepath, dict):
             data_dict   = h5filepath["data"]
             metadata    = h5filepath["metadata"]
         else:
-            data_dict       = self.load_h5(h5file_path=h5filepath, group_to_read="samples", only_distributed_data=False)
-            metadata        = self.load_h5(h5file_path=h5filepath, group_to_read="parameters", only_distributed_data=False)
+            data_dict   = self.load_h5(h5file_path=h5filepath, group_to_read="samples", only_distributed_data=False)
+            metadata    = self.load_h5(h5file_path=h5filepath, group_to_read="parameters", only_distributed_data=False)
 
-        reference_state, weights, scaling_values = self._build_pod_inputs(data_dict, metadata, centering, inner_product, scaling)
+        groups      = self._normalize_var_groups(var_groups)
+        multi_group = len(groups) > 1
 
-        _exclude  = set(exclude_vars or [])
-        active_vars = [v for v in self.state_info if v not in _exclude]
+        # Keep an unmodified copy of raw states so each group starts from the same data
+        pristine_states = {v: data_dict["states"][v].copy() for v in self.state_info}
 
-        # Only need state data and number of samples for POD computation
-        data_array    = np.concatenate([data_dict["states"][state_var] for state_var in active_vars], axis=0)
-        weights_array = np.concatenate([weights[state_var] for state_var in active_vars], axis=0)
-
-        # Actual POD computation
-        modes_array, singular_values = method_of_snapshots_distributed(matrix_local=data_array,
-                                                                       comm=self.comm, method="tsqr",
-                                                                       weights_local=weights_array,
-                                                                       orthogonality_check=True)
-
-        # Extract per-variable modes using variable-order offsets in data_array, not info["indices"].
-        # info["indices"] index into DAFoam's state vector, which with adjStateOrdering="cell" is
-        # cell-interleaved and does not match data_array's variable-order layout.
-        offset = 0
-        data_array_slices = {}
-        for state_var in active_vars:
-            n_rows = data_dict["states"][state_var].shape[0]
-            data_array_slices[state_var] = slice(offset, offset + n_rows)
-            offset += n_rows
-
-        local_modes = {state_name: modes_array[data_array_slices[state_name], :] for state_name in active_vars}
-
-        if write_h5:
-            # Change file path name if new file requested
+        # Open the output HDF5 file once (if needed) and process all groups
+        outfilepath = None
+        if write_h5 and not isinstance(h5filepath, dict):
             outfilepath = Path(h5filepath)
             if new_h5_file:
                 outfilepath = outfilepath.with_name(outfilepath.stem + f'_{new_file_suffix}' + outfilepath.suffix)
-            
-            with h5py.File(outfilepath, "a", driver="mpio", comm=self.comm) as f:
-                pod_group       = f.require_group("pod")
-                mode_group      = pod_group.require_group("modes")
-                reference_group = pod_group.require_group("reference_state")
-                if weights is not None:
-                    weights_group   = pod_group.require_group("weights")
-                scaling_group   = pod_group.require_group("scaling")
 
-                for state_var in active_vars:
-                    info        = self.state_info[state_var]
-                    state_type  = info["type"]
-                    num_modes   = local_modes[state_var].shape[1]
-                    if      state_type == "volScalarStates" or state_type == "modelStates": num_rows = self.num_cells_global
-                    elif    state_type == "volVectorStates":                                num_rows = 3 * self.num_cells_global
-                    elif    state_type == "surfaceScalarStates":                            num_rows = self.num_faces_no_proc_boundaries_global
+        results = []
+        h5_context = h5py.File(outfilepath, "a", driver="mpio", comm=self.comm) if write_h5 and outfilepath else None
 
-                    if overwrite_datasets and state_var in mode_group:
-                        del mode_group[state_var]
-                    mode_group.require_dataset(state_var,        (num_rows, num_modes),              dtype="f8")
-                    self._write_field_data_to_dataset(mode_group[state_var], local_modes[state_var], state_type)
-                    mode_group[state_var].attrs.create("addressing_type", state_type)
-                    if state_type == "surfaceScalarStates":
-                        mode_group[state_var].attrs.create("apply_sign_convention", True)
+        try:
+            for group_vars in groups:
+                group_key = "_".join(group_vars)
+                self.print0(f"\n--- POD group: {group_vars} ---")
 
-                    if overwrite_datasets and state_var in reference_group:
-                        del reference_group[state_var]
-                    reference_group.require_dataset(state_var,   (num_rows, ),                       dtype="f8")
-                    self._write_field_data_to_dataset(reference_group[state_var], reference_state[state_var], state_type)
-                    reference_group[state_var].attrs.create("addressing_type", state_type)
+                # Restore raw states for this group before _build_pod_inputs mutates them
+                for v in group_vars:
+                    data_dict["states"][v] = pristine_states[v].copy()
 
-                    if weights is not None:
-                        if overwrite_datasets and state_var in weights_group:
-                            del weights_group[state_var]
-                        weights_group.require_dataset(state_var, (num_rows, ),                       dtype="f8")
-                        self._write_field_data_to_dataset(weights_group[state_var], weights[state_var], state_type)
-                        weights_group[state_var].attrs.create("addressing_type", state_type)
-                        if state_type == "surfaceScalarStates":
-                            weights_group[state_var].attrs.create("apply_sign_convention", False) # Flag to tell that we want magnitudes when loading face data (no negatives for processor boundaries)
-                    
-                    if scaling is not None:
-                        if overwrite_datasets and state_var in scaling_group:
-                            del scaling_group[state_var]
-                        s = np.asarray(scaling_values[state_var])
-                        if s.ndim == 1 and s.size > 1:
-                            # Per-DOF scaling (e.g. per-face for phi): store as distributed field
-                            dset = scaling_group.require_dataset(state_var, (num_rows,), dtype="f8")
-                            self._write_field_data_to_dataset(dset, scaling_values[state_var], state_type)
-                            dset.attrs.create("addressing_type", state_type)
-                            dset.attrs.create("apply_sign_convention", False)
-                        else:
-                            dset = scaling_group.require_dataset(state_var, shape=(1,), dtype="f8")
-                            dset[...] = float(s)
-                
-                if overwrite_datasets and 'singular_values' in pod_group:
-                    del pod_group['singular_values']
-                dset = pod_group.require_dataset('singular_values',     shape=singular_values.shape,               dtype="f8")
-                dset[...] = singular_values
+                reference_state, weights, scaling_values = self._build_pod_inputs(
+                    data_dict, metadata, centering, inner_product, scaling,
+                    active_vars=group_vars, phi_mode=phi_mode
+                )
 
-        if write_modes_using_write_adjoint_fields:
+                # Concatenate data and weights for this group only
+                # (mode offsets track variable-order layout, not DAFoam's state vector layout)
+                data_array    = np.concatenate([data_dict["states"][v] for v in group_vars], axis=0)
+                weights_array = np.concatenate([weights[v] for v in group_vars], axis=0) if weights is not None \
+                                else np.ones(data_array.shape[0])
 
-            for i in range(singular_values.size):
+                modes_array, singular_values = method_of_snapshots_distributed(
+                    matrix_local=data_array, comm=self.comm, method="tsqr",
+                    weights_local=weights_array, orthogonality_check=True
+                )
 
-                leading_integer         = 2
-                solution_write_number   = leading_integer + (i + 1) / 10000
+                # Extract per-variable slices from the concatenated mode matrix
+                offset, local_modes = 0, {}
+                for v in group_vars:
+                    n = data_dict["states"][v].shape[0]
+                    local_modes[v] = modes_array[offset:offset + n, :]
+                    offset += n
 
-                # Write the mode; excluded vars contribute zeros so the state vector is complete
-                mode_pieces = [
-                    local_modes[sv][:, i] if sv in local_modes
-                    else np.zeros(data_dict["states"][sv].shape[0])
-                    for sv in self.state_info
-                ]
-                self.dafoam_instance.solver.writeAdjointFields("pod_mode_",
-                                                               solution_write_number,
-                                                               np.concatenate(mode_pieces, axis=0),
-                                                               True)
+                results.append({
+                    "vars":            group_vars,
+                    "modes":           local_modes,
+                    "singular_values": singular_values,
+                    "reference_state": reference_state,
+                    "weights":         weights,
+                    "scaling_values":  scaling_values,
+                })
 
-                # Write the mesh
-                mesh = np.zeros_like(self.dafoam_instance.xv.flatten())
-                self.dafoam_instance.solver.getOFMeshPoints(mesh)
-                self.dafoam_instance.solver.writeMeshPoints(mesh, solution_write_number)
+                if write_h5 and h5_context is not None:
+                    pod_subgroup = group_key if multi_group else ""
+                    self._write_pod_group_to_h5(
+                        h5_context, pod_subgroup, group_vars,
+                        local_modes, singular_values,
+                        reference_state, weights, scaling_values,
+                        scaling, overwrite_datasets, phi_mode
+                    )
 
-        return local_modes, singular_values, reference_state, weights, scaling_values
+                if write_modes_using_write_adjoint_fields:
+                    mode_prefix = f"pod_mode_{group_key}_" if multi_group else "pod_mode_"
+                    for i in range(singular_values.size):
+                        leading_integer       = 2
+                        solution_write_number = leading_integer + (i + 1) / 10000
+
+                        # Non-group vars contribute zeros so the full DAFoam state vector is valid
+                        mode_pieces = [
+                            local_modes[sv][:, i] if sv in local_modes
+                            else np.zeros(pristine_states[sv].shape[0])
+                            for sv in self.state_info
+                        ]
+                        self.dafoam_instance.solver.writeAdjointFields(
+                            mode_prefix, solution_write_number,
+                            np.concatenate(mode_pieces, axis=0), True
+                        )
+                        mesh = np.zeros_like(self.dafoam_instance.xv.flatten())
+                        self.dafoam_instance.solver.getOFMeshPoints(mesh)
+                        self.dafoam_instance.solver.writeMeshPoints(mesh, solution_write_number)
+
+        finally:
+            if h5_context is not None:
+                h5_context.close()
+
+        return results
+
+
+    # region _write_pod_group_to_h5
+    def _write_pod_group_to_h5(self, f:h5py.File, pod_subgroup:str,
+                                active_vars:list[str],
+                                local_modes:dict, singular_values:np.ndarray,
+                                reference_state:dict, weights:dict|None,
+                                scaling_values:dict, scaling,
+                                overwrite_datasets:bool, phi_mode:str="phi"):
+        """
+        Write one group's POD results into an open HDF5 file.
+
+        pod_subgroup: path fragment under /pod/ — empty string for single-group (backward-compatible
+                      layout: /pod/modes/...), or e.g. "p_T" for multi-group (/pod/p_T/modes/...).
+        """
+        pod_group = f.require_group("pod")
+        base      = pod_group.require_group(pod_subgroup) if pod_subgroup else pod_group
+
+        mode_group      = base.require_group("modes")
+        reference_group = base.require_group("reference_state")
+        weights_group   = base.require_group("weights") if weights is not None else None
+        scaling_group   = base.require_group("scaling")
+
+        for state_var in active_vars:
+            state_type = self.state_info[state_var]["type"]
+            num_modes  = local_modes[state_var].shape[1]
+            if   state_type in ("volScalarStates", "modelStates"): num_rows = self.num_cells_global
+            elif state_type == "volVectorStates":                   num_rows = 3 * self.num_cells_global
+            elif state_type == "surfaceScalarStates":               num_rows = self.num_faces_no_proc_boundaries_global
+
+            # --- modes ---
+            if overwrite_datasets and state_var in mode_group:
+                del mode_group[state_var]
+            mode_group.require_dataset(state_var, (num_rows, num_modes), dtype="f8")
+            self._write_field_data_to_dataset(mode_group[state_var], local_modes[state_var], state_type)
+            mode_group[state_var].attrs.create("addressing_type", state_type)
+            if state_type == "surfaceScalarStates":
+                mode_group[state_var].attrs.create("apply_sign_convention", True)
+
+            # --- reference state ---
+            if overwrite_datasets and state_var in reference_group:
+                del reference_group[state_var]
+            reference_group.require_dataset(state_var, (num_rows,), dtype="f8")
+            self._write_field_data_to_dataset(reference_group[state_var], reference_state[state_var], state_type)
+            reference_group[state_var].attrs.create("addressing_type", state_type)
+
+            # --- weights ---
+            if weights_group is not None:
+                if overwrite_datasets and state_var in weights_group:
+                    del weights_group[state_var]
+                weights_group.require_dataset(state_var, (num_rows,), dtype="f8")
+                self._write_field_data_to_dataset(weights_group[state_var], weights[state_var], state_type)
+                weights_group[state_var].attrs.create("addressing_type", state_type)
+                if state_type == "surfaceScalarStates":
+                    weights_group[state_var].attrs.create("apply_sign_convention", False)
+
+            # --- scaling ---
+            if scaling is not None:
+                if overwrite_datasets and state_var in scaling_group:
+                    del scaling_group[state_var]
+                s = np.asarray(scaling_values[state_var])
+                if s.ndim == 1 and s.size > 1:
+                    # Per-DOF scaling (e.g. per-face for phi): store as distributed field
+                    dset = scaling_group.require_dataset(state_var, (num_rows,), dtype="f8")
+                    self._write_field_data_to_dataset(dset, scaling_values[state_var], state_type)
+                    dset.attrs.create("addressing_type", state_type)
+                    dset.attrs.create("apply_sign_convention", False)
+                else:
+                    dset = scaling_group.require_dataset(state_var, shape=(1,), dtype="f8")
+                    dset[...] = float(s)
+
+        # --- singular values ---
+        if overwrite_datasets and "singular_values" in base:
+            del base["singular_values"]
+        dset = base.require_dataset("singular_values", shape=singular_values.shape, dtype="f8")
+        dset[...] = singular_values
+
+        # Store phi_mode so downstream readers (ROM) know which phi treatment was applied
+        base.attrs["phi_mode"] = phi_mode
 
 
     # region _build_pod_inputs
-    def _build_pod_inputs(self, data_dict:Dict, metadata:Dict, centering:str|None, 
-                          inner_product:str|None, scaling:str|None) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def _build_pod_inputs(self, data_dict:Dict, metadata:Dict, centering:str|None,
+                          inner_product:str|None, scaling:str|None,
+                          active_vars:list[str]|None=None,
+                          phi_mode:str="phi") -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
-        Apply centering, weighting, and scaling to data_dict["states"] in place.
+        Apply centering, weighting, and scaling to data_dict["states"] in place for active_vars.
 
+        active_vars:   list of variable names to process (defaults to all state_info keys)
         centering:     None | 'mean' | 'reference' | dict of arrays
         inner_product: None | 'reference' | dict of arrays
         scaling:       None | 'reference' | dict of scalars
+        phi_mode:      "phi"      – constant reference-face-area scaling, uniform inner product
+                       "phi_star" – per-snapshot face-area normalisation, scalar scale, area-weighted IP
 
         Returns reference_state, weights, scaling_values dicts (keyed by state name).
         weights is None when inner_product is None.
         """
+        if active_vars is None:
+            active_vars = list(self.state_info.keys())
+
         reference_state = {}
         weights         = None if inner_product is None else {}
         scaling_values  = {}
-        _phi_rho_ref    = None  # saved for per-snapshot phi normalization
-        _phi_U_ref      = None
 
-        for state_var, info in self.state_info.items():
+        for state_var in active_vars:
+            info       = self.state_info[state_var]
             state_data = data_dict["states"][state_var]
             state_type = info["type"]
 
@@ -1420,17 +1544,19 @@ class TrainingDataInterface():
                         elif state_type == 'volScalarStates' or state_type == "modelStates":
                             weights[state_var] = data_dict["mesh"]['cell_volumes'][:, 0]
                         elif state_type == "surfaceScalarStates":
-                            # Face-area weights have units m², cell-volume weights have units m³.
-                            # Without correction the face-area integral dominates because the totals
-                            # are numerically incomparable (sum A_f >> sum V_c for large 3-D meshes).
-                            # Multiplying by L_char = V_total / A_total converts to effective volumes
-                            # so that phi's weighted norm is O(V_total * d²), matching cell variables.
-                            face_areas   = np.abs(data_dict["mesh"]['face_areas'][:, 0])
-                            cell_volumes = data_dict["mesh"]['cell_volumes'][:, 0]
-                            V_total = self.comm.allreduce(np.sum(cell_volumes), op=MPI.SUM)
-                            A_total = self.comm.allreduce(np.sum(face_areas),   op=MPI.SUM)
-                            L_char  = V_total / A_total
-                            weights[state_var] = face_areas * L_char
+                            face_areas_ref = np.abs(data_dict["mesh"]["face_areas"][:, 0])
+                            # Area-weighted inner product scaled by V_tot/A_tot so that phi's
+                            # total inner-product weight equals the cell variables' total weight:
+                            #   sum(A_f * V_tot/A_tot) = V_tot = sum(V_cell)
+                            # Without this, face areas and cell volumes are dimensionally
+                            # incommensurable and phi dominates the combined energy. Area weights
+                            # apply to both phi_mode="phi" and "phi_star": the natural inner
+                            # product for any face flux is the area integral Σ_f A_f·a_f·b_f.
+                            local_A_tot = float(np.sum(face_areas_ref))
+                            local_V_tot = float(np.sum(data_dict["mesh"]["cell_volumes"][:, 0]))
+                            A_tot = self.comm.allreduce(local_A_tot, op=MPI.SUM)
+                            V_tot = self.comm.allreduce(local_V_tot, op=MPI.SUM)
+                            weights[state_var] = face_areas_ref * (V_tot / A_tot)
                         else:
                             raise TypeError(f"State type {state_type} not recognized.")
                     else:
@@ -1444,9 +1570,7 @@ class TrainingDataInterface():
             # --- Scaling ---
             # Options: None (ones), 'reference' (freestream patch averages), or a dict of scalars
             # nuTilda is over-scaled by 100x to reduce its contribution to POD mode energy.
-            # phi uses per-face reference values so that large-area faces don't dominate the inner
-            # product via the A_face^3 effect (phi_f ~ rho*U*A_f, so a scalar rho*U normalization
-            # leaves phi_normalized ~ A_f, and the face-area weighted norm picks up A_f^3).
+            # phi scaling depends on phi_mode; see _compute_pod_modes docstring for details.
             if scaling is None:
                 scaling_values[state_var] = np.ones_like(reference_state[state_var])
             elif scaling == 'reference':
@@ -1466,24 +1590,23 @@ class TrainingDataInterface():
                 elif state_var == "nuTilda":
                     scaling_values[state_var] = 100 * reference_states[state_var][0]
                 elif state_var == "phi":
-                    # scaling_values["phi"] = rho_ref * U_ref * A_f_ref (per face, using reference
-                    # snapshot face areas).  This is what the ROM uses for state reconstruction.
-                    #
-                    # The SNAPSHOT DATA is normalised below by rho_ref * U_ref * A_f_j (per-snapshot
-                    # face area) rather than A_f_ref.  This removes the mesh-deformation-driven
-                    # component of phi from the POD variance: phi = rho * U_n * A_f, so changes in
-                    # A_f across geometrically-varied snapshots would otherwise dominate the POD even
-                    # when the flow barely changes.  After per-snapshot normalisation,
-                    # phi_norm ≈ U_n_j / U_ref, which is bounded in [-1, 1] for subsonic flow and
-                    # comparable in magnitude to the normalised cell variables.
-                    face_areas_ref = np.abs(data_dict["mesh"]['face_areas'][:, 0])
+                    face_areas_ref = np.abs(data_dict["mesh"]["face_areas"][:, 0])
                     rho_ref = reference_states["p"][0] / reference_states["T"][0] / 287.
                     U_ref   = reference_states["U"][0]
-                    phi_face_scale = rho_ref * U_ref * face_areas_ref
-                    phi_face_scale = np.where(phi_face_scale < 1e-300, 1.0, phi_face_scale)
-                    scaling_values[state_var] = phi_face_scale
-                    _phi_rho_ref = rho_ref  # saved for per-snapshot normalization in the apply step
-                    _phi_U_ref   = U_ref
+                    if phi_mode == "phi":
+                        # Option A: constant reference-face-area vector scaling.
+                        # scaling_values["phi"] = ρ_ref · U_ref · A_f_ref  (per-face)
+                        # snapshot data:         (φ - φ_ref) / (ρ_ref · U_ref · A_f_ref)
+                        phi_face_scale = rho_ref * U_ref * face_areas_ref
+                        phi_face_scale = np.where(phi_face_scale < 1e-300, 1.0, phi_face_scale)
+                        scaling_values[state_var] = phi_face_scale
+                    elif phi_mode == "phi_star":
+                        # Option B: per-snapshot face-area normalisation, scalar global scale.
+                        # scaling_values["phi"] = ρ_ref · U_ref  (scalar)
+                        # snapshot data:         (φ_j - φ_ref) / A_f_j / (ρ_ref · U_ref)
+                        scaling_values[state_var] = rho_ref * U_ref
+                    else:
+                        raise ValueError(f"phi_mode must be 'phi' or 'phi_star'; got '{phi_mode}'")
                 else:
                     scaling_values[state_var] = reference_states[state_var][0]
             elif isinstance(scaling, dict):
@@ -1491,29 +1614,48 @@ class TrainingDataInterface():
             else:
                 raise TypeError("Not a valid scaling method. Please supply None, 'reference', or a dict.")
 
-            if state_var == "phi" and _phi_rho_ref is not None:
-                # Per-snapshot face-area normalization: divide snapshot j's phi by A_f_j (not A_f_ref).
-                # face_areas columns follow the same snapshot ordering as state data; after
-                # 'reference' centering removes column 0, the remaining k columns correspond to
-                # face_areas[:, 1:k+1].  For 'mean'/None centering all n columns are kept.
-                n_cols  = data_dict["states"]["phi"].shape[1]
-                offset  = 1 if (isinstance(centering, str) and centering == "reference") else 0
-                fa_snap = np.abs(data_dict["mesh"]["face_areas"][:, offset:offset + n_cols])
-                phi_scale_per_snap = _phi_rho_ref * _phi_U_ref * fa_snap
-                phi_scale_per_snap = np.where(phi_scale_per_snap < 1e-300, 1.0, phi_scale_per_snap)
-                data_dict["states"]["phi"] = (
-                    data_dict["states"]["phi"] - reference_state["phi"][:, None]
-                ) / phi_scale_per_snap
+            if state_var == "phi":
+                if phi_mode == "phi":
+                    phi_face_scale = np.asarray(scaling_values["phi"])
+                    data_dict["states"]["phi"] = (
+                        data_dict["states"]["phi"] - reference_state["phi"][:, None]
+                    ) / phi_face_scale[:, None]
+                else:  # "phi_star"
+                    # Compute perturbation in flux-density space: phi_star_j - phi_star_ref
+                    #   phi_star_j   = phi_j   / A_f_j          (per-snapshot area)
+                    #   phi_star_ref = phi_ref / A_f_ref         (reference area, col 0)
+                    # Centering phi in raw-flux space first and then dividing by A_f_j would
+                    # divide phi_ref by the wrong (snapshot-specific) area, leaving a spurious
+                    # geometric contribution in the centered data.
+                    n_cols  = data_dict["states"]["phi"].shape[1]
+                    col_off = 1 if (isinstance(centering, str) and centering == "reference") else 0
+                    fa_snap = np.abs(data_dict["mesh"]["face_areas"][:, col_off:col_off + n_cols])
+                    fa_snap = np.where(fa_snap < 1e-300, 1.0, fa_snap)
+                    fa_ref  = np.abs(data_dict["mesh"]["face_areas"][:, 0:1])  # (n_faces, 1)
+                    fa_ref  = np.where(fa_ref < 1e-300, 1.0, fa_ref)
+                    phi_star_j   = data_dict["states"]["phi"] / fa_snap
+                    phi_star_ref = reference_state["phi"][:, None] / fa_ref
+                    rho_U   = np.asarray(scaling_values["phi"])
+                    # rho_U is scalar (ρ_ref·U_ref) when scaling='reference';
+                    # may be a ones-vector when scaling=None — broadcast accordingly.
+                    rho_U_col = rho_U[:, None] if rho_U.ndim == 1 and rho_U.size > 1 else rho_U
+                    data_dict["states"]["phi"] = (phi_star_j - phi_star_ref) / rho_U_col
             else:
                 s = np.asarray(scaling_values[state_var])
                 s_col = s[:, None] if s.ndim == 1 and s.size > 1 else s
                 data_dict["states"][state_var] = (data_dict["states"][state_var] - reference_state[state_var][:, None]) / s_col
 
-        # Diagnostic: M-weighted snapshot energy per variable (printed once during POD setup)
+        self._print_snapshot_energy_diagnostic(data_dict, weights, active_vars)
+        return reference_state, weights, scaling_values
+
+
+    # region _print_snapshot_energy_diagnostic
+    def _print_snapshot_energy_diagnostic(self, data_dict:Dict, weights:dict|None, active_vars:list[str]):
+        """Print M-weighted snapshot energy per variable after centering and scaling."""
         self.print0("\n  === Snapshot energy diagnostic (after centering + scaling) ===")
         total_energy = 0.0
         energies = {}
-        for state_var in self.state_info:
+        for state_var in active_vars:
             data = data_dict["states"][state_var]
             w    = weights[state_var] if weights is not None else np.ones(data.shape[0])
             local_e  = float(np.sum(w[:, None] * data**2))
@@ -1529,8 +1671,6 @@ class TrainingDataInterface():
         for state_var, e in energies.items():
             self.print0(f"  {state_var:>10}: {e/max(total_energy, 1e-300):.4f}")
         self.print0("")
-
-        return reference_state, weights, scaling_values
 
 
     # region _leave_one_out_test
@@ -1561,7 +1701,11 @@ class TrainingDataInterface():
                 remaining_state[state_var]      = np.delete(state_data, read_index, axis=1)
                 supply_dict["data"]["states"]   = remaining_state
 
-            local_modes, _, reference_state, weights, scaling_values = self._compute_pod_modes(supply_dict, **pod_options, write_h5=False)
+            _result = self._compute_pod_modes(supply_dict, **pod_options, write_h5=False)[0]
+            local_modes, _, reference_state, weights, scaling_values = (
+                _result["modes"], _result["singular_values"],
+                _result["reference_state"], _result["weights"], _result["scaling_values"]
+            )
 
             '''
             For reference:
