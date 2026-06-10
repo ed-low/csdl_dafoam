@@ -8,6 +8,7 @@ import time
 import pickle
 from pathlib import Path
 import shutil
+import h5py
 
 # MPI
 from mpi4py import MPI
@@ -163,7 +164,12 @@ storage_location      = dafoam_directory
 #   "no_phi"       : single combined basis, phi excluded (use with PhiComputingLSPGModel)
 #   "split"        : separate flow (p, U, T) and turbulence (nuTilda) bases, phi excluded
 #   "per_variable" : separate basis per variable, phi included (use with PerVariableLSPGModel)
-BASIS_MODE = "per_variable"
+BASIS_MODE = "all"
+
+# Phi mode — choose which phi to include in basis:
+#   "phi"       : Just use standard phi (default)
+#   "phi_star"  : Compute area-normalized weighted face flux
+PHI_MODE = "phi"
 
 # Sampling options
 # grassmann_variables indicates the variables which correspond to points on the Grassmann manifold
@@ -582,69 +588,124 @@ data_generator = TrainingDataInterface(dafoam_instance=dafoam_instance,
 
 h5_path = Path(dafoam_directory) / dataset_keyword / "point_0.h5"
 
+# Load dataset to compute common values
+dataset = data_generator.load_h5(h5file_path=h5_path)
+
+# Common inner product weights
+ref_cell_volumes   = np.abs(dataset["samples"]["mesh"]["cell_volumes"][:, 0])
+ref_face_areas     = np.abs(dataset["samples"]["mesh"]["face_areas"][:, 0])
+total_volume       = comm.allreduce(np.sum(ref_cell_volumes), op=MPI.SUM)
+total_area         = comm.allreduce(np.sum(ref_face_areas),   op=MPI.SUM)
+ref_face_areas_v_a = ref_face_areas * total_volume / total_area
+
+inner_product_weights = {}
+for state_var, info in data_generator.state_info.items():
+    state_type = info["type"]
+    if state_type == "volVectorStates":
+        inner_product_weights[state_var] = np.repeat(ref_cell_volumes, repeats=3, axis=0)
+    elif state_type == 'volScalarStates' or state_type == "modelStates":
+        inner_product_weights[state_var] = ref_cell_volumes
+    elif state_type == "surfaceScalarStates":
+        inner_product_weights[state_var] = ref_face_areas_v_a
+
+# Common scaling factors
+gamma   = 1.4
+U_ref   = flight_conditions_group.airspeed_m_s.value[0]
+rho_ref = ambient_conditions_group.rho_kg_m3.value[0]
+T_ref   = ambient_conditions_group.T_K.value[0]
+nu_ref  = ambient_conditions_group.nu_m2_s.value[0]
+M_ref   = U_ref / ambient_conditions_group.a_m_s.value[0]
+L_ref   = 1
+
+scaling_values = {
+                    "U"       : U_ref,
+                    "p"       : 0.5 * rho_ref * U_ref ** 2,
+                    "T"       : T_ref * 0.5 * (gamma - 1) * M_ref ** 2,
+                    "nuTilda" : np.sqrt(nu_ref * U_ref * L_ref),
+                    "phi"     : rho_ref * U_ref * (np.where(ref_face_areas < 1e-300, 1.0, ref_face_areas) if PHI_MODE == "phi" else 1)
+                  }
+
+# # Delete any existing pod groups so overwrite_datasets=True starts clean
+# if rank == 0:
+#     with h5py.File(h5_path, "a") as _f:
+#         _pod_keys = [k for k in _f.keys() if k.startswith("pod")]
+#         for _k in _pod_keys:
+#             del _f[_k]
+#         if _pod_keys:
+#             print(f"Deleted existing pod groups: {_pod_keys}")
+# comm.Barrier()
+
+# Common POD keyword arguments shared by all modes
+_pod_common = dict(
+    inner_product=inner_product_weights,
+    centering="reference",
+    scaling=scaling_values,
+    write_h5=True,
+    new_h5_file=False,
+    overwrite_datasets=True,
+    write_modes_using_write_adjoint_fields=False,
+    phi_mode=PHI_MODE
+)
+
 if BASIS_MODE == "all":
     # Single combined basis for all variables including phi — use with DAFoamLSPGModel
-    local_modes, sv, reference_state, weights, scaling_vals = data_generator._compute_pod_modes(
+    results = data_generator._compute_pod_modes(
         h5_path,
-        inner_product="reference",
-        centering="reference",
-        scaling="reference",
-        write_h5=True,
-        new_h5_file=False,
-        overwrite_datasets=True,
+        **_pod_common,
         new_file_suffix="modes",
-        write_modes_using_write_adjoint_fields=False,
     )
+    result          = results[0]
+    local_modes     = result["modes"]
+    sv              = result["singular_values"]
+    reference_state = result["reference_state"]
+    weights         = result["weights"]
+    scaling_vals    = result["scaling_values"]
+
+    if rank == 0:
+        print(np.cumsum(sv ** 2) / np.sum(sv ** 2))
 
 elif BASIS_MODE == "no_phi":
     # Single combined basis, phi excluded — use with PhiComputingLSPGModel
-    local_modes, sv, reference_state, weights, scaling_vals = data_generator._compute_pod_modes(
+    vars_no_phi = [v for v in data_generator.state_info if v != "phi"]
+    results = data_generator._compute_pod_modes(
         h5_path,
-        inner_product="reference",
-        centering="reference",
-        scaling="reference",
-        exclude_vars=["phi"],
-        write_h5=True,
-        new_h5_file=False,
-        overwrite_datasets=True,
+        var_groups=vars_no_phi,   # flat list → one combined group without phi
+        **_pod_common,
         new_file_suffix="modes",
-        write_modes_using_write_adjoint_fields=False,
     )
+    result          = results[0]
+    local_modes     = result["modes"]
+    sv              = result["singular_values"]
+    reference_state = result["reference_state"]
+    weights         = result["weights"]
+    scaling_vals    = result["scaling_values"]
 
 elif BASIS_MODE == "split":
     # Separate flow (p, U, T) and turbulence (nuTilda) bases, phi excluded — use with SplitBasisLSPGModel
-    from csdl_dafoam.core.rom.rom_models import NormalizationConfig
-    gamma_air   = 1.4
-    R_air       = 287.0
-    M_ref       = flight_conditions_group.mach_number.value
-    cv0         = R_air / (gamma_air - 1.0)
-    norm_config = NormalizationConfig(p_ref=p0, rho_ref=rho0, U_ref=U0, T_ref=T0,
-                                      nu_ref=nuTilda0, M_ref=M_ref, cv=cv0)
-
-    flow_modes, turb_modes, flow_sv, turb_sv, reference_state = data_generator._compute_split_pod_modes(
+    results = data_generator._compute_pod_modes(
         h5_path,
-        norm_config=norm_config,
-        flow_var_names=None,
-        centering="reference",
-        write_h5=True,
-        new_h5_file=False,
-        overwrite_datasets=True,
-        write_modes_using_write_adjoint_fields=False,
+        var_groups=[["p", "U", "T"], ["nuTilda"]],   # phi excluded from both groups
+        **_pod_common,
     )
+    flow_result     = results[0]   # {p, U, T}
+    turb_result     = results[1]   # {nuTilda}
+    flow_modes      = flow_result["modes"]
+    flow_sv         = flow_result["singular_values"]
+    turb_modes      = turb_result["modes"]
+    turb_sv         = turb_result["singular_values"]
+    reference_state = {**flow_result["reference_state"], **turb_result["reference_state"]}
 
 elif BASIS_MODE == "per_variable":
     # Separate basis per variable, phi included — use with PerVariableLSPGModel
-    results = data_generator._compute_per_variable_pod_modes(
+    all_vars = list(data_generator.state_info.keys())
+    results = data_generator._compute_pod_modes(
         h5_path,
-        inner_product="reference",
-        centering="reference",
-        scaling="reference",
-        write_h5=True,
-        new_h5_file=False,
-        overwrite_datasets=True,
+        var_groups=[[v] for v in all_vars],   # one independent basis per variable
+        **_pod_common,
         new_file_suffix="modes_per_var",
-        write_modes_using_write_adjoint_fields=False,
     )
+    # results[i]["vars"] gives the variable(s) for that group
+    # results[i]["modes"], ["singular_values"], ["reference_state"], ["weights"], ["scaling_values"]
 
 else:
     raise ValueError(f"Unknown BASIS_MODE: {BASIS_MODE!r}. "

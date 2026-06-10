@@ -26,7 +26,7 @@ from csdl_dafoam.utils.interpolation import RBFInterpolator
 from csdl_dafoam.utils.custom_explicit_reduced_svd import customExplicitReducedSVD
 from csdl_dafoam.core.rom.csdl_rom import CSDLROMWrapper
 from csdl_dafoam.core.rom.rom_models import DAFoamLSPGModel
-from csdl_dafoam.core.rom.rom_solver import BroydenNewtonSolver
+from csdl_dafoam.core.rom.rom_solver import BroydenNewtonSolver, NewtonSolver
 
 from scipy.spatial.distance import cdist
 from scipy.stats import spearmanr
@@ -35,8 +35,6 @@ import matplotlib.pyplot as plt
 import faulthandler
 faulthandler.enable()
 os.environ["PETSC_OPTIONS"] = "-malloc_debug"
-
-print_runscript_info()
 
 
 # ===============================
@@ -146,7 +144,7 @@ storage_location = Path(dafoam_directory)
 n_retained_modes   = 20
 alpha_reg          = 0.1    # regularization strength added to normalized pullback metrics
 COMPUTE_PROJ_ERROR = True  # set True to also record projection errors per metric
-num_samples        = 5      # LHS test points (reference point always prepended)
+num_samples        = 8      # LHS test points (reference point always prepended)
 
 # Distance metrics used for RBF snapshot weighting.
 # Each metric defines a different coordinate transform L such that
@@ -163,6 +161,9 @@ rank_str  = f"{rank:0{len(str(comm_size-1))}d}"
 
 dafoam_instance     = instantiateDAFoam(da_options, comm, dafoam_directory, mesh_options)
 dafoam_instance_rom = instantiateDAFoam(da_options, comm, dafoam_directory, mesh_options)
+
+if rank == 0:
+    print_runscript_info()
 
 # All metric variants share one ROM instance — CSDL inline evaluation is sequential,
 # so only one ROM solve is active at a time.  The solution_prefix differentiates
@@ -745,7 +746,7 @@ with csdl.experimental.mpi.enter_mpi_region(rank, comm) as mpi_region:
             pod_modes=pod_modes_metric,
             reference_fom_state=reference_state,
             scaling=scaling,
-            weights=1.0 / residual_scaling ** 2,
+            weights=1 / residual_scaling ** 2,
             dafoam_instance=dafoam_instances_rom[metric_name],
             normalize_residuals=False,
             fd_step=1e-6,
