@@ -14,108 +14,6 @@ from contextlib import contextmanager, nullcontext
 
 
 
-# region NORMALIZATIONCONFIG
-@dataclass
-class NormalizationConfig:
-    """Fixed global reference values for non-dimensionalisation of compressible flow ROMs.
-
-    Usage (no DAFoam dependency — safe to use in offline basis scripts):
-        cfg = NormalizationConfig(p_ref=..., rho_ref=..., U_ref=..., T_ref=...,
-                                  nu_ref=..., M_ref=..., cv=...)
-        s = cfg.make_scaling_vector(state_indices)
-        w = cfg.make_chu_weight_vector(state_indices)
-    """
-    p_ref:   float          # reference pressure [Pa]
-    rho_ref: float          # reference density [kg/m^3]
-    U_ref:   float          # reference velocity magnitude [m/s]
-    T_ref:   float          # reference temperature [K]
-    nu_ref:  float          # reference kinematic viscosity [m^2/s]
-    M_ref:   float          # reference Mach number (for Chu energy weights)
-    cv:      float          # specific heat at constant volume [J/(kg K)]
-    gamma:   float = 1.4    # ratio of specific heats
-
-    # ------------------------------------------------------------------
-    # Scaling vector
-    # ------------------------------------------------------------------
-    def make_scaling_vector(self, state_indices: dict) -> np.ndarray:
-        """Per-DOF linear scaling denominators s (length n_local_states).
-
-        Variable conventions (DAFoam getStateVariableMap with includeComponentSuffix=False):
-            p       -> rho_ref * U_ref^2   (dynamic pressure scale)
-            U       -> U_ref               (all velocity components grouped as "U")
-            T       -> T_ref
-            nuTilda -> 1.0                 (log scaling is nonlinear; handled at reconstruction)
-            phi     -> 1.0                 (face flux; not in ROM basis)
-            other   -> 1.0  (with warning)
-        """
-        n_total = sum(mask.sum() for mask in state_indices.values())
-        s = np.ones(n_total)
-
-        _var_scale = {
-            "p":       self.rho_ref * self.U_ref**2,
-            "U":       self.U_ref,
-            "T":       self.T_ref,
-            "nuTilda": 1.0,
-            "phi":     1.0,
-        }
-
-        for var, mask in state_indices.items():
-            if var in _var_scale:
-                s[mask] = _var_scale[var]
-            else:
-                print(f"NormalizationConfig.make_scaling_vector: unknown variable '{var}', defaulting to 1.0")
-
-        return s
-
-    # ------------------------------------------------------------------
-    # Chu energy weight vector
-    # ------------------------------------------------------------------
-    def make_chu_weight_vector(self, state_indices: dict) -> np.ndarray:
-        """Per-DOF Chu energy norm weights on *scaled* variables (length n_local_states).
-
-        Cell volumes V_i are applied externally (multiply result by expand_cell_volumes output).
-
-        Weights on scaled variables:
-            p*      -> M_ref^2
-            U*      -> 1.0   (each velocity component)
-            T*      -> 1.0 / ((gamma - 1) * gamma * M_ref^2)
-            nuTilda*-> 1.0   (turbulence, unit weight; cell volume applied externally)
-            phi     -> 1.0   (not in basis; weight inconsequential)
-            other   -> 1.0  (with warning)
-        """
-        n_total = sum(mask.sum() for mask in state_indices.values())
-        w = np.ones(n_total)
-
-        T_weight = 1.0 / ((self.gamma - 1.0) * self.gamma * self.M_ref**2)
-        _var_weight = {
-            "p":       self.M_ref**2,
-            "U":       1.0,
-            "T":       T_weight,
-            "nuTilda": 1.0,
-            "phi":     1.0,
-        }
-
-        for var, mask in state_indices.items():
-            if var in _var_weight:
-                w[mask] = _var_weight[var]
-            else:
-                print(f"NormalizationConfig.make_chu_weight_vector: unknown variable '{var}', defaulting to 1.0")
-
-        return w
-
-    # ------------------------------------------------------------------
-    # Spalart–Allmaras log scaling (applied to nuTilda DOFs)
-    # ------------------------------------------------------------------
-    def apply_log_scaling_sa(self, nu_tilda: np.ndarray) -> np.ndarray:
-        """Map nuTilda -> log(1 + nuTilda / nu_ref) elementwise (numerically stable)."""
-        return np.log1p(nu_tilda / self.nu_ref)
-
-    def invert_log_scaling_sa(self, nu_tilda_star: np.ndarray) -> np.ndarray:
-        """Inverse: nu_ref * (exp(nu_tilda_star) - 1) elementwise (numerically stable)."""
-        return self.nu_ref * np.expm1(nu_tilda_star)
-
-
-
 # region BASEMODEL
 class BaseModel(ABC):  
     def __init__(self, disable_presolve_diagnostics:bool=False):
@@ -242,6 +140,11 @@ class DAFoamProjectionROMModel(BaseModel):
         # Values for writing to disk
         self.solution_iter       = 0
 
+        # Cached reference-state residual from pre_solve_diagnostics (reused in post_solve)
+        self._r_ref_diag         = None
+        # Cached test basis (subclasses that support it initialise/update this)
+        self._test_basis         = None
+
         # convenient MPI parameters
         self.comm       = dafoam_instance.comm
         self.rank       = dafoam_instance.comm.rank
@@ -303,11 +206,6 @@ class DAFoamProjectionROMModel(BaseModel):
 
         q = rom_state
         w = self._reconstruct_fom_state(rom_state=q)
-        
-        if not has_global_nan_or_inf(w, self.comm):
-            self._set_fom_states(w)
-        else:
-            self.print_fn("DAFoamROMModel: Detected NaN(s) in input_vals. Skipping DAFoam setStates")
 
         # Can't do forward mode
         if mode == 'fwd':
@@ -315,7 +213,11 @@ class DAFoamProjectionROMModel(BaseModel):
 
         elif mode == 'rev':
             m   = self.weights
-            Psi = self._get_test_basis(fom_state=w)
+            # Reuse the test basis cached during the last compute_reduced_jacobian call.
+            # The adjoint is always evaluated at the converged rom_state, which is the same
+            # state at which self._test_basis was last populated — so recomputation is wasteful.
+            # Fall back to full recomputation only if the cache is cold (e.g. Galerkin adjoint).
+            Psi = self._get_test_basis(fom_state=None if self._test_basis is not None else w)
             Phi = self.pod_modes
             s   = self.scaling
 
@@ -538,7 +440,8 @@ class DAFoamProjectionROMModel(BaseModel):
         n_cols = M.shape[1]
         assert n == n_rows, f"Matrices must have compatible sizes! Jacobian has dimension ({n}, {n}), while supplied matrix has dimensions {M.shape}"
 
-        r0 = self._eval_fom_residual(fom_state=w)
+        # r0 is only needed for forward FD; central FD ignores fom_residual entirely.
+        r0 = None if self.jac_fd_central else self._eval_fom_residual(fom_state=w)
 
         JM = np.zeros_like(M)
 
@@ -555,14 +458,15 @@ class DAFoamProjectionROMModel(BaseModel):
     def _jac_vec_product(self, fom_state, direction, fom_residual=None, step=1e-6, reset_state=True):
         w = fom_state
         v = direction
+        s = self.scaling
 
-        # Scale h relative to the direction magnitude to avoid truncation/cancellation
-        v_norm_local  = np.dot(v, v)
-        v_norm_global = np.zeros(1)
-        self.comm.Allreduce(v_norm_local, v_norm_global, op=MPI.SUM)
-        v_norm = np.sqrt(v_norm_global[0])
-
-        w_norm = np.sqrt(self.comm.allreduce(np.dot(w, w), op=MPI.SUM))
+        # Compute norms in scaled (dimensionless) space so that pressure DOFs
+        # (~1e5 Pa) don't dominate over nuTilda (~1e-5) and blow out the step size.
+        # When v = s * phi_k, v/s = phi_k which is O(1) by POD normalization.
+        ws    = w / s
+        vs    = v / s
+        w_norm = np.sqrt(self.comm.allreduce(np.dot(ws, ws), op=MPI.SUM))
+        v_norm = np.sqrt(self.comm.allreduce(np.dot(vs, vs), op=MPI.SUM))
         h = step * (1.0 + w_norm) / v_norm if v_norm > 0 else step
 
         if self.jac_fd_central:
@@ -587,6 +491,7 @@ class DAFoamProjectionROMModel(BaseModel):
         """Set DAFoam states. Subclasses may override to add post-set processing."""
         self.dafoam_instance.setStates(w)
 
+
     # region print_fn
     # Custom print function, if necessary (mainly for MPI business)
     def print_fn(self, msg: str, **kwargs):
@@ -610,9 +515,10 @@ class DAFoamProjectionROMModel(BaseModel):
         self.print_fn(sep)
 
         # --- FOM residual at reference state (q=0) ---
-        w_ref     = self.reference_fom_state
-        r_ref     = self._eval_fom_residual(fom_state=w_ref)
-        r_ref_sq  = self.comm.allreduce(np.dot(r_ref, r_ref), op=MPI.SUM)
+        w_ref      = self.reference_fom_state
+        r_ref      = self._eval_fom_residual(fom_state=w_ref)
+        self._r_ref_diag = r_ref          # cache for post_solve_diagnostics
+        r_ref_sq   = self.comm.allreduce(np.dot(r_ref, r_ref), op=MPI.SUM)
         r_ref_norm = np.sqrt(r_ref_sq)
         self.print_fn(f"  {'‖r_fom(w_ref)‖ (q=0 initial residual)':<40} {r_ref_norm:.4e}")
         self.print_fn(f"  {'Per-variable ‖r_fom(w_ref)‖':<40}")
@@ -710,11 +616,14 @@ class DAFoamProjectionROMModel(BaseModel):
         r_fom_sq_global = self.comm.allreduce(np.dot(r_fom, r_fom), op=MPI.SUM)
         r_fom_norm      = np.sqrt(r_fom_sq_global)
 
-        # Also evaluate FOM residual at reference (q=0) for ratio context
-        w_ref       = self.reference_fom_state
-        r_ref       = self._eval_fom_residual(fom_state=w_ref)
-        r_ref_sq    = self.comm.allreduce(np.dot(r_ref, r_ref), op=MPI.SUM)
-        r_ref_norm  = np.sqrt(r_ref_sq)
+        # FOM residual at reference (q=0) — reuse cached value from pre_solve_diagnostics
+        # if available (avoids one extra FOM residual evaluation).
+        if self._r_ref_diag is not None:
+            r_ref = self._r_ref_diag
+        else:
+            r_ref = self._eval_fom_residual(fom_state=self.reference_fom_state)
+        r_ref_sq   = self.comm.allreduce(np.dot(r_ref, r_ref), op=MPI.SUM)
+        r_ref_norm = np.sqrt(r_ref_sq)
 
         self.print_fn(f"\n  FOM Residual Breakdown at Converged ROM State")
         self.print_fn(f"  {'Variable':<16} {'‖r_ref‖':>14}  {'‖r_fom‖':>14}  {'ratio':>10}")
