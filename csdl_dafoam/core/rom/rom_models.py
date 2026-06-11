@@ -681,6 +681,7 @@ class DAFoamGalerkinModel(DAFoamProjectionROMModel):
             self.print_fn(f"WARNING: jac_mode {jac_mode} not recognized. Defaulting to finite difference (jac_mode='fd')")
             self.jac_mode = "fd"
     
+    
     # region compute_reduced_jacobian
     def compute_reduced_jacobian(self, rom_state):
         q   = rom_state

@@ -1640,6 +1640,7 @@ class TrainingDataInterface():
                     # may be a ones-vector when scaling=None — broadcast accordingly.
                     rho_U_col = rho_U[:, None] if rho_U.ndim == 1 and rho_U.size > 1 else rho_U
                     data_dict["states"]["phi"] = (phi_star_j - phi_star_ref) / rho_U_col
+
             else:
                 s = np.asarray(scaling_values[state_var])
                 s_col = s[:, None] if s.ndim == 1 and s.size > 1 else s

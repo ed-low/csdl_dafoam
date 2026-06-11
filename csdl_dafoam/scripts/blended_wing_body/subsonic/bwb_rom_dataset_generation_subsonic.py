@@ -492,9 +492,9 @@ quiet_barrier(comm)
 
 # region Design variables
 # ============================ Design variables ===========================
-root_twist  = csdl.Variable(shape=(1,), value=np.array([0]))
-tip_twist   = csdl.Variable(shape=(1,), value=np.array([0.]))
-mid_twist   = csdl.Variable(shape=(2,), value=np.array([0., 0.]))
+root_twist  = csdl.Variable(shape=(1,), value=np.array([0]), name="root_twist")
+tip_twist   = csdl.Variable(shape=(1,), value=np.array([0.]), name="tip_twist")
+mid_twist   = csdl.Variable(shape=(2,), value=np.array([0., 0.]), name="mid_twist")
 wing_twists = csdl.concatenate((root_twist, mid_twist, tip_twist))
 wing_twists.flatten()
 
@@ -504,8 +504,8 @@ percent_change_in_thickness_dof             = csdl.concatenate(
                                                 (percent_change_in_thickness_dof_wing,
                                                  percent_change_in_thickness_dof_body), axis=1)
 
-normalized_percent_camber_change_dof_wing   = csdl.Variable(shape=(6,4), value=0.)
-normalized_percent_camber_change_dof_body   = csdl.Variable(shape=(6,4), value=0.)
+normalized_percent_camber_change_dof_wing   = csdl.Variable(shape=(6,4), value=0., name="normalized_percent_camber_change_dof_wing")
+normalized_percent_camber_change_dof_body   = csdl.Variable(shape=(6,4), value=0., name="normalized_percent_camber_change_dof_body")
 normalized_percent_camber_change_dof        = csdl.concatenate(
                                                 (normalized_percent_camber_change_dof_wing,
                                                  normalized_percent_camber_change_dof_body), axis=1)
@@ -727,17 +727,86 @@ data_generator = TrainingDataInterface(dafoam_instance=dafoam_instance,
 # data_generator.sample_variables()
 # data_generator.run_sweep()
 
+
+# Phi mode — choose which phi to include in basis:
+#   "phi"       : Just use standard phi (default)
+#   "phi_star"  : Compute area-normalized weighted face flux
+PHI_MODE = "phi"
+
+h5_path = Path(dafoam_directory) / dataset_keyword / "point_0.h5"
+
+# Load dataset to compute common values
+dataset = data_generator.load_h5(h5file_path=h5_path)
+
+# Common inner product weights
+ref_cell_volumes   = np.abs(dataset["samples"]["mesh"]["cell_volumes"][:, 0])
+ref_face_areas     = np.abs(dataset["samples"]["mesh"]["face_areas"][:, 0])
+total_volume       = comm.allreduce(np.sum(ref_cell_volumes), op=MPI.SUM)
+total_area         = comm.allreduce(np.sum(ref_face_areas),   op=MPI.SUM)
+ref_face_areas_v_a = ref_face_areas * total_volume / total_area
+
+total_v_a_area = comm.allreduce(np.sum(ref_face_areas_v_a),   op=MPI.SUM)
+
+if rank == 0:
+    print(f"Total Volume:   {total_volume}")
+    print(f"Max cell vol:   {np.max(ref_cell_volumes)}")
+    print(f"Min cell vol:   {np.min(ref_cell_volumes)}")
+    print(f"Total area:     {total_area}")
+    print(f"Max face area:  {np.max(ref_face_areas)}")
+    print(f"Min face area:  {np.min(ref_face_areas)}")
+    print(f"Adj total area: {total_v_a_area}")
+
+inner_product_weights = {}
+for state_var, info in data_generator.state_info.items():
+    state_type = info["type"]
+    if state_type == "volVectorStates":
+        inner_product_weights[state_var] = np.repeat(ref_cell_volumes, repeats=3, axis=0)
+    elif state_type == 'volScalarStates' or state_type == "modelStates":
+        inner_product_weights[state_var] = ref_cell_volumes
+    elif state_type == "surfaceScalarStates":
+        inner_product_weights[state_var] = ref_face_areas_v_a
+
+# Common scaling factors
+gamma   = 1.4
+U_ref   = flight_conditions_group.airspeed_m_s.value[0]
+rho_ref = ambient_conditions_group.rho_kg_m3.value[0]
+T_ref   = ambient_conditions_group.T_K.value[0]
+nu_ref  = ambient_conditions_group.nu_m2_s.value[0]
+M_ref   = U_ref / ambient_conditions_group.a_m_s.value[0]
+L_ref   = 30
+
+if rank == 0:
+    print(f"-------- Reference values --------")
+    print(f"Gamma: {gamma}")
+    print(f"U:     {U_ref}")
+    print(f"rho:   {rho_ref}")
+    print(f"T:     {T_ref}")
+    print(f"nu:    {nu_ref}")
+    print(f"M:     {M_ref}")
+    print(f"L:     {L_ref}")
+
+scaling_values = {
+                    "U"       : U_ref,
+                    "p"       : 0.5 * rho_ref * U_ref ** 2,
+                    "T"       : T_ref * 0.5 * (gamma - 1) * M_ref ** 2,
+                    "nuTilda" : np.sqrt(nu_ref * U_ref * L_ref),
+                    "phi"     : rho_ref * U_ref * (np.where(ref_face_areas < 1e-300, 1.0, ref_face_areas) if PHI_MODE == "phi" else 1)
+                  }
+
 import glob
 files = glob.glob(str(Path(storage_location)/dataset_keyword/f"point_*.h5"))
 
+var_groups = [v for v in data_generator.state_info if v != "phi"]
 for i, file in enumerate([files[0]]):
     print(f"Computing POD modes for file {i} ({file})") if rank == 0 else None
     data_generator._compute_pod_modes(file,
-                    inner_product="reference",
+                    inner_product=inner_product_weights, #"reference",
                     centering='reference',
-                    scaling="reference",
+                    scaling=scaling_values,#"reference",
                     write_h5=True,
                     new_h5_file=False,
                     overwrite_datasets=True,
                     new_file_suffix="modes",
-                    write_modes_using_write_adjoint_fields=False)
+                    write_modes_using_write_adjoint_fields=False,
+                    phi_mode=PHI_MODE,
+                    var_groups=var_groups)
