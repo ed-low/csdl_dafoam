@@ -6,19 +6,23 @@ from csdl_dafoam.core.rom.rom_solver import BaseSolver, SolverResult
 
 # region CSDLROMWrapper
 class CSDLROMWrapper(csdl.experimental.CustomImplicitOperation):
-    def __init__(self, model:BaseModel, solver:BaseSolver, write_unconverged_solutions_to_file:bool=False, start_with_zero_state:bool=False):
+    def __init__(self, model:BaseModel, solver:BaseSolver, constant_initial_rom_state:np.ndarray|csdl.Variable=None, write_unconverged_solutions_to_file:bool=False):
         super().__init__()
         solver.model    = model
         self.model      = model
         self.solver     = solver
         self.print_fn   = model.print_fn
         self.write_unconverged_solutions_to_file = write_unconverged_solutions_to_file
-        self.start_with_zero_state = start_with_zero_state
+        self.constant_intitial_rom_state         = constant_initial_rom_state
 
         self._cached_result    = None # Will be set and updated during solve_residual_equations
         # self._input_info       = {}   # Set up during evaluate
         self._state_name       = None # Set up during evaluate
         self._state_info       = None # Set up during evaluate
+
+        # When the initial ROM state is a CSDL Variable we declare it as a (passive) input
+        self._initial_state_input_name  = "_initial_rom_state"
+        self._initial_state_is_variable = isinstance(constant_initial_rom_state, csdl.Variable)
 
 
     # region evaluate
@@ -31,6 +35,10 @@ class CSDLROMWrapper(csdl.experimental.CustomImplicitOperation):
         for name, csdl_var in csdl_input_declaration_dict.items():
             self.declare_input(name, csdl_var)
             # self._input_info[name] = {"shape":csdl_var.shape} # Update the output shape dict
+
+        # Declare the initial ROM state as a passive input (only when it's a Variable),
+        if self._initial_state_is_variable:
+            self.declare_input(self._initial_state_input_name, self.constant_intitial_rom_state)
 
         # Update output info
         self._state_name  = csdl_output_creation_dict["name"]
@@ -54,7 +62,15 @@ class CSDLROMWrapper(csdl.experimental.CustomImplicitOperation):
         model.update_from_input_vals(input_vals=input_vals)
 
         # Use cached state, otherwise start at zero
-        rom_state0 = np.zeros(output_shape) if self._cached_result is None or self.start_with_zero_state else self._cached_result.rom_state.copy()
+        rom_state0_user = self.constant_intitial_rom_state
+        if rom_state0_user is None:
+            rom_state0 = np.zeros(output_shape) if self._cached_result is None else self._cached_result.rom_state.copy()
+        elif self._initial_state_is_variable:
+            # Pull the freshly-computed value from input_vals (graph-ordered), not .value.
+            rom_state0 = np.asarray(input_vals[self._initial_state_input_name]).reshape(output_shape)
+        else:
+            rom_state0 = rom_state0_user
+
         result     = solver.solve(initial_state=rom_state0)
         rom_state  = result.rom_state #.copy() Might need the copy?
 
