@@ -30,7 +30,7 @@ class BaseSolver(ABC):
         pass
 
     @abstractmethod
-    def solve(self, initial_state):
+    def solve(self, initial_state)->SolverResult:
         pass
 
     @abstractmethod
@@ -392,7 +392,7 @@ class BroydenNewtonSolver(NewtonSolver):
         history         = []
         converged       = False
         reason          = []
-        ls_success      = False
+        ls_success      = True
         result          = None
         n_since_refresh = 0
 
