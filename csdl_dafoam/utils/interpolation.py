@@ -250,7 +250,138 @@ class RBFInterpolator(BaseInterpolatorClass):
 
 
 
-        
+# region _CUBICPOLYNOMIALWEIGHTOP
+class _CubicPolynomialWeightOp(csdl.CustomExplicitOperation):
+    def __init__(self, sample_points: np.ndarray, cutoff_value: float = 0.8):
+        super().__init__()
+        self.x_i = sample_points  # (N, d)
+        self.c   = cutoff_value
+
+    def evaluate(self, query_point: Variable):
+        N = self.x_i.shape[0]
+        self.declare_input("x", query_point)
+        weights = self.create_output("weights", (N,))
+        return weights
+
+    def compute(self, input_vals, output_vals):
+        mu_hat = input_vals["x"]  # (d,)
+        x_i    = self.x_i         # (N, d)
+        c      = self.c
+        N      = x_i.shape[0]
+
+        diff  = mu_hat[None, :] - x_i  # (N, d)
+        delta = np.linalg.norm(diff, axis=1)  # (N,)
+
+        # Coincident-point edge case
+        if np.any(delta == 0.0):
+            w = np.zeros(N)
+            w[np.argmin(delta)] = 1.0
+            output_vals["weights"] = w
+            return
+
+        delta_min = np.min(delta)
+        delta_max = np.max(delta)
+        delta_cut = c * delta_min + (1.0 - c) * delta_max
+
+        # Degenerate: all equidistant or cutoff collapses
+        if delta_cut <= delta_min:
+            output_vals["weights"] = np.ones(N) / N
+            return
+
+        t     = (delta - delta_min) / (delta_cut - delta_min)
+        mask  = t < 1.0
+        w_raw = np.where(mask, (1.0 + 2.0 * t) * (1.0 - t) ** 2, 0.0)
+
+        S = np.sum(w_raw)
+        if S == 0.0:
+            output_vals["weights"] = np.ones(N) / N
+            return
+
+        output_vals["weights"] = w_raw / S
+
+    def compute_derivatives(self, input_vals, output_vals, derivatives):
+        mu_hat = input_vals["x"]  # (d,)
+        x_i    = self.x_i         # (N, d)
+        c      = self.c
+        N, d   = x_i.shape
+
+        diff  = mu_hat[None, :] - x_i  # (N, d)
+        delta = np.linalg.norm(diff, axis=1)  # (N,)
+
+        if np.any(delta == 0.0):
+            derivatives["weights", "x"] = np.zeros((N, d))
+            return
+
+        j_min     = np.argmin(delta)
+        j_max     = np.argmax(delta)
+        delta_min = delta[j_min]
+        delta_max = delta[j_max]
+        delta_cut = c * delta_min + (1.0 - c) * delta_max
+        span      = delta_cut - delta_min
+
+        if span <= 0.0:
+            derivatives["weights", "x"] = np.zeros((N, d))
+            return
+
+        t     = (delta - delta_min) / span
+        mask  = t < 1.0
+        w_raw = np.where(mask, (1.0 + 2.0 * t) * (1.0 - t) ** 2, 0.0)
+        S     = np.sum(w_raw)
+
+        if S == 0.0:
+            derivatives["weights", "x"] = np.zeros((N, d))
+            return
+
+        # Unit vectors ∂δⱼ/∂μ̂ = (μ̂ − xⱼ) / δⱼ,  shape (N, d)
+        e     = diff / delta[:, None]
+        e_min = e[j_min]  # (d,)
+        e_max = e[j_max]  # (d,)
+
+        # ∂span/∂μ̂ = (1−c)(e_max − e_min),  shape (d,)
+        d_span = (1.0 - c) * (e_max - e_min)
+
+        # Full dt_j/dμ̂ accounting for δ_min and span varying with μ̂:
+        # dt_j/dμ̂ = (e_j − e_min)/span − t_j · d_span/span,  shape (N, d)
+        dt_d_muhat = (e - e_min[None, :]) / span - t[:, None] * d_span[None, :] / span
+
+        # dw_raw_j/dt_j = −6t(1−t),  shape (N,)
+        dw_dt = np.where(mask, -6.0 * t * (1.0 - t), 0.0)
+
+        # dw_raw_j/dμ̂ = dw_dt_j · dt_j/dμ̂,  shape (N, d)
+        dw_d_muhat = dw_dt[:, None] * dt_d_muhat
+
+        # dS/dμ̂ = Σᵢ dw_raw_i/dμ̂,  shape (d,)
+        dS_d_muhat = np.sum(dw_d_muhat, axis=0)
+
+        # J[j,:] = (S · dw_j/dμ̂ − w_raw_j · dS/dμ̂) / S²
+        J = (S * dw_d_muhat - w_raw[:, None] * dS_d_muhat[None, :]) / S ** 2
+
+        derivatives["weights", "x"] = J
+
+
+
+#region CUBICPOLYNOMIALINTERPOLATOR
+class CubicPolynomialInterpolator(BaseInterpolatorClass):
+    def __init__(self,
+                query_point:Variable,
+                sample_points:Union[np.ndarray, Variable],
+                cutoff_value:float=0.8,
+                apply_scaling:bool=True
+        ):
+        super().__init__(query_point=query_point,
+                    sample_points=sample_points,
+                    apply_scaling=apply_scaling)
+
+        self.cutoff_value = cutoff_value
+
+    # region weights
+    def weights(self):
+        if self.samples_are_variable:
+            raise NotImplementedError("CubicPolynomialInterpolator requires numpy sample_points")
+        op = _CubicPolynomialWeightOp(self._sample_points, self.cutoff_value)
+        return op.evaluate(self._query_point)
+
+
 
 # region INVERSEDISTANCEWEIGHTINGCOMPONENT
 class InverseDistanceWeightingComponent(CustomExplicitOperation):
@@ -318,10 +449,11 @@ if __name__ == "__main__":
     from smt.sampling_methods import LHS
 
     variable_dimension = 2
-    num_samples        = 3
+    num_samples        = 50
     exponent           = 4
-    factor             = 10000
+    factor             = 1 #10000
     margin             = 0.2
+    cutoff_value       = 0.8
 
 
     x_i_min  = np.array([0, 7000])
@@ -347,6 +479,9 @@ if __name__ == "__main__":
     rbf_weights         = RBFInterpolator(query_point=x, sample_points=x_i, kernel='gaussian', kernel_parameter=None).weights()
     rbf_weights_unscld  = RBFInterpolator(query_point=x, sample_points=x_i, kernel='gaussian', kernel_parameter=None, apply_scaling=False).weights()
 
+    cbc_weights         = CubicPolynomialInterpolator(query_point=x, sample_points=x_i, cutoff_value=cutoff_value).weights()
+    cbc_weights_unscld  = CubicPolynomialInterpolator(query_point=x, sample_points=x_i, cutoff_value=cutoff_value, apply_scaling=False).weights()
+
     weightFun      = InverseDistanceWeightingComponent(data=x_i, exponent=exponent)
     idw_ce_weights = weightFun.evaluate(x)
 
@@ -354,16 +489,22 @@ if __name__ == "__main__":
     idw_weights_unscld_expanded = csdl.expand(idw_weights_unscld,   x_i.shape, 'i->ij')
     rbf_weights_expanded        = csdl.expand(rbf_weights,          x_i.shape, 'i->ij')
     rbf_weights_unscld_expanded = csdl.expand(rbf_weights_unscld,   x_i.shape, 'i->ij')
+    cbc_weights_expanded        = csdl.expand(cbc_weights,       x_i.shape, 'i->ij')
+    cbc_weights_unscld_expanded = csdl.expand(cbc_weights_unscld,   x_i.shape, 'i->ij')
     idw_ce_weights_expanded     = csdl.expand(idw_ce_weights,       x_i.shape, 'i->ij')
+    
+    
 
     x_idw        = csdl.sum(idw_weights_expanded * x_i,         axes=(0,))
     x_idw_unscld = csdl.sum(idw_weights_unscld_expanded * x_i,  axes=(0,))
     x_rbf        = csdl.sum(rbf_weights_expanded * x_i,         axes=(0,))
     x_rbf_unscld = csdl.sum(rbf_weights_unscld_expanded * x_i,  axes=(0,))
+    x_cbc        = csdl.sum(cbc_weights_expanded * x_i,         axes=(0,))
+    x_cbc_unscld = csdl.sum(cbc_weights_unscld_expanded * x_i,  axes=(0,))
     x_idw_ce     = csdl.sum(idw_ce_weights_expanded * x_i,      axes=(0,))
 
     
-    obj = csdl.norm(x_rbf - x)
+    obj = csdl.norm(x_cbc - x)
 
     x.set_as_design_variable(lower=np.zeros(variable_dimension,), upper=np.ones(variable_dimension,))
     obj.set_as_objective()
@@ -382,7 +523,9 @@ if __name__ == "__main__":
     print(f"Sum of IDW weights (Scaled): {np.sum(idw_weights.value)}")
     print(f"Sum of IDW weights         : {np.sum(idw_weights_unscld.value)}")
     print(f"Sum of RBF weights (Scaled): {np.sum(rbf_weights.value)}")
-    print(f"Sum of RBG weights         : {np.sum(rbf_weights_unscld.value)}")
+    print(f"Sum of RBF weights         : {np.sum(rbf_weights_unscld.value)}")
+    print(f"Sum of CBC weights (Scaled): {np.sum(cbc_weights.value)}")
+    print(f"Sum of CBC weights         : {np.sum(cbc_weights_unscld.value)}")
     print(f"Sum of IDW weights         : {np.sum(idw_ce_weights.value)}")
 
     print(f"")
@@ -395,6 +538,8 @@ if __name__ == "__main__":
     plt.scatter(x_idw_unscld.value[0],  x_idw_unscld.value[1],  marker='+', label="IDW")
     plt.scatter(x_rbf.value[0],         x_rbf.value[1],         marker='^', label="RBF (scaled)")
     plt.scatter(x_rbf_unscld.value[0],  x_rbf_unscld.value[1],  marker='v', label="RBF")
+    plt.scatter(x_cbc.value[0],         x_cbc.value[1],         marker='^', label="CBC (scaled)")
+    plt.scatter(x_cbc_unscld.value[0],  x_cbc_unscld.value[1],  marker='v', label="CBC")
     plt.scatter(x_idw_ce.value[0],      x_idw_ce.value[1],      marker='x', label="IDW (CustomExplicit)")
     plt.legend()
     for i, txt in enumerate(rbf_weights.value):
@@ -406,6 +551,8 @@ if __name__ == "__main__":
     plt.plot(idw_weights_unscld.value,  label="IDW")
     plt.plot(rbf_weights.value,         label="RBF (scaled)")
     plt.plot(rbf_weights_unscld.value,  label="RBF")
+    plt.plot(cbc_weights.value,         label="CBC (scaled)")
+    plt.plot(cbc_weights_unscld.value,  label="CBC")
     plt.plot(idw_ce_weights.value,      label="IDW (CustomExplicit)")
     plt.legend()
     plt.show()
