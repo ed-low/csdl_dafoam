@@ -8,6 +8,7 @@ import numpy as np
 from mpi4py import MPI
 from dafoam import PYDAFOAM # For typing
 from csdl_alpha import Variable, VariableGroup
+from csdl_dafoam.utils.decompositions import tsqr   # distributed thin QR (TSQR)
 
 # DAFoamLSPGModel
 from contextlib import contextmanager, nullcontext
@@ -681,7 +682,7 @@ class DAFoamGalerkinModel(DAFoamProjectionROMModel):
             self.print_fn(f"WARNING: jac_mode {jac_mode} not recognized. Defaulting to finite difference (jac_mode='fd')")
             self.jac_mode = "fd"
     
-    
+
     # region compute_reduced_jacobian
     def compute_reduced_jacobian(self, rom_state):
         q   = rom_state
@@ -813,3 +814,148 @@ class DAFoamLSPGModel(DAFoamProjectionROMModel):
         r = fom_residual
         JT_r = self._jacT_vec_product(fom_state=fom_state, vec=m * r)
         return s[:, None] * np.outer(JT_r, vec)
+
+
+
+
+# region LSPGQRMODEL
+class DAFoamLSPGQRModel(DAFoamLSPGModel):
+    """
+    LSPG solved via a thin QR (TSQR) of the weighted test basis A = M^(1/2) Psi
+    (Psi = J S Phi), instead of forming the normal equations J_rom = Psi^T M Psi.
+
+    Motivation
+    ----------
+    The normal-equations matrix has cond(Psi^T M Psi) = cond(Psi)^2, so any noise
+    in Psi (e.g. from a finite-difference Jacobian) is amplified by the SQUARE of
+    the conditioning — the dominant source of LSPG state error here. Factoring
+    A = Q R (Q distributed n_local x k, R replicated k x k) turns the Gauss-Newton
+    step into
+
+        Psi^T M Psi dq = -Psi^T M r    <=>    R dq = -(Q^T M^(1/2) r),
+
+    because Psi^T M Psi = (M^(1/2)Psi)^T (M^(1/2)Psi) = R^T R and the R^T cancels.
+    The solver's k x k solve then runs on R (cond(R) = cond(Psi), NOT squared) and
+    the reduced residual is the whitened Q^T M^(1/2) r. Its norm equals the residual
+    projected onto range(Psi) — the true LSPG optimality (reduced-gradient) measure,
+    and the per-iteration cond(J_rom) printed by iter_diagnostics now reports
+    cond(R), so you can watch the un-squared conditioning directly.
+
+    Usage
+    -----
+    Pair with NewtonSolver (Jacobian/basis recomputed each iteration). Broyden's
+    secant updates are inconsistent with the per-iteration change of basis Q and
+    must NOT be used with this model.
+
+    Limitation
+    ----------
+    Reverse-mode derivatives are NOT adapted to the whitened reduction: the adjoint
+    seed in input_jacvec_transpose and the pod_modes projection term both assume
+    r_rom = Psi^T M r, and a correct pod_modes term would require differentiating
+    the QR factorization. This model is therefore for FORWARD ROM evaluation only;
+    input_jacvec_transpose raises. Use DAFoamLSPGModel for gradient-based work.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._Q_loc  = None   # distributed Q (n_local x k) of A = M^(1/2) Psi
+        self._R      = None   # replicated R (k x k)
+        self._sqrt_m = None   # cached sqrt(weights)
+
+
+    # region _ensure_test_qr
+    def _ensure_test_qr(self, fom_state):
+        # Reuse the cached factorization while the test basis is frozen (mirrors the
+        # caching semantics of _get_test_basis); otherwise rebuild Psi and refactor.
+        if self._freeze_test_basis and self._R is not None and self._Q_loc is not None:
+            return self._Q_loc, self._R
+
+        Psi    = self._get_test_basis(fom_state=fom_state)   # (n_local, k), respects freeze
+        sqrt_m = np.sqrt(self.weights)
+        A_loc  = sqrt_m[:, None] * Psi                       # weighted test basis M^(1/2) Psi
+
+        # TSQR: distributed Q (n_local x k), replicated R (k x k). cond(R) = cond(A).
+        Q_loc, R = tsqr(A_loc, self.comm)
+
+        self._Q_loc, self._R, self._sqrt_m = Q_loc, R, sqrt_m
+        return Q_loc, R
+
+
+    # region compute_reduced_jacobian
+    def compute_reduced_jacobian(self, rom_state):
+        w    = self._reconstruct_fom_state(rom_state=rom_state)
+        _, R = self._ensure_test_qr(fom_state=w)
+        return R                                              # solver solves R dq = -r_rom
+
+
+    # region evaluate_residuals
+    def evaluate_residuals(self, rom_state):
+        w        = self._reconstruct_fom_state(rom_state=rom_state)
+        Q_loc, _ = self._ensure_test_qr(fom_state=w)
+        r_fom    = self._eval_fom_residual(fom_state=w)
+        # Whitened reduced residual Q^T M^(1/2) r (sum local contributions across ranks).
+        r_loc = Q_loc.T @ (self._sqrt_m * r_fom)
+        r     = np.zeros_like(r_loc)
+        self.comm.Allreduce(r_loc, r, op=MPI.SUM)
+        return r
+
+
+    # region input_jacvec_transpose
+    def input_jacvec_transpose(self, rom_state, vec, input_vals, mode):
+        raise NotImplementedError(
+            "DAFoamLSPGQRModel supports FORWARD ROM evaluation only. Reverse-mode "
+            "derivatives are not adapted to the whitened (Q^T M^(1/2)) reduction: "
+            "the adjoint seed and the pod_modes projection term still assume the "
+            "normal-equations reduction r_rom = Psi^T M r, and a correct pod_modes "
+            "term would require differentiating the QR factorization. Use "
+            "DAFoamLSPGModel for gradient-based optimization."
+        )
+
+
+
+
+# region PHICOMPUTINGLSPGMODEL
+class DAFoamPhiComputingLSPGModel(DAFoamLSPGModel):
+    """
+    LSPG ROM where phi is excluded from the POD basis and instead estimated
+    from the reconstructed U/p/T state via dafoam_instance.computePhiFromU().
+
+    The supplied pod_modes must have zeros in the phi DOF rows (e.g. produced
+    by a "no_phi" var_groups call to _compute_pod_modes).  A warning is printed
+    at construction time if non-zero phi rows are detected.
+
+    Only _set_fom_states is overridden.  Because every residual and Jacobian
+    evaluation goes through that method, phi is kept consistent with the current
+    U/p/T estimate throughout the Newton solve with no other changes required.
+    """
+
+    def __init__(self, *args, warn_nonzero_phi_modes: bool = True, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        names, indices = self.dafoam_instance.getStateVariableMap(
+            includeComponentSuffix=False
+        )
+        self._phi_mask              = indices == names.index("phi")
+        self.warn_nonzero_phi_modes = warn_nonzero_phi_modes
+
+
+    # region evaluate_input_output
+    def evaluate_input_output(self):
+        input_dict, output_info = super().evaluate_input_output()
+
+        if self.warn_nonzero_phi_modes:
+            phi_rows = self.pod_modes[self._phi_mask, :]
+            if np.any(phi_rows != 0.0):
+                self.print_fn(
+                    "WARNING (PhiComputingLSPGModel): pod_modes has non-zero "
+                    "entries in phi DOF rows. These will be ignored — phi is "
+                    "recomputed from U/p/T at every residual/Jacobian evaluation."
+                )
+
+        return input_dict, output_info
+
+
+    # region _set_fom_states
+    def _set_fom_states(self, w: np.ndarray) -> None:
+        self.dafoam_instance.setStates(w)
+        self.dafoam_instance.setPhiFromU()
