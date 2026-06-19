@@ -684,7 +684,7 @@ elif BASIS_MODE == "split":
     # Separate flow (p, U, T) and turbulence (nuTilda) bases, phi excluded — use with SplitBasisLSPGModel
     results = data_generator._compute_pod_modes(
         h5_path,
-        var_groups=[["p", "U", "T"], ["nuTilda"]],   # phi excluded from both groups
+        var_groups=[["p", "U", "T"], ["nuTilda"], ["phi"]],   # phi excluded from both groups
         **_pod_common,
     )
     flow_result     = results[0]   # {p, U, T}

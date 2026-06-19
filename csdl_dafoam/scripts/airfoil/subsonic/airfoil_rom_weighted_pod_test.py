@@ -25,7 +25,7 @@ from csdl_dafoam.utils.runscript_helper_functions import *
 from csdl_dafoam.utils.interpolation import RBFInterpolator
 from csdl_dafoam.utils.custom_explicit_reduced_svd import customExplicitReducedSVD
 from csdl_dafoam.core.rom.csdl_rom import CSDLROMWrapper
-from csdl_dafoam.core.rom.rom_models import DAFoamLSPGModel
+from csdl_dafoam.core.rom.rom_models import DAFoamLSPGModel, DAFoamPhiComputingLSPGModel
 from csdl_dafoam.core.rom.rom_solver import BroydenNewtonSolver, NewtonSolver
 
 from scipy.spatial.distance import cdist
@@ -141,10 +141,10 @@ dataset_keyword  = "training_set_with_perturbations_300" #'training_set_with_gra
 storage_location = Path(dafoam_directory)
 
 # ROM / metric optionss
-n_retained_modes   = 20
+n_retained_modes   = 50
 alpha_reg          = 0.1    # regularization strength added to normalized pullback metrics
 COMPUTE_PROJ_ERROR = True  # set True to also record projection errors per metric
-num_samples        = 8      # LHS test points (reference point always prepended)
+num_samples        = 3      # LHS test points (reference point always prepended)
 
 # Distance metrics used for RBF snapshot weighting.
 # Each metric defines a different coordinate transform L such that
@@ -741,7 +741,7 @@ with csdl.experimental.mpi.enter_mpi_region(rank, comm) as mpi_region:
         else:
             pod_modes_metric = pod_modes[:, :n_retained_modes]
 
-        rom_model = DAFoamLSPGModel(
+        rom_model = DAFoamPhiComputingLSPGModel(
             dafoam_input_variables_group=dafoam_input_variables_group,
             pod_modes=pod_modes_metric,
             reference_fom_state=reference_state,
