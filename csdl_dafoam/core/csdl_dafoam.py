@@ -163,7 +163,11 @@ class DAFoamSolver(csdl.experimental.CustomImplicitOperation):
             output_vals['dafoam_solver_states'] = np.copy(states)
 
             if self.disable_successful_primal_state_save is False and self.always_use_same_ic is False:
-                self.saved_states               = np.copy(states)
+                if has_global_nan_or_inf(states):
+                    if rank == 0:
+                        print("Found INF or NAN in solution... Skipping primal save cache.")
+                else:
+                    self.saved_states               = np.copy(states)
 
         # We also need to just calculate the residual for the AD mode to initialize vars like URes
         # We do not print the residual for AD, though
