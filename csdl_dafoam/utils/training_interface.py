@@ -361,10 +361,14 @@ class TrainingDataInterface():
 
             if compute_split_pod:
                 opts = split_pod_options or {}
-                if "norm_config" not in opts:
-                    self.print0("WARNING: compute_split_pod=True but 'norm_config' not in split_pod_options. Skipping split POD.")
+                if "var_groups" not in opts:
+                    self.print0("WARNING: compute_split_pod=True but 'var_groups' not in split_pod_options. Skipping split POD.")
                 else:
-                    self._compute_split_pod_modes(h5filepath=h5file_path, **opts)
+                    # Split bases are just _compute_pod_modes with multiple var_groups.
+                    # Inherit the same reconstruction conventions as the monolithic POD
+                    # unless explicitly overridden in split_pod_options.
+                    split_opts = {**default_pod_options, **opts}
+                    self._compute_pod_modes(h5filepath=h5file_path, **split_opts)
 
     
     # region _check_for_interrupted_sweep
@@ -1276,7 +1280,7 @@ class TrainingDataInterface():
 
     # region _compute_pod_modes
     def _compute_pod_modes(self, h5filepath:Path,
-                           var_groups=None,
+                           var_groups=None, labels=None,
                            inner_product:str|None=None, centering:str|None='mean', scaling:str|None="reference",
                            phi_mode:str="phi",
                            write_h5:bool=True, new_h5_file:bool=True, overwrite_datasets:bool=False, new_file_suffix:str="modes",
@@ -1299,10 +1303,17 @@ class TrainingDataInterface():
           [{"vars": [...], "modes": {var: array}, "singular_values": array,
             "reference_state": {...}, "weights": {...}|None, "scaling_values": {...}}, ...]
 
-        HDF5 layout:
-          single group  → /pod/modes/, /pod/reference_state/, ... (backward-compatible)
-          multiple groups → /pod/<group_key>/modes/, /pod/<group_key>/reference_state/, ...
-          where group_key = "_".join(group_vars).
+        labels controls the on-disk name of each basis (parallel to the normalized
+        var_groups). If None: a single all-variable group is labelled "monolithic" and
+        every other group is labelled "_".join(group_vars).
+
+        HDF5 layout (unified — same for one or many bases):
+          /pod                          parent group; manifest stored in its attrs
+            attrs: basis_labels, n_bases, centering, inner_product, scaling, phi_mode,
+                   n_samples, first_sample_is_reference, source_dataset
+          /pod/{label}/                 one subgroup per basis
+            attrs: var_group, label, phi_mode
+            modes/{var}, reference_state/{var}, weights/{var}, scaling/{var}, singular_values
         """
         # Accepts either an h5 file path or a pre-loaded dict with keys "data" and "metadata"
         # (internal shortcut used by _leave_one_out_test; see * at end of file for expected structure)
@@ -1313,11 +1324,15 @@ class TrainingDataInterface():
             data_dict   = self.load_h5(h5file_path=h5filepath, group_to_read="samples", only_distributed_data=False)
             metadata    = self.load_h5(h5file_path=h5filepath, group_to_read="parameters", only_distributed_data=False)
 
-        groups      = self._normalize_var_groups(var_groups)
-        multi_group = len(groups) > 1
+        groups       = self._normalize_var_groups(var_groups)
+        group_labels = self._resolve_basis_labels(groups, labels)
 
         # Keep an unmodified copy of raw states so each group starts from the same data
         pristine_states = {v: data_dict["states"][v].copy() for v in self.state_info}
+        n_samples_full  = next(iter(pristine_states.values())).shape[1]
+        first_is_ref    = bool(metadata.get("secondary_variables", {})
+                                       .get("_attrs", {})
+                                       .get("first_sample_is_reference", False))
 
         # Open the output HDF5 file once (if needed) and process all groups
         outfilepath = None
@@ -1330,9 +1345,9 @@ class TrainingDataInterface():
         h5_context = h5py.File(outfilepath, "a", driver="mpio", comm=self.comm) if write_h5 and outfilepath else None
 
         try:
-            for group_vars in groups:
-                group_key = "_".join(group_vars)
-                self.print0(f"\n--- POD group: {group_vars} ---")
+            for group_idx, group_vars in enumerate(groups):
+                label = group_labels[group_idx]
+                self.print0(f"\n--- POD group '{label}': {group_vars} ---")
 
                 # Restore raw states for this group before _build_pod_inputs mutates them
                 for v in group_vars:
@@ -1371,16 +1386,15 @@ class TrainingDataInterface():
                 })
 
                 if write_h5 and h5_context is not None:
-                    pod_subgroup = group_key if multi_group else ""
                     self._write_pod_group_to_h5(
-                        h5_context, pod_subgroup, group_vars,
+                        h5_context, label, group_vars,
                         local_modes, singular_values,
                         reference_state, weights, scaling_values,
                         scaling, overwrite_datasets, phi_mode
                     )
 
                 if write_modes_using_write_adjoint_fields:
-                    mode_prefix = f"pod_mode_{group_key}_" if multi_group else "pod_mode_"
+                    mode_prefix = f"pod_mode_{label}_"
                     for i in range(singular_values.size):
                         leading_integer       = 2
                         solution_write_number = leading_integer + (i + 1) / 10000
@@ -1401,26 +1415,83 @@ class TrainingDataInterface():
 
         finally:
             if h5_context is not None:
+                self.comm.Barrier()
                 h5_context.close()
+
+        # String-valued attributes (manifest + per-basis label/var_group/phi_mode) are
+        # written serially from rank 0 after the collective context closes. Variable-
+        # length strings live in HDF5's global heap, which parallel HDF5 cannot flush
+        # safely — writing them under the mpio driver hangs the collective close().
+        if write_h5 and outfilepath is not None:
+            if self.rank == 0:
+                with h5py.File(outfilepath, "a") as f:
+                    pod_root = f.require_group("pod")
+                    pod_root.attrs["basis_labels"]              = group_labels
+                    pod_root.attrs["n_bases"]                   = len(group_labels)
+                    pod_root.attrs["centering"]                 = str(centering)
+                    pod_root.attrs["inner_product"]             = str(inner_product)
+                    pod_root.attrs["scaling"]                   = str(scaling)
+                    pod_root.attrs["phi_mode"]                  = phi_mode
+                    pod_root.attrs["n_samples"]                 = n_samples_full
+                    pod_root.attrs["first_sample_is_reference"] = first_is_ref
+                    pod_root.attrs["source_dataset"]            = str(self.dataset_keyword)
+                    for lbl, gvars in zip(group_labels, groups):
+                        base = f[f"pod/{lbl}"]
+                        base.attrs["label"]     = lbl
+                        base.attrs["var_group"] = gvars
+                        base.attrs["phi_mode"]  = phi_mode
+            self.comm.Barrier()
 
         return results
 
 
+    # region _resolve_basis_labels
+    def _resolve_basis_labels(self, groups:list[list[str]], labels) -> list[str]:
+        """
+        Produce one on-disk label per (normalized) var group.
+
+        labels None  -> "monolithic" for a single all-variable group, else "_".join(vars).
+        labels str   -> wrapped to a one-element list.
+        labels list  -> used as-is (must match the number of groups; must be unique).
+        """
+        all_vars = list(self.state_info.keys())
+
+        if labels is None:
+            out = []
+            for g in groups:
+                if len(groups) == 1 and set(g) == set(all_vars):
+                    out.append("monolithic")
+                else:
+                    out.append("_".join(g))
+        else:
+            out = [labels] if isinstance(labels, str) else list(labels)
+            if len(out) != len(groups):
+                raise ValueError(f"labels has {len(out)} entries but there are {len(groups)} var groups.")
+
+        if len(set(out)) != len(out):
+            raise ValueError(f"Basis labels must be unique; got {out}.")
+        return out
+
+
     # region _write_pod_group_to_h5
-    def _write_pod_group_to_h5(self, f:h5py.File, pod_subgroup:str,
+    def _write_pod_group_to_h5(self, f:h5py.File, label:str,
                                 active_vars:list[str],
                                 local_modes:dict, singular_values:np.ndarray,
                                 reference_state:dict, weights:dict|None,
                                 scaling_values:dict, scaling,
                                 overwrite_datasets:bool, phi_mode:str="phi"):
         """
-        Write one group's POD results into an open HDF5 file.
+        Write one basis's POD results into an open HDF5 file under /pod/{label}/.
 
-        pod_subgroup: path fragment under /pod/ — empty string for single-group (backward-compatible
-                      layout: /pod/modes/...), or e.g. "p_T" for multi-group (/pod/p_T/modes/...).
+        label: on-disk name for this basis (e.g. "monolithic", "p_U_T", "nuTilda").
+               Every basis — single or one of many — lives under the shared /pod parent,
+               so readers use one consistent path and never branch on /pod vs /pod_{key}.
         """
-        pod_group = f.require_group("pod")
-        base      = pod_group.require_group(pod_subgroup) if pod_subgroup else pod_group
+        base = f.require_group(f"pod/{label}")
+        # NOTE: all string-valued attrs (label, var_group, phi_mode) are written serially
+        # from rank 0 after the mpio context closes — see _compute_pod_modes. Vlen strings
+        # live in HDF5's global heap, which parallel HDF5 cannot flush; writing them under
+        # the mpio driver hangs the collective close().
 
         mode_group      = base.require_group("modes")
         reference_group = base.require_group("reference_state")
@@ -1480,9 +1551,7 @@ class TrainingDataInterface():
             del base["singular_values"]
         dset = base.require_dataset("singular_values", shape=singular_values.shape, dtype="f8")
         dset[...] = singular_values
-
-        # Store phi_mode so downstream readers (ROM) know which phi treatment was applied
-        base.attrs["phi_mode"] = phi_mode
+        # phi_mode (a string attr) is written serially from rank 0 — see _compute_pod_modes.
 
 
     # region _build_pod_inputs
