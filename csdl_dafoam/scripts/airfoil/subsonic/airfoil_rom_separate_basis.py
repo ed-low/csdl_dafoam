@@ -303,9 +303,9 @@ ambient_conditions_group = sam.compute_ambient_conditions_group(flight_condition
 pod_basis_mode       = "all"             # "all" | "separate"
 phi_mode             = "in_basis"        # "in_basis" | "computed"
 inner_product_type   = "geometric_and_corrective" # "corrective_only" | "geometric_and_corrective"
-snapshot_weight_type = "euclidean"              # None | "euclidean"
+snapshot_weight_type = None              # None | "euclidean"
 target_variance      = 0.999
-min_modes            = 20
+min_modes            = 30
 weight_method        = "rbf"
 rom_model_type       = "lspg"         # "lspg" | "lspg_qr" | "galerkin_analytical" [lspg_qr/galerkin_analytical require NewtonSolver (set below)]
 fd_step              = 1e-6
@@ -410,7 +410,7 @@ if pod_basis_mode == "separate":
 
 elif pod_basis_mode == "all":
     # POD data assembled into DAFoam's cell-interleaved state-vector ordering
-    singular_val_set = {"monolithic" : data["pod"]["singular_values"]}
+    singular_val_set = {"monolithic" : data["pod"]["monolithic"]["singular_values"]}
     n_local_dofs     = dafoam_instance.getNLocalAdjointStates()
     n_snapshots      = singular_val_set["monolithic"].shape[0]
     pod_mode_set     = {"monolithic" : np.zeros((n_local_dofs, n_snapshots))}
@@ -420,10 +420,10 @@ elif pod_basis_mode == "all":
 
     for state_var, info in state_info.items():
         idx = info["indices"]
-        pod_mode_set["monolithic"][idx, :] = data["pod"]["modes"][state_var]
-        scaling[idx]                       = data["pod"]["scaling"][state_var]
-        weights[idx]                       = data["pod"]["weights"][state_var]
-        reference_fom_state[idx]           = data["pod"]["reference_state"][state_var]
+        pod_mode_set["monolithic"][idx, :] = data["pod"]["monolithic"]["modes"][state_var]
+        scaling[idx]                       = data["pod"]["monolithic"]["scaling"][state_var]
+        weights[idx]                       = data["pod"]["monolithic"]["weights"][state_var]
+        reference_fom_state[idx]           = data["pod"]["monolithic"]["reference_state"][state_var]
 
     # Temperature residual rescaling (improves LSPG conditioning)
     residual_scaling                              = np.ones_like(dafoam_instance.getStateWeights())
@@ -435,24 +435,23 @@ elif pod_basis_mode == "all":
 
 
 # Snapshot weighting
+n_snapshots = data["samples"]["converged"].size
+
+def load_snapshots(mode_key):
+    key = f"pod_{mode_key}"
+    return np.concatenate([data["samples"]["states"][var] for var in state_info.keys() if var in data[key]["_attrs"]["var_group"]])
+
+if pod_basis_mode == "separate":
+    snapshots_set = {key : load_snapshots(key) for key in key_list}
+else:
+    snapshot_matrix = np.zeros((n_local_dofs, n_snapshots - 1))
+    for state_var, info in state_info.items():
+        snapshot_matrix[info["indices"], :] = data["samples"]["states"][state_var][:, 1:]
+    snapshots_set = {"monolithic": snapshot_matrix}
+
 if snapshot_weight_type is not None:
     from csdl_dafoam.utils.interpolation import CubicPolynomialInterpolator, RBFInterpolator, IDWInterpolator
     from csdl_dafoam.utils.custom_explicit_reduced_svd import customExplicitReducedSVD
-
-
-    n_snapshots = data["samples"]["converged"].size
-
-    def load_snapshots(mode_key):
-        key = f"pod_{mode_key}"
-        return np.concatenate([data["samples"]["states"][var] for var in state_info.keys() if var in data[key]["_attrs"]["var_group"]])
-
-    if pod_basis_mode == "separate":
-        snapshots_set = {key : load_snapshots(key) for key in key_list}
-    else:
-        snapshot_matrix = np.zeros((n_local_dofs, n_snapshots - 1))
-        for state_var, info in state_info.items():
-            snapshot_matrix[info["indices"], :] = data["samples"]["states"][state_var][:, 1:]
-        snapshots_set = {"monolithic": snapshot_matrix}
 
     # Parameter matrix: shape (n_snapshots, n_dv)
     snapshot_configs_full = np.concatenate([
@@ -531,10 +530,14 @@ if snapshot_weight_type is not None:
         )
         UD_set[key], _, _ = customExplicitReducedSVD().evaluate(A=D_svd_set[key])
         pod_mode_set[key] = pod_mode_set[key] @ UD_set[key]#[:, :n_mode_set[key]]   # (n_local, n_retained_modes) CSDL
-    
+else:
+    snapshot_weights = csdl.Variable(value=np.ones(n_snapshots - 1, )) / (n_snapshots - 1)
+
 # Construct basis
 if pod_basis_mode == "all":
     pod_modes = pod_mode_set["monolithic"][:, :n_modes]
+    if not is_csdl(pod_modes):
+        pod_modes = csdl.Variable(value=pod_modes)
 
 else:
     pod_modes = np.zeros((n_local_dofs, n_modes))
@@ -747,7 +750,7 @@ for i in range(num_samples_with_ref):
     # product. If the weighted basis has a LARGER projection error, the rotation
     # has moved the retained subspace away from what the query actually needs —
     # the direct mechanism for "weighted POD performs worse".
-    if snapshot_weight_type is not None and pod_basis_mode == "all":
+    if pod_basis_mode == "all":
         def _w_proj_rel_err(B, s_tilde, W):
             # B: (n_local, n) W-orthonormal columns; s_tilde, W: (n_local,)
             c   = comm.allreduce(B.T @ (W * s_tilde), op=MPI.SUM)   # W-orthogonal projection coeffs
@@ -755,30 +758,32 @@ for i in range(num_samples_with_ref):
 
             w_rec = rec * scaling + reference_fom_state
             dafoam_instance.setStates(w_rec)
-        
+
             lift_recon = dafoam_instance.solver.calcFunction("lift")
             drag_recon = dafoam_instance.solver.calcFunction("drag")
-                        
+
 
             num = comm.allreduce(np.sum(W * (s_tilde - rec) ** 2), op=MPI.SUM)
             den = comm.allreduce(np.sum(W * s_tilde ** 2),         op=MPI.SUM)
             return np.sqrt(num / (den + 1e-300)), lift_recon, drag_recon
 
         s_tilde = (w_fom - reference_fom_state) / scaling          # scaled FOM state at query
-        B_w     = np.asarray(pod_modes.value)                      # rotated (weighted) truncated basis
-        B_u     = pod_mode_set_unweighted["monolithic"][:, :n_modes]
-        err_w, lift_r_w, drag_r_w   = _w_proj_rel_err(B_w, s_tilde, weights)
-        err_u, lift_r_u, drag_r_u   = _w_proj_rel_err(B_u, s_tilde, weights)
+        B_w     = np.asarray(pod_modes.value)                      # truncated basis
+        err_w, lift_r_w, drag_r_w = _w_proj_rel_err(B_w, s_tilde, weights)
         proj_w.append(err_w)
-        proj_u.append(err_u)
         lift_recon_w.append(lift_r_w)
-        lift_recon_u.append(lift_r_u)
         drag_recon_w.append(drag_r_w)
-        drag_recon_u.append(drag_r_u)
         lift_rel_recon_w.append(abs(lift_r_w - fom_lift[i]) / abs(fom_lift[i] + 1e-300))
-        lift_rel_recon_u.append(abs(lift_r_u - fom_lift[i]) / abs(fom_lift[i] + 1e-300))
         drag_rel_recon_w.append(abs(drag_r_w - fom_drag[i]) / abs(fom_drag[i] + 1e-300))
-        drag_rel_recon_u.append(abs(drag_r_u - fom_drag[i]) / abs(fom_drag[i] + 1e-300))           
+
+        if snapshot_weight_type is not None:
+            B_u = pod_mode_set_unweighted["monolithic"][:, :n_modes]
+            err_u, lift_r_u, drag_r_u = _w_proj_rel_err(B_u, s_tilde, weights)
+            proj_u.append(err_u)
+            lift_recon_u.append(lift_r_u)
+            drag_recon_u.append(drag_r_u)
+            lift_rel_recon_u.append(abs(lift_r_u - fom_lift[i]) / abs(fom_lift[i] + 1e-300))
+            drag_rel_recon_u.append(abs(drag_r_u - fom_drag[i]) / abs(fom_drag[i] + 1e-300))
 
         # ACTUAL ROM state error (scaled, W) — comparable to the projection errors.
         # If this is >> proj_w, the LSPG solve is failing to reach the best-in-basis
@@ -832,39 +837,45 @@ for i in range(num_samples_with_ref):
             print("  [res by var @ best-in-basis] "
                   + "  ".join(f"{var}={val:.3e}" for var, val in res_by_var.items()))
 
-        w_np    = np.asarray(snapshot_weights.value)
-        n_eff   = (w_np.sum() ** 2) / (np.sum(w_np ** 2) + 1e-300) # participation ratio
-        # Singular spectrum of the reweighted ensemble D = Sigma VT diag(omega):
-        D_np    = (np.asarray(singular_val_set["monolithic"])[:, None]
-                   * np.asarray(VT_set["monolithic"])) * w_np[None, :]
-        S_D     = np.linalg.svd(D_np, compute_uv=False)
-        cum_D   = np.cumsum(S_D ** 2) / (np.sum(S_D ** 2) + 1e-300)
-        n_99    = int(np.argmax(cum_D >= target_variance)) + 1     # modes to hit target on WEIGHTED energy
+        if snapshot_weight_type is not None:
+            w_np    = np.asarray(snapshot_weights.value)
+            n_eff   = (w_np.sum() ** 2) / (np.sum(w_np ** 2) + 1e-300) # participation ratio
+            # Singular spectrum of the reweighted ensemble D = Sigma VT diag(omega):
+            D_np    = (np.asarray(singular_val_set["monolithic"])[:, None]
+                       * np.asarray(VT_set["monolithic"])) * w_np[None, :]
+            S_D     = np.linalg.svd(D_np, compute_uv=False)
+            cum_D   = np.cumsum(S_D ** 2) / (np.sum(S_D ** 2) + 1e-300)
+            n_99    = int(np.argmax(cum_D >= target_variance)) + 1     # modes to hit target on WEIGHTED energy
 
-        if rank == 0:
-            flag = "  <-- weighted WORSE" if err_w > err_u else ""
-            print(f"  [basis proj] FOM-state W-projection rel err: "
-                  f"unweighted={err_u:.4e}  weighted={err_w:.4e}{flag}")
-            print(f"  [basis proj] weight n_eff={n_eff:.1f} of {w_np.size} snaps | "
-                  f"keeping n_modes={n_modes}, but weighted-energy needs {n_99} for "
-                  f"{target_variance:.3f} (S_D tail beyond ~{n_eff:.0f} is noise)")
+            if rank == 0:
+                flag = "  <-- weighted WORSE" if err_w > err_u else ""
+                print(f"  [basis proj] FOM-state W-projection rel err: "
+                      f"unweighted={err_u:.4e}  weighted={err_w:.4e}{flag}")
+                print(f"  [basis proj] weight n_eff={n_eff:.1f} of {w_np.size} snaps | "
+                      f"keeping n_modes={n_modes}, but weighted-energy needs {n_99} for "
+                      f"{target_variance:.3f} (S_D tail beyond ~{n_eff:.0f} is noise)")
+        else:
+            if rank == 0:
+                print(f"  [basis proj] FOM-state W-projection rel err: {err_w:.4e}")
 
         # ---- Projection rel-err vs n, for choosing a SINGLE fixed n ----
         # For a W-orthonormal basis the captured energy with the first n columns
         # is the cumulative sum of squared projection coefficients, so the whole
         # error-vs-n curve costs one coeff vector per basis (no per-n re-solve).
-        Phi_u_full = pod_mode_set_unweighted["monolithic"]              # (n_local, k_u) all stored modes
-        U_D_np, _, _ = np.linalg.svd(
-            (np.asarray(singular_val_set["monolithic"])[:, None]
-             * np.asarray(VT_set["monolithic"])) * w_np[None, :],
-            full_matrices=False
-        )
-        B_w_full = Phi_u_full @ U_D_np                                  # (n_local, k_w) full rotated basis
-        snorm2   = comm.allreduce(np.sum(weights * s_tilde ** 2), op=MPI.SUM) + 1e-300
-        c_u      = comm.allreduce(Phi_u_full.T @ (weights * s_tilde), op=MPI.SUM)   # (k_u,)
-        c_w      = comm.allreduce(B_w_full.T   @ (weights * s_tilde), op=MPI.SUM)   # (k_w,)
+        Phi_u_full = pod_mode_set["monolithic"].value if is_csdl(pod_mode_set["monolithic"]) else pod_mode_set["monolithic"]                         # (n_local, k) all stored modes
+        snorm2     = comm.allreduce(np.sum(weights * s_tilde ** 2), op=MPI.SUM) + 1e-300
+        c_u        = comm.allreduce(Phi_u_full.T @ (weights * s_tilde), op=MPI.SUM)   # (k,)
         projcurve_u.append(np.sqrt(np.maximum(1.0 - np.cumsum(c_u ** 2) / snorm2, 0.0)))
-        projcurve_w.append(np.sqrt(np.maximum(1.0 - np.cumsum(c_w ** 2) / snorm2, 0.0)))
+
+        if snapshot_weight_type is not None:
+            U_D_np, _, _ = np.linalg.svd(
+                (np.asarray(singular_val_set["monolithic"])[:, None]
+                 * np.asarray(VT_set["monolithic"])) * w_np[None, :],
+                full_matrices=False
+            )
+            B_w_full = Phi_u_full @ U_D_np                              # (n_local, k_w) full rotated basis
+            c_w      = comm.allreduce(B_w_full.T @ (weights * s_tilde), op=MPI.SUM)   # (k_w,)
+            projcurve_w.append(np.sqrt(np.maximum(1.0 - np.cumsum(c_w ** 2) / snorm2, 0.0)))
 
     if rank == 0:
         print(f"  Per-variable relative L2 error (sample {i}):")
@@ -875,40 +886,58 @@ for i in range(num_samples_with_ref):
         if rank == 0:
             print(f"    {var:>10}: {err / (norm + 1e-300):.4e}")
 
-if rank == 0 and projcurve_w:
+if rank == 0 and projcurve_u:
     # Worst-case (over all query configs) projection rel-err as a function of the
-    # number of retained modes n. Pick the single fixed n where the WEIGHTED
-    # worst-case curve crosses your tolerance — that n is safe for every query.
+    # number of retained modes n. Pick the single fixed n where the worst-case
+    # curve crosses your tolerance — that n is safe for every query.
     import numpy as np
-    kmin = min(c.size for c in projcurve_w)
+    kmin = min(c.size for c in projcurve_u)
     # Drop near-reference queries (s_tilde ~ 0 => 0/0 noise that swamps the max).
     sn2  = np.asarray(proj_snorm2)
     keep = sn2 > 1e-6 * sn2.max()
     if not keep.all():
         print(f"[single-n] dropping {int((~keep).sum())} near-reference query(ies) "
               f"from worst-case (s_tilde≈0).")
-    W_stack = np.vstack([c[:kmin] for c, k in zip(projcurve_w, keep) if k])
     U_stack = np.vstack([c[:kmin] for c, k in zip(projcurve_u, keep) if k])
-    W_wc = np.max(W_stack, axis=0)   # weighted   worst-case vs n
-    U_wc = np.max(U_stack, axis=0)   # unweighted worst-case vs n
-    n_axis = np.arange(1, kmin + 1)
-    print("\n[single-n] worst-case-over-queries projection rel-err vs n:")
-    print(f"{'n':>5}  {'unweighted':>12}  {'weighted':>12}")
-    for n in [5, 10, 15, 20, 30, 40, 50, 75, 100]:
-        if n <= kmin:
-            print(f"{n:>5}  {U_wc[n-1]:>12.4e}  {W_wc[n-1]:>12.4e}")
-    for tol in (1e-2, 5e-3, 1e-3):
-        nw = int(n_axis[W_wc <= tol][0]) if np.any(W_wc <= tol) else None
-        nu = int(n_axis[U_wc <= tol][0]) if np.any(U_wc <= tol) else None
-        print(f"[single-n] smallest n for worst-case rel-err <= {tol:.0e}:  "
-              f"weighted={nw}   unweighted={nu}")
+    U_wc    = np.max(U_stack, axis=0)
+    n_axis  = np.arange(1, kmin + 1)
+
+    if projcurve_w:
+        kmin_w  = min(c.size for c in projcurve_w)
+        kmin    = min(kmin, kmin_w)
+        W_stack = np.vstack([c[:kmin] for c, k in zip(projcurve_w, keep) if k])
+        W_wc    = np.max(W_stack, axis=0)
+        U_wc    = U_wc[:kmin]
+        n_axis  = n_axis[:kmin]
+        print("\n[single-n] worst-case-over-queries projection rel-err vs n:")
+        print(f"{'n':>5}  {'unweighted':>12}  {'weighted':>12}")
+        for n in [5, 10, 15, 20, 30, 40, 50, 75, 100]:
+            if n <= kmin:
+                print(f"{n:>5}  {U_wc[n-1]:>12.4e}  {W_wc[n-1]:>12.4e}")
+        for tol in (1e-2, 5e-3, 1e-3):
+            nw = int(n_axis[W_wc <= tol][0]) if np.any(W_wc <= tol) else None
+            nu = int(n_axis[U_wc <= tol][0]) if np.any(U_wc <= tol) else None
+            print(f"[single-n] smallest n for worst-case rel-err <= {tol:.0e}:  "
+                  f"weighted={nw}   unweighted={nu}")
+    else:
+        print("\n[single-n] worst-case-over-queries projection rel-err vs n:")
+        print(f"{'n':>5}  {'proj_err':>12}")
+        for n in [5, 10, 15, 20, 30, 40, 50, 75, 100]:
+            if n <= kmin:
+                print(f"{n:>5}  {U_wc[n-1]:>12.4e}")
+        for tol in (1e-2, 5e-3, 1e-3):
+            nu = int(n_axis[U_wc <= tol][0]) if np.any(U_wc <= tol) else None
+            print(f"[single-n] smallest n for worst-case rel-err <= {tol:.0e}:  {nu}")
+
     import matplotlib.pyplot as plt
     plt.figure()
     plt.semilogy(n_axis, U_wc, label='unweighted (worst case)')
-    plt.semilogy(n_axis, W_wc, label='weighted (worst case)')
+    if projcurve_w:
+        plt.semilogy(n_axis, W_wc, label='weighted (worst case)')
     plt.xlabel('n retained modes'); plt.ylabel('worst-case proj rel-err'); plt.legend()
     plt.title('Choosing a single fixed n'); plt.savefig('single_n_choice.png', dpi=200)
 
+if rank == 0:
     print(f"\n{'Pt':>4}  {'ROM drag':>12}  {'FOM drag':>12}  {'drag_rel_err':>14}  "
           f"{'ROM lift':>12}  {'FOM lift':>12}  {'lift_rel_err':>14}")
     for i in range(num_samples_with_ref):
@@ -916,31 +945,43 @@ if rank == 0 and projcurve_w:
                 f"{rom_lift[i]:>12.4e}  {fom_lift[i]:>12.4e}  {lift_rel[i]:>14.4e}")
 
 # ---- Basis quality vs ROM quality (LSPG-vs-basis split) ----
-# proj_u/proj_w = best-possible (orthogonal-projection) rel-err of the FOM state
-#                 in the unweighted/weighted basis at the fixed n_modes.
+# proj_w    = best-possible (orthogonal-projection) rel-err of the FOM state in the
+#             (possibly weighted-rotated) basis at the fixed n_modes.
+# proj_u    = same for the unweighted basis (only available when snapshot_weight_type set).
 # drag_rel/lift_rel = actual ROM output error.
 # If the weighted basis projects BETTER (proj_w < proj_u) yet the ROM is WORSE,
 # the loss is in the LSPG solve (conditioning / residual minimum), not the basis.
 if rank == 0 and proj_w:
-    # proj_w   = best-possible (orthogonal projection) state rel-err in the weighted basis
+    # proj_w   = best-possible (orthogonal projection) state rel-err in the basis
     # rom_st   = ACTUAL state rel-err the LSPG ROM achieves
     # gap      = rom_st / proj_w : how far LSPG is from best-in-basis (>~3 => LSPG suboptimal)
-    print(f"\n{'Pt':>4}  {'proj_u':>11}  {'proj_w':>11}  {'rom_st':>11}  {'gap':>7}  "
-          f"{'drag_rel':>11}  {'drag_rel_proj_u':>16}  {'drag_rel_proj_w':>16}  {'lift_rel':>11}  {'lift_rel_proj_u':>16}  {'lift_rel_proj_w':>16}  {'verdict':>26}")
+    have_u = bool(proj_u)
+    header = (f"\n{'Pt':>4}  {'proj_w':>11}  {'rom_st':>11}  {'gap':>7}  "
+              f"{'drag_rel':>11}  {'drag_rel_proj_w':>16}  "
+              f"{'lift_rel':>11}  {'lift_rel_proj_w':>16}")
+    if have_u:
+        header += f"  {'proj_u':>11}  {'drag_rel_proj_u':>16}  {'lift_rel_proj_u':>16}"
+    header += f"  {'verdict':>26}"
+    print(header)
     for i in range(len(proj_w)):
         if proj_snorm2[i] <= 1e-6 * max(proj_snorm2):
             continue                                              # skip reference point (s_tilde≈0)
-        basis_better = proj_w[i] < proj_u[i]
-        rom_err      = max(drag_rel[i], lift_rel[i])
-        gap          = rom_state_e[i] / (proj_w[i] + 1e-300)      # LSPG suboptimality factor
+        rom_err = max(drag_rel[i], lift_rel[i])
+        gap     = rom_state_e[i] / (proj_w[i] + 1e-300)          # LSPG suboptimality factor
         verdict = ""
         if rom_err > 1e-2:
             if gap > 3.0:
                 verdict = "LSPG suboptimal (state)"
             else:
                 verdict = "basis-limited / forces"      # state ~ best-in-basis; forces sensitive
-        print(f"{i:>4d}  {proj_u[i]:>11.4e}  {proj_w[i]:>11.4e}  {rom_state_e[i]:>11.4e}  "
-              f"{gap:>7.1f}  {drag_rel[i]:>11.4e}  {drag_rel_recon_u[i]:>16.4e}  {drag_rel_recon_w[i]:>16.4e}  {lift_rel[i]:>11.4e}  {lift_rel_recon_u[i]:>16.4e}  {lift_rel_recon_w[i]:>16.4e}  {verdict:>26}")
+        row = (f"{i:>4d}  {proj_w[i]:>11.4e}  {rom_state_e[i]:>11.4e}  "
+               f"{gap:>7.1f}  {drag_rel[i]:>11.4e}  {drag_rel_recon_w[i]:>16.4e}  "
+               f"{lift_rel[i]:>11.4e}  {lift_rel_recon_w[i]:>16.4e}")
+        if have_u:
+            row += (f"  {proj_u[i]:>11.4e}  {drag_rel_recon_u[i]:>16.4e}  "
+                    f"{lift_rel_recon_u[i]:>16.4e}")
+        row += f"  {verdict:>26}"
+        print(row)
 
 # ---- Collect weights over all test configs ----
 # Run this in your test loop and accumulate:

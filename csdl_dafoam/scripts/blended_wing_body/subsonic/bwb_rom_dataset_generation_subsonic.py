@@ -183,7 +183,7 @@ mesh_options = {
 
 # region Training options
 # Storage options
-dataset_keyword       = 'training_data_test'
+dataset_keyword       = 'training_data_test_new'
 storage_location      = Path(dafoam_directory)
 
 
@@ -498,8 +498,8 @@ mid_twist   = csdl.Variable(shape=(2,), value=np.array([0., 0.]), name="mid_twis
 wing_twists = csdl.concatenate((root_twist, mid_twist, tip_twist))
 wing_twists.flatten()
 
-percent_change_in_thickness_dof_wing        = csdl.Variable(shape=(8,4), value=0.)
-percent_change_in_thickness_dof_body        = csdl.Variable(shape=(8,4), value=0.)
+percent_change_in_thickness_dof_wing        = csdl.Variable(shape=(8,4), value=0., name="percent_change_in_thickness_dof_wing")
+percent_change_in_thickness_dof_body        = csdl.Variable(shape=(8,4), value=0., name="percent_change_in_thickness_dof_body")
 percent_change_in_thickness_dof             = csdl.concatenate(
                                                 (percent_change_in_thickness_dof_wing,
                                                  percent_change_in_thickness_dof_body), axis=1)
@@ -629,8 +629,8 @@ sim = csdl.experimental.PySimulator(recorder)
 # Sampling options
 # grassmann_variables indicates the variables which correspond to points on the Grassmann manifold
 # snapshot_variables indicates the variables which correspond to "snapshots" or realizations
-num_grassmann_samples     = 5
-num_snapshot_samples      = 100
+num_grassmann_samples     = 2
+num_snapshot_samples      = 300
 random_state_seed         = 0
 
 # Specify variables and their limits for sampling
@@ -679,22 +679,22 @@ snapshot_vars_and_limits = {
     #     'ref_value': 0, 
     # },
     normalized_percent_camber_change_dof_wing: {
-        'name': '%_camber_change_wing',
+        # 'name': '%_camber_change_wing',
         'range': [-10, 10],
         'ref_value': 0, 
     },
     root_twist: {
-        'name': 'root_twist',
+        # 'name': 'root_twist',
         'range': [-10*np.pi/180, 10*np.pi/180],
         'ref_value': 0, 
     },
     tip_twist: {
-        'name': 'tip_twist',
+        # 'name': 'tip_twist',
         'range': [-10*np.pi/180, 10*np.pi/180],
         'ref_value': 0, 
     },
     mid_twist: {
-        'name': 'mid_twist',
+        # 'name': 'mid_twist',
         'range': [-10*np.pi/180, 10*np.pi/180],
         'ref_value': 0, 
     },
@@ -725,13 +725,12 @@ data_generator = TrainingDataInterface(dafoam_instance=dafoam_instance,
                                             parallel_read=False)
 
 # data_generator.sample_variables()
-# data_generator.run_sweep()
+# data_generator.run_sweep(compute_pod=False)
 
 
-# Phi mode — choose which phi to include in basis:
-#   "phi"       : Just use standard phi (default)
-#   "phi_star"  : Compute area-normalized weighted face flux
-PHI_MODE = "phi"
+# 
+PHI_MODE   = "phi"
+BASIS_MODE = "all" 
 
 h5_path = Path(dafoam_directory) / dataset_keyword / "point_0.h5"
 
@@ -744,17 +743,6 @@ ref_face_areas     = np.abs(dataset["samples"]["mesh"]["face_areas"][:, 0])
 total_volume       = comm.allreduce(np.sum(ref_cell_volumes), op=MPI.SUM)
 total_area         = comm.allreduce(np.sum(ref_face_areas),   op=MPI.SUM)
 ref_face_areas_v_a = ref_face_areas * total_volume / total_area
-
-total_v_a_area = comm.allreduce(np.sum(ref_face_areas_v_a),   op=MPI.SUM)
-
-if rank == 0:
-    print(f"Total Volume:   {total_volume}")
-    print(f"Max cell vol:   {np.max(ref_cell_volumes)}")
-    print(f"Min cell vol:   {np.min(ref_cell_volumes)}")
-    print(f"Total area:     {total_area}")
-    print(f"Max face area:  {np.max(ref_face_areas)}")
-    print(f"Min face area:  {np.min(ref_face_areas)}")
-    print(f"Adj total area: {total_v_a_area}")
 
 inner_product_weights = {}
 for state_var, info in data_generator.state_info.items():
@@ -775,16 +763,6 @@ nu_ref  = ambient_conditions_group.nu_m2_s.value[0]
 M_ref   = U_ref / ambient_conditions_group.a_m_s.value[0]
 L_ref   = 30
 
-if rank == 0:
-    print(f"-------- Reference values --------")
-    print(f"Gamma: {gamma}")
-    print(f"U:     {U_ref}")
-    print(f"rho:   {rho_ref}")
-    print(f"T:     {T_ref}")
-    print(f"nu:    {nu_ref}")
-    print(f"M:     {M_ref}")
-    print(f"L:     {L_ref}")
-
 scaling_values = {
                     "U"       : U_ref,
                     "p"       : 0.5 * rho_ref * U_ref ** 2,
@@ -793,20 +771,138 @@ scaling_values = {
                     "phi"     : rho_ref * U_ref * (np.where(ref_face_areas < 1e-300, 1.0, ref_face_areas) if PHI_MODE == "phi" else 1)
                   }
 
-import glob
-files = glob.glob(str(Path(storage_location)/dataset_keyword/f"point_*.h5"))
+# # Delete any existing pod groups so overwrite_datasets=True starts clean
+# if rank == 0:
+#     with h5py.File(h5_path, "a") as _f:
+#         _pod_keys = [k for k in _f.keys() if k.startswith("pod")]
+#         for _k in _pod_keys:
+#             del _f[_k]
+#         if _pod_keys:
+#             print(f"Deleted existing pod groups: {_pod_keys}")
+# comm.Barrier()
 
-var_groups = [v for v in data_generator.state_info if v != "phi"]
-for i, file in enumerate([files[0]]):
-    print(f"Computing POD modes for file {i} ({file})") if rank == 0 else None
-    data_generator._compute_pod_modes(file,
-                    inner_product=inner_product_weights, #"reference",
-                    centering='reference',
-                    scaling=scaling_values,#"reference",
-                    write_h5=True,
-                    new_h5_file=False,
-                    overwrite_datasets=True,
-                    new_file_suffix="modes",
-                    write_modes_using_write_adjoint_fields=False,
-                    phi_mode=PHI_MODE,
-                    var_groups=var_groups)
+# Common POD keyword arguments shared by all modes
+_pod_common = dict(
+    inner_product=inner_product_weights,
+    centering="reference",
+    scaling=scaling_values,
+    write_h5=True,
+    new_h5_file=False,
+    overwrite_datasets=True,
+    write_modes_using_write_adjoint_fields=False,
+    phi_mode=PHI_MODE
+)
+
+if BASIS_MODE == "all":
+    # Single combined basis for all variables including phi — use with DAFoamLSPGModel
+    results = data_generator._compute_pod_modes(
+        h5_path,
+        **_pod_common,
+        new_file_suffix="modes",
+    )
+    result          = results[0]
+    local_modes     = result["modes"]
+    sv              = result["singular_values"]
+    reference_state = result["reference_state"]
+    weights         = result["weights"]
+    scaling_vals    = result["scaling_values"]
+
+    if rank == 0:
+        print(np.cumsum(sv ** 2) / np.sum(sv ** 2))
+
+elif BASIS_MODE == "no_phi":
+    # Single combined basis, phi excluded — use with PhiComputingLSPGModel
+    vars_no_phi = [v for v in data_generator.state_info if v != "phi"]
+    results = data_generator._compute_pod_modes(
+        h5_path,
+        var_groups=vars_no_phi,   # flat list → one combined group without phi
+        **_pod_common,
+        new_file_suffix="modes",
+    )
+    result          = results[0]
+    local_modes     = result["modes"]
+    sv              = result["singular_values"]
+    reference_state = result["reference_state"]
+    weights         = result["weights"]
+    scaling_vals    = result["scaling_values"]
+
+elif BASIS_MODE == "split":
+    # Separate flow (p, U, T) and turbulence (nuTilda) bases, phi excluded — use with SplitBasisLSPGModel
+    results = data_generator._compute_pod_modes(
+        h5_path,
+        var_groups=[["p", "U", "T"], ["nuTilda"], ["phi"]],   # phi excluded from both groups
+        **_pod_common,
+    )
+    flow_result     = results[0]   # {p, U, T}
+    turb_result     = results[1]   # {nuTilda}
+    flow_modes      = flow_result["modes"]
+    flow_sv         = flow_result["singular_values"]
+    turb_modes      = turb_result["modes"]
+    turb_sv         = turb_result["singular_values"]
+    reference_state = {**flow_result["reference_state"], **turb_result["reference_state"]}
+
+elif BASIS_MODE == "per_variable":
+    # Separate basis per variable, phi included — use with PerVariableLSPGModel
+    all_vars = list(data_generator.state_info.keys())
+    results = data_generator._compute_pod_modes(
+        h5_path,
+        var_groups=[[v] for v in all_vars],   # one independent basis per variable
+        **_pod_common,
+        new_file_suffix="modes_per_var",
+    )
+    # results[i]["vars"] gives the variable(s) for that group
+    # results[i]["modes"], ["singular_values"], ["reference_state"], ["weights"], ["scaling_values"]
+
+else:
+    raise ValueError(f"Unknown BASIS_MODE: {BASIS_MODE!r}. "
+                     "Choose from 'all', 'no_phi', 'split', 'per_variable'.")
+
+# data = data_generator.load_h5(Path(storage_location)/dataset_keyword/"point_0.h5", only_distributed_data=False)
+
+# local_mode_read = data["pod"]["modes"]
+
+# weights_read = data["pod"]["weights"]
+
+
+# indices      = np.concatenate(comm.allgather(data_generator.face_global_indices), axis=0)
+# mode_compute = np.concatenate(comm.allgather(local_mode_computed["phi"][:, 0]), axis=0)
+# mode_read    = np.concatenate(comm.allgather(local_mode_read["phi"][:, 0]), axis=0)
+
+# indices_abs = np.abs(indices) - 1
+# indices_neg = indices < 0
+# sign_mask   = np.ones_like(indices_abs)
+# sign_mask[indices_neg] = -1
+
+# import matplotlib.pyplot as plt
+
+# if rank == 0:
+#     plt.scatter(indices_abs, mode_compute, label='Computed, abs')
+#     plt.scatter(indices_abs[indices_neg], mode_compute[indices_neg], marker='x', label='Computed, negated boundaries')
+#     plt.scatter(indices_abs, mode_read, marker='+', label='Read, abs')
+#     plt.scatter(indices_abs[indices_neg], mode_read[indices_neg], marker='x', label='Read, negated boundaries')
+#     plt.legend()
+#     plt.ylabel("phi")
+    
+#     plt.figure()
+#     plt.scatter(range(mode_compute.size), mode_compute, marker='x', label='compute')
+#     plt.scatter(range(mode_read.size), mode_read, marker='+', label='read')
+    
+#     diff_greater_than_tol = np.abs(mode_compute - mode_read) > 1e-12
+
+#     plt.scatter(np.where(diff_greater_than_tol), mode_compute[diff_greater_than_tol], marker='.', label='marked errors')
+#     plt.legend()
+
+    
+
+#     plt.figure()
+#     plt.scatter(range(mode_read[indices_neg].size), mode_compute[indices_neg]/mode_read[indices_neg])
+
+#     plt.show()
+# quiet_barrier(comm)
+
+
+
+# # h5file = "/media/edward/DATA/Edward/AFRL_project/csdl_dafoam_workspace/airfoil_case/results/training_test/airfoil_training/point_0.h5"
+# # data_generator._compute_pod_modes(h5filepath=h5file, inner_product="reference", centering='reference', scaling="reference", new_file=True)
+
+# # data_generator.read_h5_file()

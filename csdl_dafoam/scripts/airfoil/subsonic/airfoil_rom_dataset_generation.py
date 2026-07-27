@@ -164,7 +164,7 @@ storage_location      = dafoam_directory
 #   "no_phi"       : single combined basis, phi excluded (use with PhiComputingLSPGModel)
 #   "split"        : separate flow (p, U, T) and turbulence (nuTilda) bases, phi excluded
 #   "per_variable" : separate basis per variable, phi included (use with PerVariableLSPGModel)
-BASIS_MODE = "all"
+BASIS_MODE = "split"
 
 # Phi mode — choose which phi to include in basis:
 #   "phi"       : Just use standard phi (default)

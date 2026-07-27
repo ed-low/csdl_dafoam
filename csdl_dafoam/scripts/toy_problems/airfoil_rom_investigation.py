@@ -174,6 +174,55 @@ print(f"COMM SIZE = {comm_size}")
 # region DAFoam instance
 dafoam_instance           = instantiateDAFoam(da_options, comm, dafoam_directory, mesh_options)
 
+
+print(f"Rank {rank}: owners.shape = {dafoam_instance.owners.shape}")
+print(f"Rank {rank}: neighbours.shape = {dafoam_instance.neighbours.shape}")
+print(f"Rank {rank}: faces.shape = {len(dafoam_instance.faces)}")
+
+state_names, state_map = dafoam_instance.getStateVariableMap(includeComponentSuffix=False)
+state_index = state_names.index("p")
+vol_indices = np.where(np.array(state_map) == state_index)[0]
+
+own   = dafoam_instance.owners          # (n_faces,)  — all faces
+nei   = dafoam_instance.neighbours      # (n_int,)
+Cc    = dafoam_instance.getCellCentroids(as_matrix=True)   # (n_cells, 3)
+Cf    = dafoam_instance.getFaceCenters(as_matrix=True)   # (n_faces, 3)
+Sf    = dafoam_instance.getFaceAreaNormals(as_matrix=True)   # (n_faces, 3) SIGNED, internal first then patches
+n_int = len(nei)
+n_faces = dafoam_instance.solver.getNLocalFaces()
+n_cells = dafoam_instance.solver.getNLocalCells()
+weights = dafoam_instance.getStateWeights()
+cell_vol = weights[vol_indices]
+
+w = np.empty(n_faces)
+d_int    = Cc[nei] - Cc[own[:n_int]]
+w[:n_int] = np.abs(np.einsum('ij,ij->i', d_int, Sf[:n_int]))
+
+d_bnd     = Cf[n_int:] - Cc[own[n_int:]]        # owner centroid -> face centroid
+w[n_int:] = np.abs(np.einsum('ij,ij->i', d_bnd, Sf[n_int:]))
+
+print(f"Rank {rank}: sum(w) = {np.sum(w)}")
+print(f"Total: sum(w) = {comm.allreduce(np.sum(w), op=MPI.SUM)}")
+print(f"Total: sum(vol) = {comm.allreduce(np.sum(cell_vol), op=MPI.SUM)}")
+
+w_raw = np.linalg.norm(Sf, axis=1)
+
+import matplotlib.pyplot as plt
+plt.subplot(5, 1, 1)
+plt.semilogy(w / w_raw)
+plt.subplot(5, 1, 2)
+plt.plot(Cf[:, 0])
+plt.subplot(5, 1, 3)
+plt.plot(Cf[:, 1])
+plt.subplot(5, 1, 4)
+plt.plot(Cf[:, 2])
+plt.subplot(5, 1, 5)
+plt.plot(np.linalg.norm(Cf, axis=1))
+plt.show()
+
+
+
+
 # POD Data import
 data_generator = TrainingDataInterface(dafoam_instance=dafoam_instance, 
                                         storage_location=storage_location, 
