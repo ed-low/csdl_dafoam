@@ -163,8 +163,8 @@ class DAFoamSolver(csdl.experimental.CustomImplicitOperation):
             output_vals['dafoam_solver_states'] = np.copy(states)
 
             if self.disable_successful_primal_state_save is False and self.always_use_same_ic is False:
-                if has_global_nan_or_inf(states):
-                    if rank == 0:
+                if has_global_nan_or_inf(states, self.dafoam_instance.comm):
+                    if dafoam_instance.rank == 0:
                         print("Found INF or NAN in solution... Skipping primal save cache.")
                 else:
                     self.saved_states               = np.copy(states)
